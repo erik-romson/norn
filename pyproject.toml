@@ -1,0 +1,67 @@
+[project]
+name = "norn"
+version = "0.1.0"
+description = "Generic pipeline framework for orchestrating multi-step AI agent workflows"
+requires-python = ">=3.13"
+dependencies = [
+    "claude-agent-sdk",
+    "rich>=14.3.3",
+]
+
+[project.scripts]
+norn = "norn.cli:main"
+
+[project.entry-points."norn.stages"]
+# core
+read_file = "norn.stages.read_file:ReadFile"
+run_command = "norn.stages.run_command:RunCommand"
+generate = "norn.stages.generate:Generate"
+validate = "norn.stages.validate:Validate"
+# contrib
+read_issue = "norn.contrib.stages.read_issue:ReadIssue"
+match_repo = "norn.contrib.stages.match_repo:MatchRepo"
+clone = "norn.contrib.stages.clone:Clone"
+analyze = "norn.contrib.stages.analyze:Analyze"
+plan = "norn.contrib.stages.plan:Plan"
+write_test = "norn.contrib.stages.write_test:WriteTest"
+fix = "norn.contrib.stages.fix:Fix"
+verify_test = "norn.contrib.stages.verify_test:VerifyTest"
+full_build = "norn.contrib.stages.full_build:FullBuild"
+coverage = "norn.contrib.stages.coverage:Coverage"
+push = "norn.contrib.stages.push:Push"
+ci = "norn.contrib.stages.ci:CI"
+ship = "norn.contrib.stages.ship:Ship"
+search_logs = "norn.contrib.stages.search_logs:SearchLogs"
+
+[project.optional-dependencies]
+# core extras
+cobertura = ["pycobertura>=4.0"]
+aws = ["aioboto3"]
+vault = ["hvac>=2.0"]
+# contrib extras
+jira = ["jira>=3.10", "GitPython>=3.1"]
+search = ["elasticsearch>=8.0", "opensearch-py>=2.0"]
+slack = ["slack-sdk>=3.0"]
+# everything
+all = [
+    "jira>=3.10", "GitPython>=3.1",
+    "pycobertura>=4.0",
+    "elasticsearch>=8.0", "opensearch-py>=2.0",
+    "aioboto3", "hvac>=2.0",
+    "slack-sdk>=3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "gitpython>=3.1",
+    "mockito>=2.0.3",
+    "pytest",
+    "pytest-asyncio",
+]

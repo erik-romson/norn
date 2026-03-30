@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+.venv/
+
+# IDE
+.idea/
+
+# Project
+tmp/
+tmp2/
+/target/
+/out.py
+
+# Pipeline runtime files
+/**/*.session
+/**/*.history
+/**/*.checkpoint
+
+# Environment / secrets
+.env
+.env.*
+
+# Scratch files
+/alert-plan.md
+/alerts.txt
+/better-input.txt
+/better-ux.md
+/blaj.txt
+/resume.txt
+/tmux.txt

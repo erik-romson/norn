@@ -1,0 +1,3 @@
+Create a Python class called Greeter with:
+- A constructor that takes a name (str)
+- A method greet() that returns "Hello, {name}!"

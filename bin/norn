@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# If the first arg is a file (not a subcommand), prepend "run"
+if [[ -f "$1" ]]; then
+    exec uv run python -m norn run "$@"
+else
+    exec uv run python -m norn "$@"
+fi
