@@ -63,10 +63,32 @@ if not step_files:
         if Path(f).name not in ("index.md", "README.md", "refactor-plan.md")
     )
 
+# --- collect all step contents for review/handoff ---
+all_steps_summary = ""
+for sf in step_files:
+    all_steps_summary += f"### {Path(sf).name}\n\n{Path(sf).read_text()}\n\n---\n\n"
+
 # --- build pipeline ---
 pipeline = (
     Pipeline("implement_features")
     .alert(MacOSChannel())
+)
+
+# Fail early if working tree is dirty
+pipeline.stage(
+    "check clean worktree",
+    RunCommand(cmd=(
+        f'cd {PROJECT_DIR} && '
+        'if [ -n "$(git status --porcelain)" ]; then '
+        'echo "ERROR: Working tree is not clean. Commit or .gitignore these files before running the pipeline:" && '
+        'git status --short && exit 1; fi'
+    )),
+)
+
+# Record the starting commit so review/handoff can diff from it
+pipeline.stage(
+    "record start",
+    RunCommand(cmd=f"cd {PROJECT_DIR} && git rev-parse HEAD"),
 )
 
 for step_file in step_files:
@@ -148,5 +170,82 @@ for step_file in step_files:
     )
 
     pipeline.clear_context()
+
+# --- review: verify all changes match the plan ---
+pipeline.stage(
+    "review",
+    Generate(
+        prompt=(
+            f"## Working directory\n{PROJECT_DIR}\n\n"
+            "IMPORTANT: When creating or editing files, always use absolute paths "
+            f"based on {PROJECT_DIR}.\n\n"
+            "## Task: Review all implementation changes against the plan\n\n"
+            "The starting commit (before any steps were implemented) is:\n"
+            "{record start.output}\n\n"
+            "Run `git diff {record start.output}..HEAD` and `git log --oneline {record start.output}..HEAD` "
+            "to see all changes made during this pipeline run.\n\n"
+            f"{shared_context}"
+            "## Plan — all steps\n\n"
+            f"{all_steps_summary}\n\n"
+            "## Instructions\n"
+            "1. Read the full diff from the starting commit to HEAD\n"
+            "2. For each step in the plan, verify that:\n"
+            "   - The implementation matches what was requested\n"
+            "   - No unrelated changes were introduced\n"
+            "   - Code style and conventions are consistent\n"
+            "   - Tests were added where required\n"
+            "3. Check for cross-step issues: naming inconsistencies, "
+            "duplicated code, missing integrations between steps\n"
+            "4. Write the review to a file at "
+            f"{feature_dir}/review.md with:\n"
+            "   - A summary verdict (pass / pass with notes / needs fixes)\n"
+            "   - Per-step compliance checklist\n"
+            "   - Any issues found, with file paths and line numbers\n"
+            "   - Suggestions for improvement (if any)\n"
+        ),
+        allowed_tools=["Read", "Glob", "Grep", "Bash"],
+        permission_mode="acceptEdits",
+        cwd=PROJECT_DIR,
+        setting_sources=["project"],
+    ),
+)
+
+# --- handoff document: summarize all changes ---
+pipeline.stage(
+    "handoff",
+    Generate(
+        prompt=(
+            f"## Working directory\n{PROJECT_DIR}\n\n"
+            "IMPORTANT: When creating or editing files, always use absolute paths "
+            f"based on {PROJECT_DIR}.\n\n"
+            "## Task: Create a handoff document\n\n"
+            "The starting commit (before any steps were implemented) is:\n"
+            "{record start.output}\n\n"
+            "Run `git diff --stat {record start.output}..HEAD` and "
+            "`git log --oneline {record start.output}..HEAD` to see the scope of changes.\n\n"
+            f"{shared_context}"
+            "## Instructions\n"
+            "Create a handoff document at "
+            f"{feature_dir}/handoff.md that includes:\n\n"
+            "1. **Overview** — what was built and why (1-2 paragraphs)\n"
+            "2. **Changes summary** — list of all files added/modified/deleted, "
+            "grouped by feature area\n"
+            "3. **New functionality** — what the user can now do that they couldn't before, "
+            "with usage examples or commands where applicable\n"
+            "4. **Architecture decisions** — key design choices made during implementation\n"
+            "5. **Configuration** — any new env vars, config files, or settings introduced\n"
+            "6. **Testing** — what tests were added and how to run them\n"
+            "7. **Known limitations** — anything not implemented, deferred, or requiring "
+            "follow-up work\n"
+            "8. **Dependencies** — any new dependencies added\n\n"
+            "Read the actual changed files to understand what was built — "
+            "don't just summarize the plan, summarize the implementation.\n"
+        ),
+        allowed_tools=["Read", "Glob", "Grep", "Bash"],
+        permission_mode="acceptEdits",
+        cwd=PROJECT_DIR,
+        setting_sources=["project"],
+    ),
+)
 
 config = pipeline

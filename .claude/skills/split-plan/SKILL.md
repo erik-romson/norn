@@ -62,6 +62,7 @@ A table showing the step order, what each does, and why tests pass between steps
 ## Key Principles
 
 - **Tests must pass after every step.** If a step would break tests, include the fix in the same step or use a compatibility strategy (shims, re-exports, etc.) documented in `index.md`.
+- **If it is not natural for a step to have a test.** Create some kind of placeholder as the all tests will be tested for each step 
 - **Each step should be independently understandable.** Combined with `index.md`, a step file must give the implementing agent everything it needs. No implicit knowledge from prior steps.
 - **Steps should be as small as possible but no smaller.** Group tightly coupled changes that can't be separated without breaking tests. Split everything else.
 - **Dependency order matters.** If module A depends on module B, move B first.
