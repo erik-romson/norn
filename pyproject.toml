@@ -17,6 +17,7 @@ read_file = "norn.stages.read_file:ReadFile"
 run_command = "norn.stages.run_command:RunCommand"
 generate = "norn.stages.generate:Generate"
 validate = "norn.stages.validate:Validate"
+check_ci = "norn.stages.check_ci:CheckCI"
 # contrib
 read_issue = "norn.contrib.stages.read_issue:ReadIssue"
 match_repo = "norn.contrib.stages.match_repo:MatchRepo"
@@ -39,11 +40,13 @@ cobertura = ["pycobertura>=4.0"]
 aws = ["aioboto3"]
 vault = ["hvac>=2.0"]
 # contrib extras
+github = ["githubkit>=0.12"]
 jira = ["jira>=3.10", "GitPython>=3.1"]
 search = ["elasticsearch>=8.0", "opensearch-py>=2.0"]
 slack = ["slack-sdk>=3.0"]
 # everything
 all = [
+    "githubkit>=0.12",
     "jira>=3.10", "GitPython>=3.1",
     "pycobertura>=4.0",
     "elasticsearch>=8.0", "opensearch-py>=2.0",
