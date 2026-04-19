@@ -58,6 +58,14 @@ if not step_files:
         if Path(f).name not in ("index.md", "README.md", "refactor-plan.md")
     )
 
+if not step_files:
+    print(
+        f"Error: no step-*.md files found in {feature_dir}\n"
+        "Usage: norn run dogfooding/implement_features.py <directory>",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 # --- build pipeline ---
 pipeline = (
     Pipeline("implement_features")
