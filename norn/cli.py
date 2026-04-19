@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 _ISSUE_KEY_RE = re.compile(r"^[A-Z]+-\d+$")
 
 
+
 def _expand_file_refs(text: str) -> str:
     """Replace @path references with file contents, like Claude Code's @ syntax."""
 
@@ -133,6 +134,14 @@ def main() -> None:
     describe_parser = sub.add_parser("describe", help="Describe a bundled pipeline")
     describe_parser.add_argument("name", help="Name of the bundled pipeline")
 
+    diagram_parser = sub.add_parser("diagram", help="Generate a Mermaid flowchart for a pipeline")
+    diagram_parser.add_argument("config", help="Path to pipeline config .py file or bundled pipeline name")
+    diagram_parser.add_argument(
+        "--mermaid",
+        action="store_true",
+        help="Output raw Mermaid syntax instead of Markdown",
+    )
+
     args, remaining = parser.parse_known_args()
 
     if args.command == "history":
@@ -210,6 +219,28 @@ def main() -> None:
             usage += " " + " ".join(f"<{a}>" for a in info.args)
         console.print(usage)
         console.print()
+        return
+
+    if args.command == "diagram":
+        from norn.diagram import to_markdown, to_mermaid
+
+        info = get_pipeline_info(args.config)
+        if info:
+            pipeline = load_bundled_pipeline(args.config)
+            config_path = str(info.path)
+        else:
+            pipeline = _load_pipeline(args.config)
+            config_path = args.config
+        if not pipeline.items:
+            print(
+                f"Warning: pipeline {pipeline.name!r} has no stages"
+                " (dynamic pipelines may need runtime arguments)",
+                file=sys.stderr,
+            )
+        if args.mermaid:
+            print(to_mermaid(pipeline))
+        else:
+            print(to_markdown(pipeline, config_path))
         return
 
     if args.command != "run":
