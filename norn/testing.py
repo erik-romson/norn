@@ -27,8 +27,10 @@ Usage::
 from __future__ import annotations
 
 import copy
+import inspect
 import itertools
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -78,6 +80,155 @@ class CallRecord:
     def context_had(self, stage_name: str) -> bool:
         """Check whether a stage had completed before this call."""
         return stage_name in self.ctx.results
+
+
+class MockStage(BaseStage):
+    """A programmable stage that records all calls for later verification."""
+
+    def __init__(self) -> None:
+        self._output: Any = "mock output"
+        self._fail_count: int = 0
+        self._fail_error: str = "mock failure"
+        self._always_fail: bool = False
+        self._success_output: Any | None = None  # set by then_returns()
+        self._side_effect: Callable | None = None
+        self._artifacts: list[str] = []
+        self._agent_session_id: str | None = None
+        self._agent_cost_usd: float = 0.01
+        self._calls: list[CallRecord] = []
+        self._call_count: int = 0
+        self.original_impl: BaseStage | None = None
+
+    # --- Stubbing (fluent) ---
+
+    def returns(self, output: Any) -> MockStage:
+        """Set the output value for successful calls."""
+        self._output = output
+        return self
+
+    def fails(self, *, times: int = 1, error: str = "mock failure") -> MockStage:
+        """Configure the mock to fail for the first `times` calls."""
+        self._fail_count = times
+        self._fail_error = error
+        return self
+
+    def always_fails(self, error: str = "mock failure") -> MockStage:
+        """Configure the mock to always fail."""
+        self._always_fail = True
+        self._fail_error = error
+        return self
+
+    def then_returns(self, output: Any) -> MockStage:
+        """Set the output value after failures are exhausted."""
+        self._success_output = output
+        return self
+
+    def as_agent(self, session_id: str | None = None, cost_usd: float = 0.01) -> MockStage:
+        """Mark this mock as an agent stage with usage tracking."""
+        self.needs_agent = True
+        self._agent_session_id = session_id
+        self._agent_cost_usd = cost_usd
+        return self
+
+    def with_side_effect(self, fn: Callable) -> MockStage:
+        """Set a side-effect function called instead of normal stubbing logic."""
+        self._side_effect = fn
+        return self
+
+    def with_artifacts(self, artifacts: list[str]) -> MockStage:
+        """Set artifacts returned on successful calls."""
+        self._artifacts = artifacts
+        return self
+
+    # --- Recording ---
+
+    @property
+    def calls(self) -> list[CallRecord]:
+        """Return all recorded calls."""
+        return self._calls
+
+    @property
+    def call_count(self) -> int:
+        """Return how many times this mock was called."""
+        return self._call_count
+
+    @property
+    def last_call(self) -> CallRecord:
+        """Return the most recent call record."""
+        if not self._calls:
+            raise AssertionError("MockStage was never called")
+        return self._calls[-1]
+
+    # --- Execution ---
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        """Execute the mock stage, recording the call."""
+        self._call_count += 1
+        attempt = kwargs.get("attempt", 1)
+
+        # Snapshot context
+        ctx_snapshot = PipelineContext(
+            results=dict(ctx.results),
+            params=dict(ctx.params),
+        )
+
+        # Side effect
+        if self._side_effect is not None:
+            if inspect.iscoroutinefunction(self._side_effect):
+                result = await self._side_effect(ctx, **kwargs)
+            else:
+                result = self._side_effect(ctx, **kwargs)
+            record = CallRecord(
+                index=next(_global_call_counter),
+                ctx=ctx_snapshot,
+                kwargs=dict(kwargs),
+                result=result,
+                timestamp=time.monotonic(),
+                original_impl=self.original_impl,
+            )
+            self._calls.append(record)
+            return result
+
+        # Determine success/failure
+        if self._always_fail or self._call_count <= self._fail_count:
+            session_id = self._agent_session_id or "mock-session-1"
+            result = _make_failure_result(
+                error=self._fail_error,
+                session_id=session_id,
+                cost_usd=self._agent_cost_usd,
+                attempt=attempt,
+            ) if self.needs_agent else StageResult(
+                name="", success=False, error=self._fail_error,
+            )
+        else:
+            output = (
+                self._success_output
+                if (self._success_output is not None
+                    and self._call_count > self._fail_count
+                    and self._fail_count > 0)
+                else self._output
+            )
+            session_id = self._agent_session_id or "mock-session-1"
+            result = _make_success_result(
+                output=output,
+                session_id=session_id,
+                cost_usd=self._agent_cost_usd,
+                artifacts=self._artifacts or None,
+                attempt=attempt,
+            ) if self.needs_agent else StageResult(
+                name="", success=True, output=output,
+            )
+
+        record = CallRecord(
+            index=next(_global_call_counter),
+            ctx=ctx_snapshot,
+            kwargs=dict(kwargs),
+            result=result,
+            timestamp=time.monotonic(),
+            original_impl=self.original_impl,
+        )
+        self._calls.append(record)
+        return result
 
 
 def _make_success_result(
