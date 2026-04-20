@@ -373,6 +373,107 @@ class CallVerifier:
         return self
 
 
+class StageResultView:
+    """Convenience wrapper around a single stage's StageResult."""
+
+    def __init__(self, result: StageResult) -> None:
+        self._result = result
+
+    def assert_success(self) -> None:
+        if not self._result.success:
+            raise AssertionError(
+                f"Expected stage {self._result.name!r} to succeed, "
+                f"but it failed with: {self._result.error}"
+            )
+
+    def assert_failed(self) -> None:
+        if self._result.success:
+            raise AssertionError(
+                f"Expected stage {self._result.name!r} to fail, but it succeeded"
+            )
+
+    def assert_output(self, expected: Any) -> None:
+        if self._result.output != expected:
+            raise AssertionError(
+                f"Expected output {expected!r}, got {self._result.output!r}"
+            )
+
+    def assert_output_contains(self, text: str) -> None:
+        output_str = str(self._result.output)
+        if text not in output_str:
+            raise AssertionError(
+                f"Expected output to contain {text!r}, got {output_str!r}"
+            )
+
+
+class PipelineTestResult:
+    """Rich result object wrapping PipelineContext after a test run."""
+
+    def __init__(self, ctx: PipelineContext, mocks: dict[str, MockStage]) -> None:
+        self.ctx = ctx
+        self._mocks = mocks
+
+    def stage(self, name: str) -> StageResultView:
+        if name not in self.ctx.results:
+            raise KeyError(f"Stage {name!r} not found in results")
+        return StageResultView(self.ctx.results[name])
+
+    def mock(self, name: str) -> MockStage:
+        if name not in self._mocks:
+            raise KeyError(f"Mock {name!r} not found in patches")
+        return self._mocks[name]
+
+    def assert_completed(self) -> None:
+        failed = [
+            name for name, r in self.ctx.results.items() if not r.success
+        ]
+        if failed:
+            raise AssertionError(f"Pipeline had failed stages: {failed}")
+
+    def assert_failed_at(self, stage_name: str) -> None:
+        if stage_name not in self.ctx.results:
+            raise AssertionError(f"Stage {stage_name!r} not found in results")
+        if self.ctx.results[stage_name].success:
+            raise AssertionError(
+                f"Expected stage {stage_name!r} to fail, but it succeeded"
+            )
+
+
+class PipelineTestRunner:
+    """Fluent test builder for pipeline execution."""
+
+    def __init__(self, config: str | Pipeline) -> None:
+        self._config = config
+        self._patches: dict[str, MockStage] = {}
+        self._params: dict[str, str] = {}
+        self._resume_session: str | None = None
+
+    def patch(self, stage_name: str, mock: MockStage) -> PipelineTestRunner:
+        self._patches[stage_name] = mock
+        return self
+
+    def with_param(self, key: str, value: str) -> PipelineTestRunner:
+        self._params[key] = value
+        return self
+
+    def with_resume(self, session_id: str) -> PipelineTestRunner:
+        self._resume_session = session_id
+        return self
+
+    async def run(self) -> PipelineTestResult:
+        if isinstance(self._config, str):
+            pipeline = load_pipeline(self._config)
+        else:
+            pipeline = self._config
+        patch_stages(pipeline, self._patches)
+        ctx = await run_pipeline(
+            pipeline,
+            params=self._params or None,
+            resume_session=self._resume_session,
+        )
+        return PipelineTestResult(ctx, self._patches)
+
+
 def _make_success_result(
     output: Any = "mock output",
     session_id: str = "mock-session-1",
