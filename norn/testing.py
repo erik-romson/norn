@@ -400,9 +400,13 @@ def _patch_items(items: list, patches: dict[str, BaseStage]) -> None:
     """Recursively replace stage implementations by name in a pipeline's items."""
     for i, item in enumerate(items):
         if isinstance(item, Stage) and item.name in patches:
+            mock = patches[item.name]
+            # Stash original impl on MockStage instances for input inspection
+            if isinstance(mock, MockStage):
+                mock.original_impl = item.impl
             items[i] = Stage(
                 name=item.name,
-                impl=patches[item.name],
+                impl=mock,
                 on_failure=item.on_failure,
                 when=item.when,
                 timeout=item.timeout,
