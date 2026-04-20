@@ -231,6 +231,148 @@ class MockStage(BaseStage):
         return result
 
 
+def verify(mock: MockStage) -> Verifier:
+    """Start a verification chain on a MockStage."""
+    if not isinstance(mock, MockStage):
+        raise TypeError(f"verify() requires a MockStage, got {type(mock).__name__}")
+    return Verifier(mock)
+
+
+class Verifier:
+    """Fluent assertion API for MockStage call verification."""
+
+    def __init__(self, mock: MockStage) -> None:
+        self._mock = mock
+
+    def called(self, *, times: int | None = None,
+               at_least: int | None = None,
+               at_most: int | None = None) -> Verifier:
+        """Assert call count constraints."""
+        count = self._mock.call_count
+        if times is not None and count != times:
+            raise AssertionError(
+                f"Expected {times} call(s), got {count}"
+            )
+        if at_least is not None and count < at_least:
+            raise AssertionError(
+                f"Expected at least {at_least} call(s), got {count}"
+            )
+        if at_most is not None and count > at_most:
+            raise AssertionError(
+                f"Expected at most {at_most} call(s), got {count}"
+            )
+        return self
+
+    def never_called(self) -> Verifier:
+        """Assert the mock was never called."""
+        return self.called(times=0)
+
+    def called_before(self, other: MockStage) -> Verifier:
+        """Assert this mock was called before another mock."""
+        if not self._mock.calls:
+            raise AssertionError("This mock was never called")
+        if not other.calls:
+            raise AssertionError("The other mock was never called")
+        if self._mock.calls[0].index >= other.calls[0].index:
+            raise AssertionError(
+                f"Expected to be called before the other mock "
+                f"(index {self._mock.calls[0].index} >= {other.calls[0].index})"
+            )
+        return self
+
+    def called_after(self, other: MockStage) -> Verifier:
+        """Assert this mock was called after another mock."""
+        if not self._mock.calls:
+            raise AssertionError("This mock was never called")
+        if not other.calls:
+            raise AssertionError("The other mock was never called")
+        if self._mock.calls[0].index <= other.calls[0].index:
+            raise AssertionError(
+                f"Expected to be called after the other mock "
+                f"(index {self._mock.calls[0].index} <= {other.calls[0].index})"
+            )
+        return self
+
+    def received_context(self, predicate: Callable[[PipelineContext], bool],
+                         msg: str = "") -> Verifier:
+        """Assert at least one call matched a context predicate."""
+        for call in self._mock.calls:
+            if predicate(call.ctx):
+                return self
+        detail = f": {msg}" if msg else ""
+        raise AssertionError(
+            f"No call matched the context predicate{detail}"
+        )
+
+    def received_session(self, session_id: str) -> Verifier:
+        """Assert at least one call received the given session_id."""
+        for call in self._mock.calls:
+            if call.session_id == session_id:
+                return self
+        raise AssertionError(
+            f"No call received session_id={session_id!r}"
+        )
+
+    def on_attempt(self, n: int) -> CallVerifier:
+        """Return a CallVerifier for the nth call (1-indexed)."""
+        if n < 1 or n > len(self._mock.calls):
+            raise AssertionError(
+                f"Call {n} does not exist (mock was called {len(self._mock.calls)} time(s))"
+            )
+        return CallVerifier(self._mock.calls[n - 1])
+
+
+class CallVerifier:
+    """Assertions on a specific CallRecord."""
+
+    def __init__(self, call: CallRecord) -> None:
+        self._call = call
+
+    def succeeded(self) -> CallVerifier:
+        """Assert the call succeeded."""
+        if not self._call.succeeded:
+            raise AssertionError(
+                f"Expected call {self._call.index} to succeed, "
+                f"but it failed with: {self._call.result.error}"
+            )
+        return self
+
+    def failed(self) -> CallVerifier:
+        """Assert the call failed."""
+        if self._call.succeeded:
+            raise AssertionError(
+                f"Expected call {self._call.index} to fail, but it succeeded"
+            )
+        return self
+
+    def had_context(self, stage_name: str) -> CallVerifier:
+        """Assert a stage result was present in the context at call time."""
+        if not self._call.context_had(stage_name):
+            available = list(self._call.ctx.results.keys())
+            raise AssertionError(
+                f"Expected {stage_name!r} in context, "
+                f"available: {available}"
+            )
+        return self
+
+    def had_output(self, stage_name: str, expected: Any = None,
+                   *, error: str | None = None) -> CallVerifier:
+        """Assert a stage result was present with specific output or error."""
+        self.had_context(stage_name)
+        result = self._call.ctx.results[stage_name]
+        if expected is not None and result.output != expected:
+            raise AssertionError(
+                f"Expected output {expected!r} for {stage_name!r}, "
+                f"got {result.output!r}"
+            )
+        if error is not None and result.error != error:
+            raise AssertionError(
+                f"Expected error {error!r} for {stage_name!r}, "
+                f"got {result.error!r}"
+            )
+        return self
+
+
 def _make_success_result(
     output: Any = "mock output",
     session_id: str = "mock-session-1",

@@ -7,7 +7,15 @@ from typing import Any
 import pytest
 
 from norn.models import PipelineContext, StageResult, UsageRecord
-from norn.testing import CallRecord, reset_call_counter, _global_call_counter
+from norn.testing import (
+    CallRecord,
+    CallVerifier,
+    MockStage,
+    Verifier,
+    reset_call_counter,
+    verify,
+    _global_call_counter,
+)
 
 
 def _make_ctx(**results: StageResult) -> PipelineContext:
@@ -91,6 +99,24 @@ class TestCallRecord:
             result=_dummy_result(), timestamp=1.0,
         )
         assert rec.context_had("build") is False
+
+
+class TestVerifyAPI:
+    """Placeholder — verify API is defined but exercised in a later step."""
+
+    def test_verify_classes_importable(self) -> None:
+        assert verify is not None
+        assert Verifier is not None
+        assert CallVerifier is not None
+
+    def test_verify_rejects_non_mock(self) -> None:
+        with pytest.raises(TypeError, match="verify\\(\\) requires a MockStage"):
+            verify("not a mock")  # type: ignore[arg-type]
+
+    def test_verify_returns_verifier(self) -> None:
+        m = MockStage()
+        v = verify(m)
+        assert isinstance(v, Verifier)
 
 
 class TestGlobalCallCounter:
