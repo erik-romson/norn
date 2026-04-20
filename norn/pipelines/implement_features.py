@@ -64,12 +64,13 @@ if not step_files:
     )
 
 if not step_files:
-    print(
-        f"Error: no step-*.md files found in {feature_dir}\n"
+    import logging as _logging
+
+    _logging.getLogger(__name__).warning(
+        "No step-*.md files found in %s — pipeline will be empty.\n"
         "Usage: norn run implement_features <directory>",
-        file=sys.stderr,
+        feature_dir,
     )
-    sys.exit(1)
 
 # --- collect all step contents for review/handoff ---
 all_steps_summary = ""

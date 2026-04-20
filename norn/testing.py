@@ -26,6 +26,12 @@ Usage::
 
 from __future__ import annotations
 
+import copy
+import inspect
+import itertools
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from mockito import mock
@@ -35,6 +41,437 @@ from norn.loader import load_pipeline
 from norn.models import PipelineContext, StageResult, UsageRecord
 from norn.runner import run_pipeline
 from norn.stages.base import BaseStage
+
+_global_call_counter = itertools.count()
+
+
+def reset_call_counter() -> None:
+    """Reset the global call counter. Called between tests."""
+    global _global_call_counter
+    _global_call_counter = itertools.count()
+
+
+@dataclass
+class CallRecord:
+    """A single recorded invocation of a MockStage."""
+
+    index: int
+    ctx: PipelineContext
+    kwargs: dict[str, Any]
+    result: StageResult
+    timestamp: float
+    original_impl: BaseStage | None = None
+
+    @property
+    def session_id(self) -> str | None:
+        """Return the session_id kwarg, if present."""
+        return self.kwargs.get("session_id")
+
+    @property
+    def attempt(self) -> int:
+        """Return the attempt kwarg, defaulting to 1."""
+        return self.kwargs.get("attempt", 1)
+
+    @property
+    def succeeded(self) -> bool:
+        """Return whether the result was successful."""
+        return self.result.success
+
+    def context_had(self, stage_name: str) -> bool:
+        """Check whether a stage had completed before this call."""
+        return stage_name in self.ctx.results
+
+
+class MockStage(BaseStage):
+    """A programmable stage that records all calls for later verification."""
+
+    def __init__(self) -> None:
+        self._output: Any = "mock output"
+        self._fail_count: int = 0
+        self._fail_error: str = "mock failure"
+        self._always_fail: bool = False
+        self._success_output: Any | None = None  # set by then_returns()
+        self._side_effect: Callable | None = None
+        self._artifacts: list[str] = []
+        self._agent_session_id: str | None = None
+        self._agent_cost_usd: float = 0.01
+        self._calls: list[CallRecord] = []
+        self._call_count: int = 0
+        self.original_impl: BaseStage | None = None
+
+    # --- Stubbing (fluent) ---
+
+    def returns(self, output: Any) -> MockStage:
+        """Set the output value for successful calls."""
+        self._output = output
+        return self
+
+    def fails(self, *, times: int = 1, error: str = "mock failure") -> MockStage:
+        """Configure the mock to fail for the first `times` calls."""
+        self._fail_count = times
+        self._fail_error = error
+        return self
+
+    def always_fails(self, error: str = "mock failure") -> MockStage:
+        """Configure the mock to always fail."""
+        self._always_fail = True
+        self._fail_error = error
+        return self
+
+    def then_returns(self, output: Any) -> MockStage:
+        """Set the output value after failures are exhausted."""
+        self._success_output = output
+        return self
+
+    def as_agent(self, session_id: str | None = None, cost_usd: float = 0.01) -> MockStage:
+        """Mark this mock as an agent stage with usage tracking."""
+        self.needs_agent = True
+        self._agent_session_id = session_id
+        self._agent_cost_usd = cost_usd
+        return self
+
+    def with_side_effect(self, fn: Callable) -> MockStage:
+        """Set a side-effect function called instead of normal stubbing logic."""
+        self._side_effect = fn
+        return self
+
+    def with_artifacts(self, artifacts: list[str]) -> MockStage:
+        """Set artifacts returned on successful calls."""
+        self._artifacts = artifacts
+        return self
+
+    # --- Recording ---
+
+    @property
+    def calls(self) -> list[CallRecord]:
+        """Return all recorded calls."""
+        return self._calls
+
+    @property
+    def call_count(self) -> int:
+        """Return how many times this mock was called."""
+        return self._call_count
+
+    @property
+    def last_call(self) -> CallRecord:
+        """Return the most recent call record."""
+        if not self._calls:
+            raise AssertionError("MockStage was never called")
+        return self._calls[-1]
+
+    # --- Execution ---
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        """Execute the mock stage, recording the call."""
+        self._call_count += 1
+        attempt = kwargs.get("attempt", 1)
+
+        # Snapshot context
+        ctx_snapshot = PipelineContext(
+            results=dict(ctx.results),
+            params=dict(ctx.params),
+        )
+
+        # Side effect
+        if self._side_effect is not None:
+            if inspect.iscoroutinefunction(self._side_effect):
+                result = await self._side_effect(ctx, **kwargs)
+            else:
+                result = self._side_effect(ctx, **kwargs)
+            record = CallRecord(
+                index=next(_global_call_counter),
+                ctx=ctx_snapshot,
+                kwargs=dict(kwargs),
+                result=result,
+                timestamp=time.monotonic(),
+                original_impl=self.original_impl,
+            )
+            self._calls.append(record)
+            return result
+
+        # Determine success/failure
+        if self._always_fail or self._call_count <= self._fail_count:
+            session_id = self._agent_session_id or "mock-session-1"
+            result = _make_failure_result(
+                error=self._fail_error,
+                session_id=session_id,
+                cost_usd=self._agent_cost_usd,
+                attempt=attempt,
+            ) if self.needs_agent else StageResult(
+                name="", success=False, error=self._fail_error,
+            )
+        else:
+            output = (
+                self._success_output
+                if (self._success_output is not None
+                    and self._call_count > self._fail_count
+                    and self._fail_count > 0)
+                else self._output
+            )
+            session_id = self._agent_session_id or "mock-session-1"
+            result = _make_success_result(
+                output=output,
+                session_id=session_id,
+                cost_usd=self._agent_cost_usd,
+                artifacts=self._artifacts or None,
+                attempt=attempt,
+            ) if self.needs_agent else StageResult(
+                name="", success=True, output=output,
+            )
+
+        record = CallRecord(
+            index=next(_global_call_counter),
+            ctx=ctx_snapshot,
+            kwargs=dict(kwargs),
+            result=result,
+            timestamp=time.monotonic(),
+            original_impl=self.original_impl,
+        )
+        self._calls.append(record)
+        return result
+
+
+def verify(mock: MockStage) -> Verifier:
+    """Start a verification chain on a MockStage."""
+    if not isinstance(mock, MockStage):
+        raise TypeError(f"verify() requires a MockStage, got {type(mock).__name__}")
+    return Verifier(mock)
+
+
+class Verifier:
+    """Fluent assertion API for MockStage call verification."""
+
+    def __init__(self, mock: MockStage) -> None:
+        self._mock = mock
+
+    def called(self, *, times: int | None = None,
+               at_least: int | None = None,
+               at_most: int | None = None) -> Verifier:
+        """Assert call count constraints."""
+        count = self._mock.call_count
+        if times is not None and count != times:
+            raise AssertionError(
+                f"Expected {times} call(s), got {count}"
+            )
+        if at_least is not None and count < at_least:
+            raise AssertionError(
+                f"Expected at least {at_least} call(s), got {count}"
+            )
+        if at_most is not None and count > at_most:
+            raise AssertionError(
+                f"Expected at most {at_most} call(s), got {count}"
+            )
+        return self
+
+    def never_called(self) -> Verifier:
+        """Assert the mock was never called."""
+        return self.called(times=0)
+
+    def called_before(self, other: MockStage) -> Verifier:
+        """Assert this mock was called before another mock."""
+        if not self._mock.calls:
+            raise AssertionError("This mock was never called")
+        if not other.calls:
+            raise AssertionError("The other mock was never called")
+        if self._mock.calls[0].index >= other.calls[0].index:
+            raise AssertionError(
+                f"Expected to be called before the other mock "
+                f"(index {self._mock.calls[0].index} >= {other.calls[0].index})"
+            )
+        return self
+
+    def called_after(self, other: MockStage) -> Verifier:
+        """Assert this mock was called after another mock."""
+        if not self._mock.calls:
+            raise AssertionError("This mock was never called")
+        if not other.calls:
+            raise AssertionError("The other mock was never called")
+        if self._mock.calls[0].index <= other.calls[0].index:
+            raise AssertionError(
+                f"Expected to be called after the other mock "
+                f"(index {self._mock.calls[0].index} <= {other.calls[0].index})"
+            )
+        return self
+
+    def received_context(self, predicate: Callable[[PipelineContext], bool],
+                         msg: str = "") -> Verifier:
+        """Assert at least one call matched a context predicate."""
+        for call in self._mock.calls:
+            if predicate(call.ctx):
+                return self
+        detail = f": {msg}" if msg else ""
+        raise AssertionError(
+            f"No call matched the context predicate{detail}"
+        )
+
+    def received_session(self, session_id: str) -> Verifier:
+        """Assert at least one call received the given session_id."""
+        for call in self._mock.calls:
+            if call.session_id == session_id:
+                return self
+        raise AssertionError(
+            f"No call received session_id={session_id!r}"
+        )
+
+    def on_attempt(self, n: int) -> CallVerifier:
+        """Return a CallVerifier for the nth call (1-indexed)."""
+        if n < 1 or n > len(self._mock.calls):
+            raise AssertionError(
+                f"Call {n} does not exist (mock was called {len(self._mock.calls)} time(s))"
+            )
+        return CallVerifier(self._mock.calls[n - 1])
+
+
+class CallVerifier:
+    """Assertions on a specific CallRecord."""
+
+    def __init__(self, call: CallRecord) -> None:
+        self._call = call
+
+    def succeeded(self) -> CallVerifier:
+        """Assert the call succeeded."""
+        if not self._call.succeeded:
+            raise AssertionError(
+                f"Expected call {self._call.index} to succeed, "
+                f"but it failed with: {self._call.result.error}"
+            )
+        return self
+
+    def failed(self) -> CallVerifier:
+        """Assert the call failed."""
+        if self._call.succeeded:
+            raise AssertionError(
+                f"Expected call {self._call.index} to fail, but it succeeded"
+            )
+        return self
+
+    def had_context(self, stage_name: str) -> CallVerifier:
+        """Assert a stage result was present in the context at call time."""
+        if not self._call.context_had(stage_name):
+            available = list(self._call.ctx.results.keys())
+            raise AssertionError(
+                f"Expected {stage_name!r} in context, "
+                f"available: {available}"
+            )
+        return self
+
+    def had_output(self, stage_name: str, expected: Any = None,
+                   *, error: str | None = None) -> CallVerifier:
+        """Assert a stage result was present with specific output or error."""
+        self.had_context(stage_name)
+        result = self._call.ctx.results[stage_name]
+        if expected is not None and result.output != expected:
+            raise AssertionError(
+                f"Expected output {expected!r} for {stage_name!r}, "
+                f"got {result.output!r}"
+            )
+        if error is not None and result.error != error:
+            raise AssertionError(
+                f"Expected error {error!r} for {stage_name!r}, "
+                f"got {result.error!r}"
+            )
+        return self
+
+
+class StageResultView:
+    """Convenience wrapper around a single stage's StageResult."""
+
+    def __init__(self, result: StageResult) -> None:
+        self._result = result
+
+    def assert_success(self) -> None:
+        if not self._result.success:
+            raise AssertionError(
+                f"Expected stage {self._result.name!r} to succeed, "
+                f"but it failed with: {self._result.error}"
+            )
+
+    def assert_failed(self) -> None:
+        if self._result.success:
+            raise AssertionError(
+                f"Expected stage {self._result.name!r} to fail, but it succeeded"
+            )
+
+    def assert_output(self, expected: Any) -> None:
+        if self._result.output != expected:
+            raise AssertionError(
+                f"Expected output {expected!r}, got {self._result.output!r}"
+            )
+
+    def assert_output_contains(self, text: str) -> None:
+        output_str = str(self._result.output)
+        if text not in output_str:
+            raise AssertionError(
+                f"Expected output to contain {text!r}, got {output_str!r}"
+            )
+
+
+class PipelineTestResult:
+    """Rich result object wrapping PipelineContext after a test run."""
+
+    def __init__(self, ctx: PipelineContext, mocks: dict[str, MockStage]) -> None:
+        self.ctx = ctx
+        self._mocks = mocks
+
+    def stage(self, name: str) -> StageResultView:
+        if name not in self.ctx.results:
+            raise KeyError(f"Stage {name!r} not found in results")
+        return StageResultView(self.ctx.results[name])
+
+    def mock(self, name: str) -> MockStage:
+        if name not in self._mocks:
+            raise KeyError(f"Mock {name!r} not found in patches")
+        return self._mocks[name]
+
+    def assert_completed(self) -> None:
+        failed = [
+            name for name, r in self.ctx.results.items() if not r.success
+        ]
+        if failed:
+            raise AssertionError(f"Pipeline had failed stages: {failed}")
+
+    def assert_failed_at(self, stage_name: str) -> None:
+        if stage_name not in self.ctx.results:
+            raise AssertionError(f"Stage {stage_name!r} not found in results")
+        if self.ctx.results[stage_name].success:
+            raise AssertionError(
+                f"Expected stage {stage_name!r} to fail, but it succeeded"
+            )
+
+
+class PipelineTestRunner:
+    """Fluent test builder for pipeline execution."""
+
+    def __init__(self, config: str | Pipeline) -> None:
+        self._config = config
+        self._patches: dict[str, MockStage] = {}
+        self._params: dict[str, str] = {}
+        self._resume_session: str | None = None
+
+    def patch(self, stage_name: str, mock: MockStage) -> PipelineTestRunner:
+        self._patches[stage_name] = mock
+        return self
+
+    def with_param(self, key: str, value: str) -> PipelineTestRunner:
+        self._params[key] = value
+        return self
+
+    def with_resume(self, session_id: str) -> PipelineTestRunner:
+        self._resume_session = session_id
+        return self
+
+    async def run(self) -> PipelineTestResult:
+        if isinstance(self._config, str):
+            pipeline = load_pipeline(self._config)
+        else:
+            pipeline = self._config
+        patch_stages(pipeline, self._patches)
+        ctx = await run_pipeline(
+            pipeline,
+            params=self._params or None,
+            resume_session=self._resume_session,
+        )
+        return PipelineTestResult(ctx, self._patches)
 
 
 def _make_success_result(
@@ -206,9 +643,13 @@ def _patch_items(items: list, patches: dict[str, BaseStage]) -> None:
     """Recursively replace stage implementations by name in a pipeline's items."""
     for i, item in enumerate(items):
         if isinstance(item, Stage) and item.name in patches:
+            mock = patches[item.name]
+            # Stash original impl on MockStage instances for input inspection
+            if isinstance(mock, MockStage):
+                mock.original_impl = item.impl
             items[i] = Stage(
                 name=item.name,
-                impl=patches[item.name],
+                impl=mock,
                 on_failure=item.on_failure,
                 when=item.when,
                 timeout=item.timeout,
