@@ -144,6 +144,15 @@ from norn.stages.base import BaseStage
 log = logging.getLogger(__name__)
 
 
+def _githubkit_available() -> bool:
+    """Check whether the ``githubkit`` package is importable."""
+    try:
+        import githubkit  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 async def _resolve_token() -> str | None:
     """Resolve a GitHub token using a layered strategy.
 
@@ -469,9 +478,7 @@ class CheckCI(BaseStage):
         self.max_log_lines = max_log_lines
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
-        try:
-            from githubkit import GitHub
-        except ImportError:
+        if not _githubkit_available():
             return StageResult(
                 name="", success=False,
                 error="githubkit is not installed. Install with: pip install 'norn[github]'",

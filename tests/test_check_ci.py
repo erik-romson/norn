@@ -62,6 +62,9 @@ def _patch_env(monkeypatch):
     """Patch token resolution and repo/branch detection."""
     def _apply(token="ghp_test123", repo="org/repo", branch="main"):
         monkeypatch.setattr(
+            "norn.stages.check_ci._githubkit_available", lambda: True,
+        )
+        monkeypatch.setattr(
             "norn.stages.check_ci._resolve_token", AsyncMock(return_value=token),
         )
         monkeypatch.setattr(
@@ -187,12 +190,13 @@ async def test_no_repo(_patch_env):
 
 
 @pytest.mark.asyncio
-async def test_missing_githubkit(_patch_env):
-    _patch_env()
+async def test_missing_githubkit(monkeypatch):
+    monkeypatch.setattr(
+        "norn.stages.check_ci._githubkit_available", lambda: False,
+    )
 
-    with patch.dict("sys.modules", {"githubkit": None}):
-        stage = CheckCI(repo="org/repo")
-        result = await stage.run(PipelineContext())
+    stage = CheckCI(repo="org/repo")
+    result = await stage.run(PipelineContext())
 
     assert not result.success
     assert "githubkit is not installed" in result.error
