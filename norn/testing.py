@@ -26,6 +26,10 @@ Usage::
 
 from __future__ import annotations
 
+import copy
+import itertools
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from mockito import mock
@@ -35,6 +39,45 @@ from norn.loader import load_pipeline
 from norn.models import PipelineContext, StageResult, UsageRecord
 from norn.runner import run_pipeline
 from norn.stages.base import BaseStage
+
+_global_call_counter = itertools.count()
+
+
+def reset_call_counter() -> None:
+    """Reset the global call counter. Called between tests."""
+    global _global_call_counter
+    _global_call_counter = itertools.count()
+
+
+@dataclass
+class CallRecord:
+    """A single recorded invocation of a MockStage."""
+
+    index: int
+    ctx: PipelineContext
+    kwargs: dict[str, Any]
+    result: StageResult
+    timestamp: float
+    original_impl: BaseStage | None = None
+
+    @property
+    def session_id(self) -> str | None:
+        """Return the session_id kwarg, if present."""
+        return self.kwargs.get("session_id")
+
+    @property
+    def attempt(self) -> int:
+        """Return the attempt kwarg, defaulting to 1."""
+        return self.kwargs.get("attempt", 1)
+
+    @property
+    def succeeded(self) -> bool:
+        """Return whether the result was successful."""
+        return self.result.success
+
+    def context_had(self, stage_name: str) -> bool:
+        """Check whether a stage had completed before this call."""
+        return stage_name in self.ctx.results
 
 
 def _make_success_result(

@@ -59,12 +59,12 @@ if not step_files:
     )
 
 if not step_files:
-    print(
-        f"Error: no step-*.md files found in {feature_dir}\n"
-        "Usage: norn run dogfooding/implement_features.py <directory>",
-        file=sys.stderr,
+    from norn.runner import PipelineError
+
+    raise PipelineError(
+        f"No step-*.md files found in {feature_dir}\n"
+        "Usage: norn run dogfooding/implement_features.py <directory>"
     )
-    sys.exit(1)
 
 # --- build pipeline ---
 pipeline = (
