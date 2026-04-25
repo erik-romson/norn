@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import pytest
 
+from dogfooding.common import (
+    clean_worktree,
+    first_h1,
+    parse_front_matter,
+    preflight,
+    record_start,
+)
 from dogfooding.implement_plan.implementation_plan import (
     ImplementationPlan,
     PlanStep,
-    _first_h1,
-    _parse_front_matter,
 )
-from norn.dsl import Pipeline, Stage, fail
+from dogfooding.implement_plan.pipeline import build_pipeline
+from norn.dsl import Pipeline
 from norn.stages.generate import Generate
 from norn.stages.run_command import RunCommand
 from norn.testing import (
@@ -64,29 +70,29 @@ class TestPlanStep:
 
 class TestParseFrontMatter:
     def test_no_front_matter(self):
-        fm, body = _parse_front_matter("just text")
+        fm, body = parse_front_matter("just text")
         assert fm == {}
         assert body == "just text"
 
     def test_simple_key_value(self):
         text = "---\ntest_cmd: pytest -v\n---\nbody here"
-        fm, body = _parse_front_matter(text)
+        fm, body = parse_front_matter(text)
         assert fm["test_cmd"] == "pytest -v"
         assert body == "body here"
 
     def test_list_values(self):
         text = "---\npaths:\n  - src/\n  - tests/\n---\nbody"
-        fm, body = _parse_front_matter(text)
+        fm, body = parse_front_matter(text)
         assert fm["paths"] == ["src/", "tests/"]
         assert body == "body"
 
 
 class TestFirstH1:
     def test_finds_h1(self):
-        assert _first_h1("some text\n# My Title\nmore") == "My Title"
+        assert first_h1("some text\n# My Title\nmore") == "My Title"
 
     def test_no_h1(self):
-        assert _first_h1("no heading here") is None
+        assert first_h1("no heading here") is None
 
 
 # ---------------------------------------------------------------------------
@@ -98,30 +104,27 @@ class TestImplementationPlanFromSteps:
     def _plan(self, steps: list[PlanStep] | None = None) -> ImplementationPlan:
         if steps is None:
             steps = [_make_step()]
-        return ImplementationPlan.from_steps(steps, project_dir="/tmp/proj")
+        return ImplementationPlan(steps, project_dir="/tmp/proj")
 
     def test_iteration_yields_steps(self):
         steps = [_make_step(name="a"), _make_step(name="b")]
-        plan = ImplementationPlan.from_steps(steps, project_dir="/tmp")
+        plan = ImplementationPlan(steps, project_dir="/tmp")
         assert [s.name for s in plan] == ["a", "b"]
 
     def test_clean_worktree_returns_run_command(self):
-        plan = self._plan()
-        stage = plan.clean_worktree()
+        stage = clean_worktree("/tmp/proj")
         assert isinstance(stage, RunCommand)
         assert "git status --porcelain" in stage.cmd
 
     def test_preflight_returns_run_command(self):
-        plan = self._plan()
-        stage = plan.preflight("uv", "python3")
+        stage = preflight("/tmp/proj", "uv", "python3")
         assert isinstance(stage, RunCommand)
         assert "command -v" in stage.cmd
         assert "uv" in stage.cmd
         assert "python3" in stage.cmd
 
     def test_record_start_returns_run_command(self):
-        plan = self._plan()
-        stage = plan.record_start()
+        stage = record_start("/tmp/proj")
         assert isinstance(stage, RunCommand)
         assert "git rev-parse HEAD" in stage.cmd
 
@@ -198,9 +201,9 @@ class TestImplementationPlanFromSteps:
         assert "Write" not in stage.allowed_tools
         assert "handoff.md" in stage.prompt
 
-    def test_from_steps_with_shared_context(self):
+    def test_shared_context_in_implement_prompt(self):
         step = _make_step()
-        plan = ImplementationPlan.from_steps(
+        plan = ImplementationPlan(
             [step], project_dir="/tmp", shared_context="Some shared info"
         )
         gen = plan.implement(step)
@@ -208,7 +211,7 @@ class TestImplementationPlanFromSteps:
 
     def test_generate_sets_cwd_and_setting_sources(self):
         step = _make_step()
-        plan = ImplementationPlan.from_steps([step], project_dir="/my/project")
+        plan = ImplementationPlan([step], project_dir="/my/project")
         gen = plan.implement(step)
         assert gen.cwd == "/my/project"
         assert gen.setting_sources == ["project"]
@@ -234,27 +237,10 @@ def _make_test_step(
     )
 
 
-def _build_pipeline(steps: list[PlanStep] | None = None) -> Pipeline:
-    """Build a pipeline matching the structure of implement_plan/pipeline.py."""
-    plan = ImplementationPlan.from_steps(steps or [_make_test_step()])
-    pipeline = Pipeline("test")
-    pipeline.stage("record start", RunCommand(cmd="echo abc123"))
-    for step in plan:
-        pipeline.stage(f"implement {step.name}", plan.implement(step))
-        pipeline.loop(
-            f"test {step.name}",
-            max_retries=5,
-            on_exhaust=fail,
-            stages=[
-                Stage(f"fix {step.name}", plan.fix(step), when=step.test_failed()),
-                Stage(f"test {step.name}", plan.test(step)),
-                Stage(f"bats {step.name}", plan.bats(step)),
-            ],
-        )
-        pipeline.stage(f"commit {step.name}", plan.commit(step))
-        pipeline.stage(f"summarize {step.name}", plan.summarize(step))
-        pipeline.clear_context()
-    return pipeline
+def _build(steps: list[PlanStep] | None = None) -> Pipeline:
+    """Build a pipeline using the real structure from pipeline.py."""
+    plan = ImplementationPlan(steps or [_make_test_step()], project_dir="/tmp")
+    return build_pipeline(plan)
 
 
 @pytest.mark.asyncio
@@ -269,7 +255,7 @@ async def test_single_step_happy_path():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline())
+        PipelineTestRunner(_build())
         .patch("record start", record)
         .patch("implement step-01", implement)
         .patch("fix step-01", fix)
@@ -301,7 +287,7 @@ async def test_pytest_fails_then_fix_retries():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline())
+        PipelineTestRunner(_build())
         .patch("record start", record)
         .patch("implement step-01", implement)
         .patch("fix step-01", fix)
@@ -333,7 +319,7 @@ async def test_bats_fails_then_fix_retries():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline())
+        PipelineTestRunner(_build())
         .patch("record start", record)
         .patch("implement step-01", implement)
         .patch("fix step-01", fix)
@@ -364,7 +350,7 @@ async def test_exhausts_retries_raises():
 
     with pytest.raises(Exception):
         await (
-            PipelineTestRunner(_build_pipeline())
+            PipelineTestRunner(_build())
             .patch("record start", record)
             .patch("implement step-01", implement)
             .patch("fix step-01", fix)
@@ -391,7 +377,7 @@ async def test_original_impl_preserved():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline())
+        PipelineTestRunner(_build())
         .patch("record start", record)
         .patch("implement step-01", implement)
         .patch("fix step-01", fix)
@@ -423,7 +409,7 @@ async def test_implement_prompt_contains_step_body():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline([step]))
+        PipelineTestRunner(_build([step]))
         .patch("record start", record)
         .patch("implement step-01", implement)
         .patch("fix step-01", fix)
@@ -454,7 +440,7 @@ async def test_fix_prompt_references_test_outputs():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline([step]))
+        PipelineTestRunner(_build([step]))
         .patch("record start", record)
         .patch("implement step-01", implement)
         .patch("fix step-01", fix)
@@ -492,7 +478,7 @@ async def test_custom_test_cmd():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline([step]))
+        PipelineTestRunner(_build([step]))
         .patch("record start", record)
         .patch("implement step-01", implement)
         .patch("fix step-01", fix)
@@ -532,7 +518,7 @@ async def test_commit_subject_from_h1():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline([step]))
+        PipelineTestRunner(_build([step]))
         .patch("record start", record)
         .patch("implement step-01", implement)
         .patch("fix step-01", fix)
@@ -569,7 +555,7 @@ async def test_multi_step_runs_all_steps():
     record = MockStage().returns({"stdout": "abc123", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner(_build_pipeline([s1, s2]))
+        PipelineTestRunner(_build([s1, s2]))
         .patch("record start", record)
         .patch("implement step-01", impl1)
         .patch("implement step-02", impl2)
