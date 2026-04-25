@@ -5,6 +5,7 @@ import glob as glob_module
 import logging
 import pathlib
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -12,7 +13,7 @@ from norn.alerts import AlertEvent, AlertManager, AlertMessage
 from norn.checkpoint import Checkpoint, save_checkpoint, serialise_output
 from norn.dsl import Budget, ClearContext, ContextSpec, Include, Loop, OnFailure, Parallel, Pipeline, PipelineItem, Stage
 from norn.loader import load_pipeline
-from norn.models import PipelineContext, StageResult, UsageTracker
+from norn.models import PipelineContext, StageLogEntry, StageResult, UsageTracker
 from norn import ui
 
 if TYPE_CHECKING:
@@ -155,6 +156,42 @@ async def _check_budget(budgets: list[Budget], tracker: UsageTracker) -> None:
                 raise BudgetExceededError(f"Budget exceeded: {detail}")
 
 
+def _append_stage_log(
+    ctx: PipelineContext,
+    *,
+    stage_name: str,
+    status: str,
+    success: bool,
+    attempt: int = 1,
+    duration_ms: int = 0,
+    error: str | None = None,
+) -> None:
+    """Record a detailed stage event for later inspection in run history."""
+    usage = ctx.results.get(stage_name).usage if stage_name in ctx.results else None
+    ctx.stage_log.append(
+        StageLogEntry(
+            name=stage_name,
+            status=status,
+            success=success,
+            attempt=attempt,
+            duration_ms=duration_ms,
+            cost_usd=usage.total_cost_usd if usage else 0.0,
+            running_total_cost_usd=ctx.usage_tracker.total_cost_usd,
+            running_total_tokens=ctx.usage_tracker.total_tokens,
+            input_tokens=usage.input_tokens if usage else 0,
+            output_tokens=usage.output_tokens if usage else 0,
+            cache_read_input_tokens=usage.cache_read_input_tokens if usage else 0,
+            cache_creation_input_tokens=usage.cache_creation_input_tokens if usage else 0,
+            duration_api_ms=usage.duration_api_ms if usage else 0,
+            num_turns=usage.num_turns if usage else 0,
+            model=usage.model if usage else None,
+            session_id=usage.session_id if usage else None,
+            error=error,
+        )
+    )
+    _persist_history_snapshot(ctx)
+
+
 async def _run_stage(
     stage: Stage,
     ctx: PipelineContext,
@@ -192,6 +229,15 @@ async def _run_stage(
         elapsed = time.monotonic() - start
         result = StageResult(name=stage.name, success=False, error=f"Timed out after {stage.timeout}s")
         ctx.results[stage.name] = result
+        _append_stage_log(
+            ctx,
+            stage_name=stage.name,
+            status="failed",
+            success=False,
+            attempt=attempt,
+            duration_ms=int(elapsed * 1000),
+            error=result.error,
+        )
         ui.print_stage_failure(stage.name, elapsed, result)
         ui.print_running_total(ctx.usage_tracker, budgets)
         return result
@@ -202,6 +248,15 @@ async def _run_stage(
         result.usage.stage_name = stage.name
         ctx.usage_tracker.add(result.usage)
     ctx.results[stage.name] = result
+    _append_stage_log(
+        ctx,
+        stage_name=stage.name,
+        status="passed" if result.success else "failed",
+        success=result.success,
+        attempt=attempt,
+        duration_ms=int(elapsed * 1000),
+        error=result.error,
+    )
 
     if result.success:
         ui.print_stage_success(stage.name, elapsed, result)
@@ -294,16 +349,37 @@ async def _run_loop(
         for stage in loop.stages:
             if _is_cached(stage, ctx):
                 ui.print_stage_cached(stage.name)
+                _append_stage_log(
+                    ctx,
+                    stage_name=stage.name,
+                    status="cached",
+                    success=True,
+                    attempt=attempt,
+                )
                 continue
 
             if _is_skipped(stage, ctx):
                 ui.print_stage_skipped(stage.name)
                 ctx.results[stage.name] = StageResult(name=stage.name, success=True)
+                _append_stage_log(
+                    ctx,
+                    stage_name=stage.name,
+                    status="skipped",
+                    success=True,
+                    attempt=attempt,
+                )
                 continue
 
             if stage.when is not None and not stage.when(ctx):
                 ui.print_stage_skipped_condition(stage.name)
                 ctx.results[stage.name] = StageResult(name=stage.name, success=True)
+                _append_stage_log(
+                    ctx,
+                    stage_name=stage.name,
+                    status="skipped_condition",
+                    success=True,
+                    attempt=attempt,
+                )
                 continue
 
             if step_mode:
@@ -311,6 +387,13 @@ async def _run_loop(
                 if action == "s":
                     ui.print_stage_skipped(stage.name)
                     ctx.results[stage.name] = StageResult(name=stage.name, success=True)
+                    _append_stage_log(
+                        ctx,
+                        stage_name=stage.name,
+                        status="skipped",
+                        success=True,
+                        attempt=attempt,
+                    )
                     continue
                 if action == "a":
                     raise PipelineError(
@@ -428,14 +511,17 @@ async def _run_parallel(
     ui.print_parallel_done(parallel.name)
 
 
-def _append_history(
+def _append_history_snapshot(
     config_path: str,
     ctx: PipelineContext,
     start_time: float,
     failed_stage: str | None,
+    *,
+    run_id: int,
+    in_progress: bool,
 ) -> None:
-    """Persist a run record to the JSONL history file beside the config."""
-    from norn.history import RunRecord, StageHistoryEntry, append_run, next_run_id
+    """Append a run snapshot to the JSONL history file."""
+    from norn.history import RunRecord, StageHistoryEntry, append_run
 
     stage_costs: dict[str, float] = {}
     for rec in ctx.usage_tracker.records:
@@ -446,13 +532,12 @@ def _append_history(
         for name, result in ctx.results.items()
     ]
 
-    run_id = next_run_id(config_path)
     duration_ms = int((time.monotonic() - start_time) * 1000)
 
     record = RunRecord(
         run_id=run_id,
         timestamp=datetime.now(timezone.utc).isoformat(),
-        success=failed_stage is None,
+        success=failed_stage is None and not in_progress,
         total_cost_usd=ctx.usage_tracker.total_cost_usd,
         total_tokens=ctx.usage_tracker.total_tokens,
         duration_ms=duration_ms,
@@ -460,11 +545,35 @@ def _append_history(
         retries=ctx.retries,
         session_id=ctx.usage_tracker.last_session_id,
         failed_stage=failed_stage,
+        in_progress=in_progress,
+        stage_log=list(ctx.stage_log),
     )
     try:
         append_run(config_path, record)
     except Exception:
         log.warning("Failed to write run history for %s", config_path)
+
+
+def _persist_history_snapshot(
+    ctx: PipelineContext,
+    *,
+    failed_stage: str | None = None,
+    in_progress: bool = True,
+) -> None:
+    """Persist the current run snapshot when history tracking is active."""
+    config_path = getattr(ctx, "_history_config_path", None)
+    run_id = getattr(ctx, "_history_run_id", None)
+    start_time = getattr(ctx, "_history_start_time", None)
+    if not config_path or run_id is None or start_time is None:
+        return
+    _append_history_snapshot(
+        config_path,
+        ctx,
+        start_time,
+        failed_stage,
+        run_id=run_id,
+        in_progress=in_progress,
+    )
 
 
 async def run_pipeline(
@@ -498,6 +607,12 @@ async def run_pipeline(
     if pipeline.default_model:
         ctx.params.setdefault("default_model", pipeline.default_model)
     start_time = time.monotonic()
+    if config_path:
+        from norn.history import next_run_id
+
+        ctx._history_config_path = config_path
+        ctx._history_run_id = next_run_id(config_path)
+        ctx._history_start_time = start_time
     if ctx.params:
         log.debug("Pipeline params: %s", ctx.params)
 
@@ -551,6 +666,8 @@ async def run_pipeline(
         if current_session is None:
             current_session = resume_checkpoint.session_id
 
+    _persist_history_snapshot(ctx)
+
     _failed_stage: str | None = None
     try:
         for item in items:
@@ -564,16 +681,24 @@ async def run_pipeline(
             if isinstance(item, Stage):
                 if _is_cached(item, ctx):
                     ui.print_stage_cached(item.name)
+                    _append_stage_log(ctx, stage_name=item.name, status="cached", success=True)
                     continue
 
                 if _is_skipped(item, ctx):
                     ui.print_stage_skipped(item.name)
                     ctx.results[item.name] = StageResult(name=item.name, success=True)
+                    _append_stage_log(ctx, stage_name=item.name, status="skipped", success=True)
                     continue
 
                 if item.when is not None and not item.when(ctx):
                     ui.print_stage_skipped_condition(item.name)
                     ctx.results[item.name] = StageResult(name=item.name, success=True)
+                    _append_stage_log(
+                        ctx,
+                        stage_name=item.name,
+                        status="skipped_condition",
+                        success=True,
+                    )
                     continue
 
                 if step_mode:
@@ -581,6 +706,7 @@ async def run_pipeline(
                     if action == "s":
                         ui.print_stage_skipped(item.name)
                         ctx.results[item.name] = StageResult(name=item.name, success=True)
+                        _append_stage_log(ctx, stage_name=item.name, status="skipped", success=True)
                         continue
                     if action == "a":
                         raise PipelineError(
@@ -659,6 +785,8 @@ async def run_pipeline(
                 # isolated=True: run in a fresh context with a forked agent session
                 sub = load_pipeline(item.path)
                 sub_params = {**ctx.params, **item.args}
+                cost_offset = ctx.usage_tracker.total_cost_usd
+                token_offset = ctx.usage_tracker.total_tokens
                 ui.print_include_start(item.path, isolated=True)
                 sub_ctx = await run_pipeline(
                     sub,
@@ -670,6 +798,15 @@ async def run_pipeline(
                 # Merge usage records into parent tracker
                 for record in sub_ctx.usage_tracker.records:
                     ctx.usage_tracker.add(record)
+                for entry in sub_ctx.stage_log:
+                    ctx.stage_log.append(
+                        replace(
+                            entry,
+                            running_total_cost_usd=entry.running_total_cost_usd + cost_offset,
+                            running_total_tokens=entry.running_total_tokens + token_offset,
+                        )
+                    )
+                _persist_history_snapshot(ctx)
                 # Copy requested stage outputs to parent context
                 for name in item.outputs:
                     if name in sub_ctx.results:
@@ -688,8 +825,7 @@ async def run_pipeline(
             )
         raise
     finally:
-        if config_path:
-            _append_history(config_path, ctx, start_time, _failed_stage)
+        _persist_history_snapshot(ctx, failed_stage=_failed_stage, in_progress=False)
 
     ui.print_usage_report(pipeline.name, ctx.usage_tracker, config_path)
     if alert_manager:

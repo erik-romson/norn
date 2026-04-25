@@ -308,10 +308,16 @@ def print_history_table(records: list[RunRecord]) -> None:
     table.add_column("Info")
 
     for r in records:
-        status = "[green]✓ Complete[/green]" if r.success else "[red]✗ Failed[/red]"
+        if r.in_progress:
+            status = "[yellow]↻ Running[/yellow]"
+        else:
+            status = "[green]✓ Complete[/green]" if r.success else "[red]✗ Failed[/red]"
         cost = f"${r.total_cost_usd:.2f}" if r.total_cost_usd else "-"
         duration = f"{r.duration_ms / 1000:.1f}s"
-        info = f"{len(r.stages)} stages" if r.success else f"stage: {r.failed_stage or '?'}"
+        if r.in_progress:
+            info = f"{len(r.stages)} stages so far"
+        else:
+            info = f"{len(r.stages)} stages" if r.success else f"stage: {r.failed_stage or '?'}"
         ts = r.timestamp[:16].replace("T", " ")
         table.add_row(f"#{r.run_id}", ts, status, cost, duration, info)
 
@@ -348,4 +354,84 @@ def print_history_comparison(records: list[RunRecord], run_a: int, run_b: int) -
         + _pct(float(a.total_tokens), float(b.total_tokens))
     )
     console.print(f"  Retries: {a.retries} → {b.retries}")
+    console.print()
+
+
+def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
+    """Print a detailed step-by-step log for a single run."""
+    by_id = {r.run_id: r for r in records}
+    record = by_id.get(run_id)
+    if record is None:
+        console.print(f"[red]Run #{run_id} not found in history.[/red]")
+        return
+
+    if record.in_progress:
+        status = "[yellow]Running[/yellow]"
+    else:
+        status = "[green]Complete[/green]" if record.success else "[red]Failed[/red]"
+    timestamp = record.timestamp[:19].replace("T", " ")
+
+    console.print(f"\n  [bold]Run #{record.run_id}[/bold]")
+    console.print(f"  Status:    {status}")
+    console.print(f"  Timestamp: {timestamp}")
+    console.print(f"  Cost:      ${record.total_cost_usd:.4f}")
+    console.print(f"  Tokens:    {record.total_tokens:,}")
+    console.print(f"  Duration:  {record.duration_ms / 1000:.1f}s")
+    console.print(f"  Retries:   {record.retries}")
+    if record.session_id:
+        console.print(f"  Session:   {record.session_id}")
+    if record.failed_stage:
+        console.print(f"  Failed at: {record.failed_stage}")
+
+    if not record.stage_log:
+        console.print("\n  [dim]No detailed stage log stored for this run.[/dim]\n")
+        return
+
+    table = Table(title=f"Run #{record.run_id} — Step Log", title_style="bold", show_edge=False)
+    table.add_column("Step", style="cyan", overflow="fold")
+    table.add_column("Att", justify="right")
+    table.add_column("Status")
+    table.add_column("Cost", justify="right")
+    table.add_column("Running", justify="right")
+    table.add_column("Tokens", justify="right")
+    table.add_column("API", justify="right")
+    table.add_column("Wall", justify="right")
+    table.add_column("Model", overflow="fold")
+    table.add_column("Info", overflow="fold")
+
+    status_labels = {
+        "passed": "[green]passed[/green]",
+        "failed": "[red]failed[/red]",
+        "skipped": "[dim]skipped[/dim]",
+        "skipped_condition": "[dim]skipped[/dim]",
+        "cached": "[dim]cached[/dim]",
+    }
+    info_labels = {
+        "skipped_condition": "condition not met",
+        "cached": "checkpoint cache",
+    }
+
+    for entry in record.stage_log:
+        tokens = f"{entry.input_tokens:,}/{entry.output_tokens:,}" if entry.total_tokens else "-"
+        api = f"{entry.duration_api_ms / 1000:.1f}s" if entry.duration_api_ms else "-"
+        cost = f"${entry.cost_usd:.4f}" if entry.cost_usd else "-"
+        running = f"${entry.running_total_cost_usd:.4f}"
+        info = info_labels.get(entry.status, "")
+        if entry.error:
+            info = mask(entry.error).strip().splitlines()[-1]
+        table.add_row(
+            entry.name,
+            str(entry.attempt),
+            status_labels.get(entry.status, entry.status),
+            cost,
+            running,
+            tokens,
+            api,
+            f"{entry.duration_ms / 1000:.1f}s",
+            entry.model or "-",
+            info or "-",
+        )
+
+    console.print()
+    console.print(table)
     console.print()

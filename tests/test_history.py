@@ -14,7 +14,7 @@ from norn.history import (
     load_history,
     next_run_id,
 )
-from norn.models import PipelineContext, StageResult
+from norn.models import PipelineContext, StageLogEntry, StageResult, UsageRecord
 from norn.runner import PipelineError, run_pipeline
 from norn.stages.base import BaseStage
 
@@ -50,6 +50,25 @@ def _make_record(run_id: int = 1, success: bool = True) -> RunRecord:
         retries=0,
         session_id="abc123",
         failed_stage=None if success else "some_stage",
+        in_progress=False,
+        stage_log=[
+            StageLogEntry(
+                name="generate",
+                status="passed",
+                success=True,
+                attempt=1,
+                duration_ms=4200,
+                cost_usd=0.12,
+                running_total_cost_usd=0.12,
+                running_total_tokens=15100,
+                input_tokens=10000,
+                output_tokens=5100,
+                duration_api_ms=3900,
+                num_turns=3,
+                model="sonnet",
+                session_id="abc123",
+            )
+        ],
     )
 
 
@@ -86,6 +105,12 @@ def test_append_and_load_round_trip(tmp_path):
     assert len(r.stages) == 1
     assert r.stages[0].name == "generate"
     assert r.stages[0].cost_usd == pytest.approx(0.12)
+    assert len(r.stage_log) == 1
+    assert r.stage_log[0].name == "generate"
+    assert r.stage_log[0].cost_usd == pytest.approx(0.12)
+    assert r.stage_log[0].running_total_cost_usd == pytest.approx(0.12)
+    assert r.stage_log[0].input_tokens == 10000
+    assert r.stage_log[0].model == "sonnet"
 
 
 def test_append_multiple_runs(tmp_path):
@@ -98,6 +123,39 @@ def test_append_multiple_runs(tmp_path):
     assert len(records) == 3
     assert [r.run_id for r in records] == [1, 2, 3]
     assert [r.success for r in records] == [True, False, True]
+
+
+def test_load_history_keeps_latest_snapshot_per_run_id(tmp_path):
+    config = str(tmp_path / "pipeline.py")
+    append_run(config, RunRecord(
+        run_id=1,
+        timestamp="2026-03-25T09:00:00+00:00",
+        success=False,
+        total_cost_usd=0.12,
+        total_tokens=1000,
+        duration_ms=100,
+        stages=[StageHistoryEntry(name="step1", success=True, cost_usd=0.12)],
+        retries=0,
+        in_progress=True,
+    ))
+    append_run(config, RunRecord(
+        run_id=1,
+        timestamp="2026-03-25T09:01:00+00:00",
+        success=True,
+        total_cost_usd=0.19,
+        total_tokens=15100,
+        duration_ms=10500,
+        stages=[StageHistoryEntry(name="step1", success=True, cost_usd=0.19)],
+        retries=0,
+        in_progress=False,
+    ))
+
+    records = load_history(config)
+    assert len(records) == 1
+    assert records[0].run_id == 1
+    assert records[0].success is True
+    assert records[0].in_progress is False
+    assert records[0].total_cost_usd == pytest.approx(0.19)
 
 
 def test_load_history_returns_empty_when_no_file(tmp_path):
@@ -223,3 +281,80 @@ async def test_retries_counted_in_history(tmp_path):
     records = load_history(config)
     assert len(records) == 1
     assert records[0].retries == 1
+
+
+async def test_history_captures_detailed_stage_log(tmp_path):
+    config = str(tmp_path / "pipeline.py")
+
+    class CostStage(BaseStage):
+        needs_agent = False
+
+        async def run(self, ctx: PipelineContext) -> StageResult:
+            usage = UsageRecord(
+                stage_name="",
+                session_id="sess-1",
+                input_tokens=1200,
+                output_tokens=300,
+                total_cost_usd=0.25,
+                duration_api_ms=2100,
+                num_turns=2,
+                model="sonnet",
+            )
+            return StageResult(name="", success=True, output="ok", usage=usage)
+
+    pipeline = (
+        Pipeline("test")
+        .stage("billable", CostStage())
+        .stage("conditional", SuccessStage(), when=lambda ctx: False)
+    )
+
+    await run_pipeline(pipeline, config_path=config)
+
+    records = load_history(config)
+    assert len(records) == 1
+    assert [entry.name for entry in records[0].stage_log] == ["billable", "conditional"]
+
+    first, second = records[0].stage_log
+    assert first.status == "passed"
+    assert first.cost_usd == pytest.approx(0.25)
+    assert first.running_total_cost_usd == pytest.approx(0.25)
+    assert first.input_tokens == 1200
+    assert first.output_tokens == 300
+    assert first.duration_api_ms == 2100
+    assert first.model == "sonnet"
+    assert second.status == "skipped_condition"
+    assert second.running_total_cost_usd == pytest.approx(0.25)
+
+
+async def test_history_is_appended_incrementally_during_run(tmp_path):
+    config = str(tmp_path / "pipeline.py")
+    observed_records: list[RunRecord] = []
+
+    class InspectHistoryStage(BaseStage):
+        needs_agent = False
+
+        async def run(self, ctx: PipelineContext) -> StageResult:
+            assert history_file(config).exists()
+            records = load_history(config)
+            observed_records.extend(records)
+            assert len(records) == 1
+            assert records[0].run_id == 1
+            assert records[0].in_progress is True
+            assert [entry.name for entry in records[0].stage_log] == ["step1"]
+            return StageResult(name="", success=True, output="ok")
+
+    pipeline = (
+        Pipeline("test")
+        .stage("step1", SuccessStage())
+        .stage("step2", InspectHistoryStage())
+    )
+
+    await run_pipeline(pipeline, config_path=config)
+
+    raw_lines = [line for line in history_file(config).read_text().splitlines() if line.strip()]
+    assert len(raw_lines) >= 3
+    assert observed_records
+    final_records = load_history(config)
+    assert len(final_records) == 1
+    assert final_records[0].in_progress is False
+    assert [entry.name for entry in final_records[0].stage_log] == ["step1", "step2"]

@@ -50,10 +50,6 @@ from norn.stages.run_command import RunCommand
 
 PROJECT_DIR = os.getcwd()
 
-# Default test commands for this project.
-DEFAULT_TEST_CMD = "uv run python -m pytest tests/ -v"
-DEFAULT_BATS_CMD = "bats -r bats/ -v"
-
 metadata = {
     "env_vars": ["ANTHROPIC_API_KEY"],
     "args": {"args": "Path to directory containing step-*.md files"},
@@ -97,6 +93,54 @@ def first_h1(text: str) -> str | None:
     return None
 
 
+def default_test_cmd(project_dir: str) -> str:
+    """Choose a conservative repo-level validation default from common markers."""
+    root = Path(project_dir)
+    if (root / "pom.xml").exists():
+        return "mvn -q test"
+    if (root / "gradlew").exists():
+        return "./gradlew test"
+    if (root / "package.json").exists():
+        return "npm test -- --runInBand"
+    if (root / "pyproject.toml").exists() or (root / "tests").exists():
+        return "uv run python -m pytest tests/ -v"
+    return "true"
+
+
+def default_bats_cmd(project_dir: str) -> str:
+    root = Path(project_dir)
+    return "bats -r bats/ -v" if (root / "bats").is_dir() else "true"
+
+
+def command_executable(cmd: str) -> str | None:
+    """Extract the executable name from a simple shell command."""
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    exe = argv[0]
+    if exe in {"true", ":"}:
+        return None
+    return exe
+
+
+def command_probe(cmd: str) -> str | None:
+    exe = command_executable(cmd)
+    if not exe:
+        return None
+    if "/" in exe:
+        return (
+            f'test -x {shlex.quote(exe)} || '
+            f'{{ echo "ERROR: {exe} is not executable"; exit 1; }}'
+        )
+    return (
+        f'command -v {shlex.quote(exe)} >/dev/null || '
+        f'{{ echo "ERROR: {exe} not on PATH"; exit 1; }}'
+    )
+
+
 def already_committed_steps() -> set[str]:
     """Return step names whose `refactor: <name>` commit is already on HEAD.
     Used for resume support — those steps are skipped at build time."""
@@ -138,8 +182,8 @@ if feature_dir is None:
 
 index_path = Path(feature_dir) / "index.md"
 shared_context = ""
-feature_test_cmd = DEFAULT_TEST_CMD
-feature_bats_cmd = DEFAULT_BATS_CMD
+feature_test_cmd = default_test_cmd(PROJECT_DIR)
+feature_bats_cmd = default_bats_cmd(PROJECT_DIR)
 
 if index_path.exists():
     fm, body = parse_front_matter(index_path.read_text())
@@ -173,6 +217,22 @@ if not step_files:
         "Usage: norn run dogfooding/implement_features.py <directory>"
     )
 
+validation_commands = [feature_test_cmd, feature_bats_cmd]
+for step_file in step_files:
+    step_fm, _ = parse_front_matter(Path(step_file).read_text())
+    if isinstance(step_fm.get("test_cmd"), str):
+        validation_commands.append(step_fm["test_cmd"])
+    if isinstance(step_fm.get("bats_cmd"), str):
+        validation_commands.append(step_fm["bats_cmd"])
+
+preflight_checks: list[str] = []
+seen_checks: set[str] = set()
+for cmd in validation_commands:
+    probe = command_probe(cmd)
+    if probe and probe not in seen_checks:
+        preflight_checks.append(probe)
+        seen_checks.add(probe)
+
 # --- resume: drop steps whose commit is already on HEAD --------------------
 
 done = already_committed_steps()
@@ -197,7 +257,7 @@ for sf in step_files:
 # --- build pipeline --------------------------------------------------------
 
 pipeline = (
-    Pipeline("implement_features")
+    Pipeline("implement_features", default_model="sonnet")
     .alert(MacOSChannel())
 )
 
@@ -212,14 +272,12 @@ pipeline.stage(
     )),
 )
 
-# Pre-flight: toolchain sanity. Fails fast before we spend Generate tokens.
+# Pre-flight: validate tools required by the configured test commands.
 pipeline.stage(
     "preflight toolchain",
     RunCommand(cmd=(
         f'cd {shlex.quote(PROJECT_DIR)} && '
-        'command -v uv >/dev/null || { echo "ERROR: uv not on PATH"; exit 1; } && '
-        'command -v python3 >/dev/null || { echo "ERROR: python3 not on PATH"; exit 1; } && '
-        'python3 --version && uv --version'
+        + " && ".join(preflight_checks or ["true"])
     )),
 )
 
@@ -281,12 +339,15 @@ for step_file in step_files:
                 f"{step_body}\n\n"
                 "## Instructions\n"
                 "- Read the relevant source files before making changes\n"
+                "- Use context7 to check that versions and similar are up-to-date\n"
                 "- Implement exactly what this step describes, nothing more\n"
                 "- Follow the existing code style and conventions in the project\n"
                 "- No fallbacks or similar — fail fast and hard\n"
                 "- Do not change unrelated code\n"
                 "- Tests must pass after this step\n"
-                "- If this step has no tests, add a placeholder test that always succeeds\n"
+                "- Use the configured test command as the validation contract for this step\n"
+                "- Add or update tests when the step changes behavior or introduces logic that should be covered\n"
+                "- Do not add placeholder tests that always succeed\n"
             ),
             allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
             permission_mode="acceptEdits",
@@ -309,8 +370,8 @@ for step_file in step_files:
                     f"{shared_context}"
                     "## Fix test failures\n"
                     "The tests failed. Fix the code so the tests pass.\n\n"
-                    f"### pytest output\n{{{test_name}.output}}\n\n"
-                    f"### bats output\n{{{bats_name}.output}}\n"
+                    f"### test_cmd output\n{{{test_name}.output}}\n\n"
+                    f"### bats_cmd output\n{{{bats_name}.output}}\n"
                 ),
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
                 permission_mode="acceptEdits",
@@ -359,6 +420,7 @@ for step_file in step_files:
                 "- Important details the next step's implementer should know\n\n"
                 "Output ONLY the bullet points, no preamble.\n"
             ),
+            model="haiku",
             allowed_tools=["Read", "Glob", "Grep", "Bash"],
             permission_mode="acceptEdits",
             cwd=PROJECT_DIR,
@@ -440,6 +502,7 @@ pipeline.stage(
             "Read the actual changed files to understand what was built — "
             "don't just summarize the plan, summarize the implementation.\n"
         ),
+        model="haiku",
         allowed_tools=["Read", "Glob", "Grep", "Bash"],
         permission_mode="acceptEdits",
         cwd=PROJECT_DIR,

@@ -61,10 +61,11 @@ bin/norn pipeline.py "implement changes from @spec.txt"
 ### `norn history`
 
 ```
-norn history <config.py> [--compare RUN_A RUN_B]
+norn history <config.py> [--compare RUN_A RUN_B] [--run RUN_ID]
 ```
 
-Show run history for a pipeline config, or compare two runs side-by-side.
+Show run history for a pipeline config, compare two runs side-by-side, or inspect
+the detailed step log for a single run.
 
 ```bash
 # List all runs
@@ -73,6 +74,9 @@ uv run python -m norn history examples/hello.py
 
 # Compare runs #1 and #3
 uv run python -m norn history examples/hello.py --compare 1 3
+
+# Inspect the full step-by-step log for run #3
+uv run python -m norn history examples/hello.py --run 3
 ```
 
 Output:
@@ -83,7 +87,15 @@ Output:
    #3   2026-03-25 09:00   ✓ Complete   $0.19   10.5s  3 stages
 ```
 
-History is stored as JSONL beside the config: `examples/hello.history`.
+History is stored as JSONL using the pipeline state key.
+For bundled pipelines, that means the current working directory.
+For pipeline files inside your repo, it stays beside the config file.
+For external shared pipeline files run from another repo, it is written in the
+current working directory using the pipeline filename, e.g. `implement_features.history`.
+Each run now includes a detailed stage log with per-step status, cost, tokens,
+timing, model, and running totals.
+History is appended incrementally during execution, so interrupted runs still
+leave behind an in-progress record you can inspect later.
 
 ---
 
@@ -450,7 +462,8 @@ bin/norn examples/hello.py --resume
   ✓ test              0.8s
 ```
 
-Checkpoint file: `examples/hello.checkpoint` (JSON, beside the config file).
+Checkpoint file: `examples/hello.checkpoint` (JSON, using the same state-key
+location as history files).
 
 Contains: completed stage names, their outputs, session ID, timestamp.
 The Claude session is also resumed so the agent has memory of prior conversation.

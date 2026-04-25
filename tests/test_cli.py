@@ -2,7 +2,9 @@ from unittest.mock import patch
 
 import pytest
 
-from norn.cli import _expand_file_refs, main
+from norn.cli import _expand_file_refs, _primary_state_key, _state_key_candidates, main
+from norn.history import RunRecord, StageHistoryEntry, append_run
+from norn.models import StageLogEntry
 
 
 def test_expand_single_file_ref(tmp_path):
@@ -87,3 +89,130 @@ def test_run_unknown_file_exits():
     with patch("sys.argv", ["norn", "run", "no_such_file.py"]):
         with pytest.raises(SystemExit):
             main()
+
+
+def test_external_file_state_key_uses_cwd(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    shared = tmp_path / "shared"
+    workspace.mkdir()
+    shared.mkdir()
+    external = shared / "pipeline.py"
+    external.write_text("config = None\n")
+
+    monkeypatch.chdir(workspace)
+
+    assert _state_key_candidates(str(external)) == [
+        str((workspace / "pipeline.py").resolve()),
+        str(external.resolve()),
+    ]
+    assert _primary_state_key(str(external)) == str((workspace / "pipeline.py").resolve())
+
+
+def test_internal_file_state_key_stays_beside_config(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    internal = workspace / "pipeline.py"
+    internal.write_text("config = None\n")
+
+    monkeypatch.chdir(workspace)
+
+    assert _state_key_candidates(str(internal)) == [str(internal.resolve())]
+    assert _primary_state_key(str(internal)) == str(internal.resolve())
+
+
+def test_history_run_shows_detailed_step_log(capsys, tmp_path):
+    config = str(tmp_path / "pipeline.py")
+    append_run(
+        config,
+        RunRecord(
+            run_id=1,
+            timestamp="2026-03-25T09:00:00+00:00",
+            success=True,
+            total_cost_usd=0.19,
+            total_tokens=15100,
+            duration_ms=10500,
+            stages=[StageHistoryEntry(name="gen", success=True, cost_usd=0.12)],
+            retries=0,
+            session_id="abc123",
+            stage_log=[
+                StageLogEntry(
+                    name="gen",
+                    status="passed",
+                    success=True,
+                    attempt=1,
+                    duration_ms=4200,
+                    cost_usd=0.12,
+                    running_total_cost_usd=0.12,
+                    running_total_tokens=15100,
+                    input_tokens=10000,
+                    output_tokens=5100,
+                    duration_api_ms=3900,
+                    num_turns=3,
+                    model="sonnet",
+                    session_id="abc123",
+                )
+            ],
+        ),
+    )
+
+    with patch("sys.argv", ["norn", "history", config, "--run", "1"]):
+        main()
+
+    captured = capsys.readouterr()
+    assert "Step Log" in captured.out
+    assert "gen" in captured.out
+    assert "$0.1200" in captured.out
+    assert "sonnet" in captured.out
+
+
+def test_history_for_external_config_prefers_cwd_state(capsys, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    shared = tmp_path / "shared"
+    workspace.mkdir()
+    shared.mkdir()
+    external = shared / "pipeline.py"
+    external.write_text("config = None\n")
+
+    monkeypatch.chdir(workspace)
+
+    append_run(
+        str(workspace / "pipeline.py"),
+        RunRecord(
+            run_id=1,
+            timestamp="2026-03-25T09:00:00+00:00",
+            success=True,
+            total_cost_usd=0.19,
+            total_tokens=15100,
+            duration_ms=10500,
+            stages=[StageHistoryEntry(name="gen", success=True, cost_usd=0.12)],
+            retries=0,
+        ),
+    )
+
+    with patch("sys.argv", ["norn", "history", str(external)]):
+        main()
+
+    captured = capsys.readouterr()
+    assert "#1" in captured.out
+
+
+def test_run_external_config_writes_state_in_cwd(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    shared = tmp_path / "shared"
+    workspace.mkdir()
+    shared.mkdir()
+    external = shared / "pipeline.py"
+    external.write_text(
+        "from norn.dsl import Pipeline\n"
+        "from norn.stages.run_command import RunCommand\n"
+        "config = Pipeline('test').stage('step1', RunCommand(cmd='echo hello'))\n"
+    )
+
+    monkeypatch.chdir(workspace)
+
+    with patch("sys.argv", ["norn", "run", str(external)]):
+        main()
+
+    assert (workspace / "pipeline.history").exists()
+    assert (workspace / "pipeline.checkpoint").exists()
+    assert not (shared / "pipeline.history").exists()

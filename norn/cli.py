@@ -12,6 +12,7 @@ from norn.catalog import get_pipeline_info, list_pipelines, load_bundled_pipelin
 from norn.envfile import apply_env_files
 from norn.checkpoint import Checkpoint, load_checkpoint
 from norn.dsl import Pipeline
+from norn.history import load_history
 from norn.loader import (
     find_org_for_project,
     list_orgs,
@@ -23,6 +24,46 @@ from norn.runner import PipelineError, run_pipeline
 log = logging.getLogger(__name__)
 
 _ISSUE_KEY_RE = re.compile(r"^[A-Z]+-\d+$")
+
+
+def _state_key_candidates(config_arg: str, *, cwd: Path | None = None) -> list[str]:
+    """Return preferred state-key paths for history/checkpoint files.
+
+    External pipeline files that live outside the current working directory use
+    a cwd-local state key first, with the legacy config-adjacent location as a
+    fallback for reads.
+    """
+    cwd_path = (cwd or Path.cwd()).resolve()
+    raw = Path(config_arg)
+    if raw.suffix == ".py" and raw.exists():
+        resolved = raw.resolve()
+        if resolved.is_relative_to(cwd_path):
+            return [str(resolved)]
+        return [str((cwd_path / resolved.name).resolve()), str(resolved)]
+    return [config_arg]
+
+
+def _primary_state_key(config_arg: str, *, cwd: Path | None = None) -> str:
+    """Return the preferred state key for new checkpoint/history writes."""
+    return _state_key_candidates(config_arg, cwd=cwd)[0]
+
+
+def _load_checkpoint_for_config(config_arg: str, *, cwd: Path | None = None) -> Checkpoint | None:
+    """Load a checkpoint using primary state resolution with legacy fallback."""
+    for candidate in _state_key_candidates(config_arg, cwd=cwd):
+        checkpoint = load_checkpoint(candidate)
+        if checkpoint is not None:
+            return checkpoint
+    return None
+
+
+def _load_history_for_config(config_arg: str, *, cwd: Path | None = None) -> list:
+    """Load history using primary state resolution with legacy fallback."""
+    for candidate in _state_key_candidates(config_arg, cwd=cwd):
+        records = load_history(candidate)
+        if records:
+            return records
+    return load_history(_primary_state_key(config_arg, cwd=cwd))
 
 
 
@@ -124,6 +165,12 @@ def main() -> None:
         metavar=("RUN_A", "RUN_B"),
         help="Compare two runs by run ID (e.g. --compare 1 3)",
     )
+    history_parser.add_argument(
+        "--run",
+        type=int,
+        metavar="RUN_ID",
+        help="Show the detailed step log for one run",
+    )
 
     sub.add_parser("orgs", help="List available org configs")
 
@@ -145,11 +192,14 @@ def main() -> None:
     args, remaining = parser.parse_known_args()
 
     if args.command == "history":
-        from norn.history import load_history
         from norn import ui as _ui
 
-        records = load_history(args.config)
-        if args.compare:
+        if args.compare and args.run:
+            parser.error("--run cannot be used with --compare")
+        records = _load_history_for_config(args.config)
+        if args.run is not None:
+            _ui.print_history_run_details(records, args.run)
+        elif args.compare:
             run_a, run_b = args.compare
             _ui.print_history_comparison(records, run_a, run_b)
         else:
@@ -261,7 +311,7 @@ def main() -> None:
         except FileNotFoundError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-        config_path_for_checkpoint = args.config
+        config_path_for_checkpoint = _primary_state_key(args.config)
     elif _ISSUE_KEY_RE.match(args.config):
         project_key = args.config.split("-")[0]
         try:
@@ -270,13 +320,13 @@ def main() -> None:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
         params.setdefault("issue", args.config)
-        config_path_for_checkpoint = args.config
+        config_path_for_checkpoint = _primary_state_key(args.config)
     elif get_pipeline_info(args.config):
         pipeline = load_bundled_pipeline(args.config)
-        config_path_for_checkpoint = args.config
+        config_path_for_checkpoint = _primary_state_key(args.config)
     else:
         pipeline = _load_pipeline(args.config)
-        config_path_for_checkpoint = args.config
+        config_path_for_checkpoint = _primary_state_key(args.config)
 
     if args.dry_run:
         from norn.ui import print_dry_run
@@ -287,7 +337,7 @@ def main() -> None:
     resume_checkpoint: Checkpoint | None = None
 
     if args.resume or args.continue_session:
-        checkpoint = load_checkpoint(config_path_for_checkpoint)
+        checkpoint = _load_checkpoint_for_config(args.config)
         if args.resume and checkpoint:
             resume_checkpoint = checkpoint
             resume_session = checkpoint.session_id

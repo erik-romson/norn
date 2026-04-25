@@ -113,6 +113,38 @@ class UsageTracker:
 
 
 @dataclass
+class StageLogEntry:
+    """Detailed record for a single stage event within a pipeline run.
+
+    Captures every executed, skipped, or cached stage so completed runs can be
+    inspected later with the same step-level cost context shown during live
+    output.
+    """
+
+    name: str
+    status: str
+    success: bool
+    attempt: int = 1
+    duration_ms: int = 0
+    cost_usd: float = 0.0
+    running_total_cost_usd: float = 0.0
+    running_total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    duration_api_ms: int = 0
+    num_turns: int = 0
+    model: str | None = None
+    session_id: str | None = None
+    error: str | None = None
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass
 class StageResult:
     """Result returned by a stage after execution.
 
@@ -156,10 +188,12 @@ class PipelineContext:
         env: Pipeline-level environment variables from ``.env()``.
         retries: Total number of loop retries during this run.
         pipeline_skills: Skills applied to all Generate stages via ``.skills()``.
+        stage_log: Detailed per-stage execution log for the run.
     """
 
     results: dict[str, StageResult] = field(default_factory=dict)
     usage_tracker: UsageTracker = field(default_factory=UsageTracker)
+    stage_log: list[StageLogEntry] = field(default_factory=list)
     params: dict[str, Any] = field(default_factory=dict)
     checkpoint_stages: set[str] = field(default_factory=set)
     injected_context: list[tuple[str, str]] = field(default_factory=list)
