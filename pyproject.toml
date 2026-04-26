@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "claude-agent-sdk",
     "rich>=14.3.3",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

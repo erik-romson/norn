@@ -85,6 +85,34 @@ def print_stage_running(name: str) -> float:
     return time.monotonic()
 
 
+def print_calling_claude(stage_name: str, model: str | None) -> None:
+    """Announce that a Generate stage is about to invoke the SDK.
+
+    Prints on its own line (with newline) so it survives past the
+    agent's streamed token output, which writes directly to stdout.
+    Pairs with ``print_got_reply`` for symmetric bracketing of the
+    long-running query call.
+    """
+    model_label = f" ({model})" if model else ""
+    # Newline first so we don't land on the runner's open ⏳ spinner line.
+    console.print(
+        f"\n    [yellow]→ calling Claude{model_label}…[/yellow] [dim]({stage_name})[/dim]",
+        highlight=False,
+    )
+
+
+def print_got_reply(stage_name: str, elapsed: float) -> None:
+    """Announce that the SDK query finished, before the runner emits
+    its final ✓/✗ result line.
+
+    Pairs with ``print_calling_claude``.
+    """
+    console.print(
+        f"    [cyan]← got reply[/cyan] [dim]({stage_name}, {elapsed:.1f}s)[/dim]",
+        highlight=False,
+    )
+
+
 def print_stage_success(name: str, elapsed: float, result: StageResult) -> None:
     parts = [f"\r  [bold green]✓[/bold green] [green]{name:<20}[/green]"]
     if result.usage:

@@ -200,6 +200,100 @@ async def test_resume_checkpoint_skips_completed_stages():
     assert ctx.get("gen") == "cached-output"
 
 
+@pytest.mark.asyncio
+async def test_resume_drops_partial_loop_cache():
+    """A loop that crashed mid-attempt must not have its body stages
+    restored from the checkpoint — they need to re-run with fresh
+    outputs. The whole-loop cache (all body stages present) is still
+    honored.
+    """
+    from norn.checkpoint import Checkpoint
+
+    class CountingStage(BaseStage):
+        def __init__(self, *, fail: bool = False) -> None:
+            self.calls = 0
+            self._fail = fail
+
+        async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+            self.calls += 1
+            return StageResult(name="", success=not self._fail, output="ran")
+
+    compress = CountingStage()
+    fix = CountingStage()
+    test_stage = CountingStage(fail=True)
+    p = (
+        Pipeline("test")
+        .loop(
+            "build_loop",
+            max_retries=1,
+            on_exhaust=OnFailure.FAIL,
+            stages=[
+                Stage("compress", compress),
+                Stage("fix", fix),
+                Stage("test", test_stage),
+            ],
+        )
+    )
+
+    # Prior run got partway through the loop: compress + fix passed,
+    # then test failed and retries were exhausted. The partial successes
+    # leaked into the checkpoint — exactly the bug we're fixing.
+    partial_checkpoint = Checkpoint(
+        pipeline="test",
+        timestamp="2026-01-01T00:00:00Z",
+        session_id=None,
+        completed_stages=["compress", "fix"],
+        results={"compress": "stale", "fix": "stale"},
+        usage=[],
+    )
+
+    from norn.runner import RetriesExhaustedError
+
+    with pytest.raises(RetriesExhaustedError):
+        await run_pipeline(p, resume_checkpoint=partial_checkpoint)
+
+    # All three loop body stages re-ran fresh — the partial cache was dropped.
+    assert compress.calls == 1, "compress must re-run, not be cached"
+    assert fix.calls == 1, "fix must re-run, not be cached"
+    assert test_stage.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_complete_loop_cache():
+    """When every body stage of a loop is in the checkpoint, the loop
+    is treated as fully cached (all stages skipped, loop succeeds on
+    attempt 1 without running anything)."""
+    from norn.checkpoint import Checkpoint
+
+    class CountingStage(BaseStage):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+            self.calls += 1
+            return StageResult(name="", success=True, output="ran")
+
+    a, b, c = CountingStage(), CountingStage(), CountingStage()
+    p = Pipeline("test").loop(
+        "build_loop",
+        max_retries=2,
+        on_exhaust=OnFailure.FAIL,
+        stages=[Stage("a", a), Stage("b", b), Stage("c", c)],
+    )
+
+    full_checkpoint = Checkpoint(
+        pipeline="test",
+        timestamp="2026-01-01T00:00:00Z",
+        session_id=None,
+        completed_stages=["a", "b", "c"],
+        results={"a": "ok", "b": "ok", "c": "ok"},
+        usage=[],
+    )
+    await run_pipeline(p, resume_checkpoint=full_checkpoint)
+
+    assert a.calls == 0 and b.calls == 0 and c.calls == 0
+
+
 # ---------------------------------------------------------------------------
 # MCP tools — runner creates MCP server and passes mcp_servers kwarg
 # ---------------------------------------------------------------------------

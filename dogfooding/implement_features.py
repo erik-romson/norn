@@ -6,7 +6,11 @@ and commits the result before moving to the next file.
 
 Features:
 - `metadata` block for bin/norn discovery
-- `check clean worktree` gate — stops untracked files from leaking into commits
+- Per-step worktree snapshot — captures `git status --porcelain` before the
+  step runs and again before commit. The diff between the two is the exact
+  list of paths changed during this step, which is what gets committed.
+  Pre-existing dirty files (whose status didn't change) are NOT swept into
+  the commit, so a dirty worktree no longer blocks the run.
 - Pre-flight toolchain check (uv, python) before any expensive Generate call
 - `record start` captures the starting SHA for later diffs
 - `review` and `handoff` stages at the end
@@ -15,16 +19,10 @@ Features:
       test_cmd: uv run python -m pytest tests/test_foo.py -v
       ---
 - Per-step `test_cmd` override in step-NN.md front-matter (falls back to feature,
-  then to repo default). Also supports per-step `paths:` to scope git add:
+  then to repo default):
       ---
       test_cmd: uv run python -m pytest tests/test_foo.py -v
-      paths:
-        - norn/stages/
-        - tests/test_stages.py
       ---
-- Scoped git add — defaults to `git add -u` (tracked files only), plus any
-  `paths:` declared in step front-matter. Stops new untracked junk from leaking
-  into commits.
 - Commit message subject pulled from the first H1 in the step file.
 - Resume support: any step whose `refactor: <name>` commit is already on HEAD
   is skipped at pipeline build time.
@@ -35,20 +33,50 @@ Usage:
     bin/norn dogfooding/implement_features.py tmp/refactor --skip "commit step-03-models"
 """
 
+import hashlib
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from glob import glob
 from pathlib import Path
 
 from norn.alerts import MacOSChannel
 from norn.dsl import Pipeline, Stage, fail, stage_failed
+from norn.stages.compress_test_log import CompressTestLog
 from norn.stages.generate import Generate
 from norn.stages.run_command import RunCommand
 
 PROJECT_DIR = os.getcwd()
+
+
+def _git_toplevel(start: str) -> str:
+    """Resolve the git toplevel for ``start`` so all git operations can run
+    from a single, stable cwd. Falls back to ``start`` when not in a repo.
+
+    Pinning git operations to the toplevel removes whole categories of
+    "git status output is rooted differently than git add expects" bugs
+    that otherwise show up when PROJECT_DIR is a subdirectory of the
+    repo (e.g. a `jupyter/` subfolder of a larger project)."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", start, "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return out or start
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return start
+
+
+GIT_TOPLEVEL = _git_toplevel(PROJECT_DIR)
+
+# Snapshot location: outside PROJECT_DIR so the snapshot files themselves
+# never appear in `git status` output. Deterministic per feature_dir so
+# resume can be made aware of prior runs if needed.
+SNAPSHOT_HELPER = str(Path(__file__).parent / "_snapshot_diff.py")
 
 metadata = {
     "env_vars": ["ANTHROPIC_API_KEY"],
@@ -59,31 +87,21 @@ metadata = {
 # --- helpers ---------------------------------------------------------------
 
 def parse_front_matter(text: str) -> tuple[dict, str]:
-    """Parse a tiny subset of YAML front-matter: `key: value` and `key:`
-    + indented `- item` lists.  Returns (dict, body)."""
+    """Parse YAML front-matter delimited by ``---`` lines.
+
+    Returns ``(data, body)``. ``data`` is the parsed mapping (empty dict
+    if no front-matter), ``body`` is the remainder of the document.
+    ``data`` is normalised to a dict so callers can ``.get(...)`` even
+    on empty front-matter.
+    """
+    import yaml
+
     m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.DOTALL)
     if not m:
         return {}, text
-    block, body = m.group(1), m.group(2)
-    data: dict = {}
-    current_list_key: str | None = None
-    for raw_line in block.splitlines():
-        if not raw_line.strip():
-            current_list_key = None
-            continue
-        if raw_line.lstrip().startswith("- ") and current_list_key:
-            data[current_list_key].append(raw_line.lstrip()[2:].strip())
-            continue
-        if ":" in raw_line:
-            k, v = raw_line.split(":", 1)
-            k, v = k.strip(), v.strip()
-            if v == "":
-                data[k] = []
-                current_list_key = k
-            else:
-                data[k] = v
-                current_list_key = None
-    return data, body
+    parsed = yaml.safe_load(m.group(1))
+    data = parsed if isinstance(parsed, dict) else {}
+    return data, m.group(2)
 
 
 def first_h1(text: str) -> str | None:
@@ -93,37 +111,81 @@ def first_h1(text: str) -> str | None:
     return None
 
 
-def default_test_cmd(project_dir: str) -> str:
-    """Choose a conservative repo-level validation default from common markers."""
-    root = Path(project_dir)
-    if (root / "pom.xml").exists():
-        return "mvn -q test"
-    if (root / "gradlew").exists():
-        return "./gradlew test"
-    if (root / "package.json").exists():
-        return "npm test -- --runInBand"
-    if (root / "pyproject.toml").exists() or (root / "tests").exists():
-        return "uv run python -m pytest tests/ -v"
-    return "true"
+def _resolve_test_cmd(
+    step_fm: dict,
+    step_file: str,
+    feature_test_cmd: str | None,
+) -> str:
+    """Resolve a step's ``test_cmd`` from its front-matter, falling back to
+    the feature-level ``index.md`` value. Fails fast when neither is set
+    so the agent can't silently run a guessed command.
+
+    The split-plan skill is responsible for putting a real ``test_cmd``
+    in every step file — see ``.claude/skills/split-plan/SKILL.md``.
+    """
+    raw = step_fm.get("test_cmd")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    if feature_test_cmd:
+        return feature_test_cmd
+    from norn.runner import PipelineError
+
+    raise PipelineError(
+        f"{step_file}: missing required `test_cmd:` in front-matter and no "
+        f"feature-level fallback in index.md.\n"
+        f"Each step must declare the command that validates it. "
+        f"Re-run /split-plan to regenerate the steps with explicit test_cmd "
+        f"values."
+    )
 
 
-def default_bats_cmd(project_dir: str) -> str:
-    root = Path(project_dir)
-    return "bats -r bats/ -v" if (root / "bats").is_dir() else "true"
+def _resolve_bats_cmd(step_fm: dict, feature_bats_cmd: str | None) -> str | None:
+    """Per-step ``bats_cmd`` is optional. Returns ``None`` when neither
+    the step nor the feature declares one — the bats stage is then
+    skipped entirely (no placeholder/no guess)."""
+    raw = step_fm.get("bats_cmd")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return feature_bats_cmd
 
 
 def command_executable(cmd: str) -> str | None:
-    """Extract the executable name from a simple shell command."""
+    """Extract the real executable name from a shell command.
+
+    Walks past subshell parens, ``cd <dir> &&`` wrappers, env-var
+    assignments, and shell separators so we find the actual binary
+    being invoked. For ``(cd client && flutter test)`` returns
+    ``flutter``; for ``bash bin/run.sh`` returns ``bash``. Returns
+    ``None`` when no plausible executable can be found.
+    """
     try:
         argv = shlex.split(cmd)
     except ValueError:
         return None
-    if not argv:
+
+    separators = {"&&", "||", ";", "|", "&", "(", "{", ")", "}"}
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        while tok and tok[0] in "({":
+            tok = tok[1:]
+        while tok and tok[-1] in ")}":
+            tok = tok[:-1]
+        if not tok or tok in separators:
+            i += 1
+            continue
+        if tok == "cd" and i + 1 < len(argv):
+            i += 2
+            continue
+        if tok in {"true", ":"}:
+            return None
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            i += 1
+            continue
+        if re.fullmatch(r"[\w./-]+", tok):
+            return tok
         return None
-    exe = argv[0]
-    if exe in {"true", ":"}:
-        return None
-    return exe
+    return None
 
 
 def command_probe(cmd: str) -> str | None:
@@ -177,20 +239,32 @@ for arg in raw_args:
 if feature_dir is None:
     feature_dir = os.path.join(PROJECT_DIR, "tmp")
 
+# Bump SNAPSHOT_VERSION whenever the snapshot file format changes (e.g. when
+# we adjust git flags or change the cwd we run git from) so prior runs'
+# caches are invalidated automatically.
+SNAPSHOT_VERSION = "v3"
+snapshot_root = os.path.join(
+    tempfile.gettempdir(),
+    "norn-snapshots",
+    SNAPSHOT_VERSION,
+    hashlib.sha1(feature_dir.encode()).hexdigest()[:12],
+)
+os.makedirs(snapshot_root, exist_ok=True)
+
 
 # --- load shared context (index.md) and optional front-matter -------------
 
 index_path = Path(feature_dir) / "index.md"
 shared_context = ""
-feature_test_cmd = default_test_cmd(PROJECT_DIR)
-feature_bats_cmd = default_bats_cmd(PROJECT_DIR)
+feature_test_cmd: str | None = None
+feature_bats_cmd: str | None = None
 
 if index_path.exists():
     fm, body = parse_front_matter(index_path.read_text())
-    if isinstance(fm.get("test_cmd"), str):
-        feature_test_cmd = fm["test_cmd"]
-    if isinstance(fm.get("bats_cmd"), str):
-        feature_bats_cmd = fm["bats_cmd"]
+    if isinstance(fm.get("test_cmd"), str) and fm["test_cmd"].strip():
+        feature_test_cmd = fm["test_cmd"].strip()
+    if isinstance(fm.get("bats_cmd"), str) and fm["bats_cmd"].strip():
+        feature_bats_cmd = fm["bats_cmd"].strip()
     shared_context = (
         "## Shared context (from index.md — applies to every step)\n\n"
         f"{body}\n\n"
@@ -217,13 +291,20 @@ if not step_files:
         "Usage: norn run dogfooding/implement_features.py <directory>"
     )
 
-validation_commands = [feature_test_cmd, feature_bats_cmd]
+validation_commands: list[str] = []
+if feature_test_cmd:
+    validation_commands.append(feature_test_cmd)
+if feature_bats_cmd:
+    validation_commands.append(feature_bats_cmd)
 for step_file in step_files:
     step_fm, _ = parse_front_matter(Path(step_file).read_text())
-    if isinstance(step_fm.get("test_cmd"), str):
-        validation_commands.append(step_fm["test_cmd"])
-    if isinstance(step_fm.get("bats_cmd"), str):
-        validation_commands.append(step_fm["bats_cmd"])
+    # Resolve eagerly so a missing test_cmd fails the whole run before any
+    # expensive Generate stage starts. Bats is optional so we only collect
+    # it when present.
+    validation_commands.append(_resolve_test_cmd(step_fm, step_file, feature_test_cmd))
+    bats = _resolve_bats_cmd(step_fm, feature_bats_cmd)
+    if bats:
+        validation_commands.append(bats)
 
 preflight_checks: list[str] = []
 seen_checks: set[str] = set()
@@ -261,17 +342,6 @@ pipeline = (
     .alert(MacOSChannel())
 )
 
-# Fail early if working tree is dirty.
-pipeline.stage(
-    "check clean worktree",
-    RunCommand(cmd=(
-        f'cd {shlex.quote(PROJECT_DIR)} && '
-        'if [ -n "$(git status --porcelain)" ]; then '
-        'echo "ERROR: Working tree is not clean. Commit or .gitignore these files:" && '
-        'git status --short && exit 1; fi'
-    )),
-)
-
 # Pre-flight: validate tools required by the configured test commands.
 pipeline.stage(
     "preflight toolchain",
@@ -294,20 +364,17 @@ for step_file in step_files:
     raw_step_text = Path(step_file).read_text()
     step_fm, step_body = parse_front_matter(raw_step_text)
 
-    # Per-step test_cmd override: step > feature > default.
-    test_cmd = step_fm.get("test_cmd") if isinstance(step_fm.get("test_cmd"), str) else None
-    test_cmd = test_cmd or feature_test_cmd
+    # Required: each step declares the validation contract in its
+    # front-matter, no project-marker guessing. _resolve_test_cmd raises
+    # if neither the step nor index.md provides one — see
+    # .claude/skills/split-plan/SKILL.md.
+    test_cmd = _resolve_test_cmd(step_fm, step_file, feature_test_cmd)
+    bats_cmd = _resolve_bats_cmd(step_fm, feature_bats_cmd)
 
-    bats_cmd = step_fm.get("bats_cmd") if isinstance(step_fm.get("bats_cmd"), str) else None
-    bats_cmd = bats_cmd or feature_bats_cmd
-
-    # Per-step paths for scoped git add. Always include `git add -u` so renames
-    # and modifications to tracked files are picked up.
-    extra_paths = step_fm.get("paths") if isinstance(step_fm.get("paths"), list) else []
-    add_cmd_parts = ["git add -u"]
-    for p in extra_paths:
-        add_cmd_parts.append(f"git add {shlex.quote(p)}")
-    add_cmd = " && ".join(add_cmd_parts)
+    # Per-step model override. Steps that need heavier reasoning can opt in
+    # to opus via `model: opus` in their front-matter; everything else falls
+    # back to the pipeline default (sonnet).
+    step_model = step_fm.get("model") or None
 
     # Commit subject: first H1 from the step body, falling back to the stem.
     h1 = first_h1(step_body) or name
@@ -315,6 +382,21 @@ for step_file in step_files:
 
     test_name = f"test {name}"
     bats_name = f"bats {name}"
+
+    pre_snapshot = os.path.join(snapshot_root, f"{name}.pre")
+    post_snapshot = os.path.join(snapshot_root, f"{name}.post")
+    changed_list = os.path.join(snapshot_root, f"{name}.changed")
+
+    # Snapshot the worktree state before the step runs. The commit stage
+    # below diffs this against the post-step snapshot to figure out exactly
+    # which paths to stage.
+    pipeline.stage(
+        f"snapshot pre {name}",
+        RunCommand(cmd=(
+            f'cd {shlex.quote(GIT_TOPLEVEL)} && '
+            f'git status --porcelain -uall > {shlex.quote(pre_snapshot)}'
+        )),
+    )
 
     # Build the prior-steps context block (empty for the first step).
     prior_context = ""
@@ -325,6 +407,9 @@ for step_file in step_files:
         )
 
     # Step 1: implement the step.
+    # Defaults to the pipeline-level model (sonnet). Steps that need heavier
+    # reasoning can opt into opus via `model: opus` in their front-matter —
+    # see .claude/skills/split-plan/SKILL.md for the convention.
     pipeline.stage(
         f"implement {name}",
         Generate(
@@ -349,52 +434,113 @@ for step_file in step_files:
                 "- Add or update tests when the step changes behavior or introduces logic that should be covered\n"
                 "- Do not add placeholder tests that always succeed\n"
             ),
-            allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
+            allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash", "Task"],
             permission_mode="acceptEdits",
             cwd=PROJECT_DIR,
             setting_sources=["project"],
+            model=step_model,
         ),
     )
 
     # Step 2: test + fix loop.
+    #
+    # Loop layout (do-while):
+    #   1. compress {test_name}      — pulls failures from the previous
+    #                                   iteration's run; "" when source
+    #                                   succeeded or hasn't run yet
+    #   2. compress {bats_name}      — same, only added when bats_cmd is set
+    #   3. fix {name}                — only when a prior iter failed; reads
+    #                                   the compressed outputs above
+    #   4. {test_name}               — actual test run (declared by the step)
+    #   5. {bats_name}               — optional bats integration tests
+    #
+    # CompressTestLog skips on success by default, so the fix prompt only
+    # ever sees real failure context — no passing-pytest noise carrying
+    # over to subsequent iterations.
+    fix_when = (
+        (lambda ctx, t=test_name, b=bats_name: stage_failed(t)(ctx) or stage_failed(b)(ctx))
+        if bats_cmd
+        else (lambda ctx, t=test_name: stage_failed(t)(ctx))
+    )
+    fix_prompt_parts = [
+        f"## Working directory\n{PROJECT_DIR}\n\n",
+        "IMPORTANT: When creating or editing files, always use absolute paths "
+        f"based on {PROJECT_DIR}.\n\n",
+        shared_context,
+        "## Fix test failures\n",
+        "The tests failed. Fix the code so the tests pass.\n\n",
+        f"### test_cmd output (compressed)\n{{compress {test_name}.output}}\n\n",
+    ]
+    loop_stages: list[Stage] = [
+        Stage(f"compress {test_name}", CompressTestLog(source_stage=test_name)),
+    ]
+    if bats_cmd:
+        loop_stages.append(
+            Stage(f"compress {bats_name}", CompressTestLog(source_stage=bats_name)),
+        )
+        fix_prompt_parts.append(
+            f"### bats_cmd output (compressed)\n{{compress {bats_name}.output}}\n",
+        )
+    loop_stages.append(
+        Stage(f"fix {name}", Generate(
+            prompt="".join(fix_prompt_parts),
+            allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash", "Task"],
+            permission_mode="acceptEdits",
+            cwd=PROJECT_DIR,
+            setting_sources=["project"],
+            model=step_model,
+        ), when=fix_when),
+    )
+    # The actual test command comes verbatim from the step front-matter
+    # (or feature index.md), never from a guessed project default.
+    loop_stages.append(
+        Stage(test_name, RunCommand(
+            cmd=f"cd {shlex.quote(PROJECT_DIR)} && {test_cmd}",
+        )),
+    )
+    if bats_cmd:
+        loop_stages.append(
+            Stage(bats_name, RunCommand(
+                cmd=f"cd {shlex.quote(PROJECT_DIR)} && {bats_cmd}",
+            )),
+        )
+
     pipeline.loop(
         f"test {name}",
         max_retries=5,
         on_exhaust=fail,
-        stages=[
-            Stage(f"fix {name}", Generate(
-                prompt=(
-                    f"## Working directory\n{PROJECT_DIR}\n\n"
-                    "IMPORTANT: When creating or editing files, always use absolute paths "
-                    f"based on {PROJECT_DIR}.\n\n"
-                    f"{shared_context}"
-                    "## Fix test failures\n"
-                    "The tests failed. Fix the code so the tests pass.\n\n"
-                    f"### test_cmd output\n{{{test_name}.output}}\n\n"
-                    f"### bats_cmd output\n{{{bats_name}.output}}\n"
-                ),
-                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-                permission_mode="acceptEdits",
-                cwd=PROJECT_DIR,
-                setting_sources=["project"],
-            ), when=lambda ctx, t=test_name, b=bats_name: stage_failed(t)(ctx) or stage_failed(b)(ctx)),
-            Stage(test_name, RunCommand(
-                cmd=f"cd {shlex.quote(PROJECT_DIR)} && {test_cmd}",
-            )),
-            Stage(bats_name, RunCommand(
-                cmd=f"cd {shlex.quote(PROJECT_DIR)} && {bats_cmd}",
-            )),
-        ],
+        stages=loop_stages,
     )
 
-    # Step 3: scoped commit. Uses git commit -F - so the subject is safe no
-    # matter what characters the H1 contained.
+    # Step 3: snapshot-scoped commit.
+    #
+    # Take a post-step snapshot, diff it against the pre-step snapshot to
+    # get the exact list of paths whose porcelain status changed during the
+    # step, then `git add -A --` only those paths. Pre-existing dirty files
+    # whose status is unchanged are left untouched.
+    #
+    # Uses `git commit -F -` so the subject is safe regardless of what
+    # characters the H1 contained.
     pipeline.stage(
         f"commit {name}",
         RunCommand(
             cmd=(
-                f'cd {shlex.quote(PROJECT_DIR)} && '
-                f'{add_cmd} && '
+                f'cd {shlex.quote(GIT_TOPLEVEL)} && '
+                f'if [ ! -f {shlex.quote(pre_snapshot)} ]; then '
+                f'echo "ERROR: pre-snapshot missing at {pre_snapshot}." 1>&2; '
+                f'echo "This usually means a stale checkpoint is being resumed '
+                f'after the snapshot format changed." 1>&2; '
+                f'echo "Fix: rm {os.path.dirname(snapshot_root)}/* and rerun '
+                f'without --resume (already-committed steps are auto-skipped)." 1>&2; '
+                f'exit 1; fi && '
+                f'git status --porcelain -uall > {shlex.quote(post_snapshot)} && '
+                f'python3 {shlex.quote(SNAPSHOT_HELPER)} '
+                f'{shlex.quote(pre_snapshot)} {shlex.quote(post_snapshot)} '
+                f'> {shlex.quote(changed_list)} && '
+                f'if [ ! -s {shlex.quote(changed_list)} ]; then '
+                f'echo "no files changed during this step"; exit 0; fi && '
+                f'tr "\\n" "\\0" < {shlex.quote(changed_list)} | '
+                f'xargs -0 git add -A -- && '
                 f'(git diff --cached --quiet && echo "nothing to commit") || '
                 f'printf %s {shlex.quote(commit_subject)} | git commit -F -'
             ),

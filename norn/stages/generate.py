@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
 from norn import ui
@@ -16,11 +17,69 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# The SDK emits an INFO-level "Using bundled Claude Code CLI: <path>" line on
+# every transport spawn. That breaks the inline ⏳→✓ stage indicator (the line
+# lands between the spinner and its success/failure replacement) and clutters
+# the run log with the same path repeated on every Generate call. Pin the SDK
+# logger to WARNING to keep real errors but drop the spawn chatter — same
+# pattern check_ci.py uses for httpx/httpcore.
+logging.getLogger("claude_agent_sdk").setLevel(logging.WARNING)
+
 MODEL_MAP: dict[str, str] = {
     "opus": "claude-opus-4-6",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
+
+_STDERR_PLACEHOLDER = "Check stderr output for details"
+
+
+def _normalize_error_text(text: str) -> str:
+    """Trim duplicate SDK boilerplate from CLI failure messages."""
+    cleaned = text.strip()
+    cleaned = re.sub(
+        r"Command failed with exit code (\d+) \(exit code: \1\)",
+        r"Command failed with exit code \1",
+        cleaned,
+    )
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _render_cli_exception(
+    exc: Exception,
+    stderr_lines: list[str],
+    assistant_chunks: list[str] | None = None,
+) -> str:
+    """Merge the SDK exception with captured CLI stderr, if available.
+
+    When the SDK exception's stderr is the bare "Check stderr output for
+    details" placeholder AND no stderr lines were captured (e.g. the failure
+    happened in the assistant message stream — usage-limit messages,
+    invalid-API-key messages, etc.), fall back to the tail of the
+    assistant output. That's where Claude itself prints "You've hit your
+    limit", so without this fallback the user gets a useless error.
+    """
+    message = ui.mask(str(exc)).strip() or exc.__class__.__name__
+    captured_stderr = "\n".join(ui.mask(line).strip() for line in stderr_lines if line.strip()).strip()
+    if captured_stderr:
+        if _STDERR_PLACEHOLDER in message:
+            message = message.replace(_STDERR_PLACEHOLDER, captured_stderr)
+        elif captured_stderr not in message:
+            message = f"{message}\n{captured_stderr}"
+    else:
+        exc_stderr = getattr(exc, "stderr", None)
+        if isinstance(exc_stderr, str):
+            exc_stderr = ui.mask(exc_stderr).strip()
+            if exc_stderr and exc_stderr != _STDERR_PLACEHOLDER and exc_stderr not in message:
+                message = f"{message}\n{exc_stderr}"
+
+    if _STDERR_PLACEHOLDER in message and assistant_chunks:
+        tail = ui.mask("".join(assistant_chunks)).strip()
+        if tail:
+            tail_excerpt = tail[-1000:].strip()
+            message = message.replace(_STDERR_PLACEHOLDER, tail_excerpt)
+    return _normalize_error_text(message)
 
 
 class Generate(BaseStage):
@@ -163,6 +222,7 @@ class Generate(BaseStage):
         attempt: int = kwargs.get("attempt", 1)
         fork_session: bool = kwargs.get("fork_session", False)
         mcp_servers: dict | None = kwargs.get("mcp_servers")
+        stage_name: str = kwargs.get("stage_name", "claude")
 
         try:
             from claude_agent_sdk import query
@@ -191,6 +251,7 @@ class Generate(BaseStage):
                 f"## {label}\n{content}" for label, content in ctx.injected_context
             )
 
+        stderr_lines: list[str] = []
         try:
             from claude_agent_sdk import (
                 AssistantMessage,
@@ -252,6 +313,7 @@ class Generate(BaseStage):
                 opt_kwargs["model"] = MODEL_MAP.get(resolved_model, resolved_model)
             if self.thinking:
                 opt_kwargs["thinking"] = self.thinking
+            opt_kwargs["stderr"] = lambda line: stderr_lines.append(line)
 
             # Build system_prompt from skills, template, and context injection
             system_prompt_parts: list[str] = []
@@ -300,6 +362,9 @@ class Generate(BaseStage):
                 opt_kwargs["hooks"] = {"PostToolUse": [artifact_hook]}
 
             options = ClaudeAgentOptions(**opt_kwargs)
+
+            ui.print_calling_claude(stage_name, resolved_model)
+            _query_start = time.monotonic()
 
             async for message in query(prompt=resolved_prompt, options=options):
                 if isinstance(message, AssistantMessage):
@@ -353,6 +418,8 @@ class Generate(BaseStage):
             if chunks:
                 print()  # end the streamed output line
 
+            ui.print_got_reply(stage_name, time.monotonic() - _query_start)
+
             raw_output = "".join(chunks)
 
             # When output_format was declared (via template), prefer structured_output
@@ -373,4 +440,7 @@ class Generate(BaseStage):
             return StageResult(name="", success=True, output=raw_output, usage=usage_record, artifacts=artifacts)
         except Exception as e:
             log.debug("[generate] Exception: %s", e)
-            return StageResult(name="", success=False, error=str(e))
+            return StageResult(
+                name="", success=False,
+                error=_render_cli_exception(e, stderr_lines, chunks),
+            )

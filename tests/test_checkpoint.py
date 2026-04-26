@@ -254,17 +254,22 @@ async def test_checkpoint_saved_after_loop_stage(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_resume_checkpoint_in_loop_skips_cached_stage():
-    """Cached stages inside a loop are skipped on resume."""
-    s1 = SuccessStage("cached-out")
-    s2 = SuccessStage("fresh-out")
+async def test_resume_checkpoint_in_loop_drops_partial_cache():
+    """A loop is atomic: when only some of its body stages are in the
+    checkpoint, the loop crashed mid-attempt and ALL its stages must
+    re-run on resume. Otherwise downstream stages (e.g. ``fix``) would
+    replay against the original failure rather than the current one.
+    """
+    s1 = SuccessStage("fresh-s1")
+    s2 = SuccessStage("fresh-s2")
 
+    # Only s1 is in the checkpoint — partial loop, must be dropped.
     cp = Checkpoint(
         pipeline="test",
         timestamp="2026-01-01T00:00:00Z",
         session_id=None,
         completed_stages=["s1"],
-        results={"s1": "cached-out"},
+        results={"s1": "stale-out"},
         usage=[],
     )
 
@@ -275,7 +280,7 @@ async def test_resume_checkpoint_in_loop_skips_cached_stage():
     )
     ctx = await run_pipeline(p, resume_checkpoint=cp)
 
-    assert s1.call_count == 0
+    assert s1.call_count == 1, "s1 must re-run; partial-loop cache dropped"
     assert s2.call_count == 1
-    assert ctx.get("s1") == "cached-out"
-    assert ctx.get("s2") == "fresh-out"
+    assert ctx.get("s1") == "fresh-s1"
+    assert ctx.get("s2") == "fresh-s2"

@@ -62,3 +62,26 @@ async def test_run_command_stage_env_overrides_pipeline_env():
     result = await stage.run(ctx)
     assert result.success
     assert "from_stage" in result.output["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_run_command_error_includes_both_stdout_and_stderr():
+    """Failure error must surface stdout even when stderr is non-empty.
+
+    Tools like ``pg_isready`` write diagnostics to stdout; suppressing it
+    would hide the actual failure cause.
+    """
+    stage = RunCommand(cmd="echo on_stdout; echo on_stderr 1>&2; exit 3")
+    result = await stage.run(PipelineContext())
+    assert not result.success
+    assert "stdout:\non_stdout" in result.error
+    assert "stderr:\non_stderr" in result.error
+
+
+@pytest.mark.asyncio
+async def test_run_command_error_surfaces_last_xtrace_line():
+    """When ``set -x`` is active, the last traced command appears as a hint."""
+    stage = RunCommand(cmd="sh -ex -c 'true; false'")
+    result = await stage.run(PipelineContext())
+    assert not result.success
+    assert "last command: + false" in result.error

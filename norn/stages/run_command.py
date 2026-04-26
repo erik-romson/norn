@@ -63,5 +63,39 @@ class RunCommand(BaseStage):
             "returncode": proc.returncode,
         }
         success = proc.returncode == 0
-        error = output["stderr"] if not success else None
+        error = self._format_error(output) if not success else None
         return StageResult(name="", success=success, output=output, error=error)
+
+    def _format_error(self, output: dict) -> str:
+        """Build a useful error message from a failed command's output.
+
+        Always includes exit code and the command. Shows both stdout and
+        stderr when non-empty (some tools log diagnostics only to stdout —
+        e.g. ``pg_isready``). When ``set -x`` traces are detected in stderr,
+        surfaces the last traced command as a concise ``last command`` hint
+        so chained ``&&`` failures are easy to localize.
+        """
+        cmd_preview = self.cmd if len(self.cmd) <= 500 else self.cmd[:500] + "…"
+        parts = [
+            f"command exited with status {output['returncode']}",
+            f"$ {cmd_preview}",
+        ]
+        stderr = output["stderr"].rstrip()
+        stdout = output["stdout"].rstrip()
+        last_traced = self._last_xtrace_line(stderr)
+        if last_traced:
+            parts.append(f"last command: {last_traced}")
+        if stderr:
+            parts.append(f"stderr:\n{stderr}")
+        if stdout:
+            parts.append(f"stdout:\n{stdout}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _last_xtrace_line(stderr: str) -> str | None:
+        """Return the last ``set -x`` trace line (``+ ...``), if any."""
+        for line in reversed(stderr.splitlines()):
+            stripped = line.lstrip()
+            if stripped.startswith("+ ") or stripped.startswith("++ "):
+                return stripped
+        return None

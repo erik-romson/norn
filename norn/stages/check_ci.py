@@ -77,6 +77,18 @@ _NOISE_PREFIXES = (
 # When adding a new anchor, prefer a highly specific literal that only
 # the failing tool emits, to avoid false positives in prose log lines.
 _FAILURE_ANCHORS: list[tuple[str, re.Pattern[str]]] = [
+    # --- JVM test runners (surefire / failsafe) ---
+    # Match the per-test "<<< FAILURE!" / "<<< ERROR!" markers BEFORE the
+    # generic "[INFO] BUILD FAILURE" anchor below. Maven's BUILD FAILURE
+    # line appears AFTER the surefire output, so anchoring there means
+    # the extracted block skips every test detail (stack traces, MockMvc
+    # request/response bodies) and only captures Maven's "Failed to
+    # execute goal" boilerplate. Surefire's "<<< FAILURE!" markers
+    # appear at the end of each failing test's detail block, so anchoring
+    # there with a generous lead_context captures the actual failure
+    # context.
+    ("surefire_failure", re.compile(r"<<< FAILURE!\s*$")),
+    ("surefire_error",   re.compile(r"<<< ERROR!\s*$")),
     # --- JVM build tools ---
     ("maven",      re.compile(r"^\[INFO\] BUILD FAILURE\b")),
     ("gradle",     re.compile(r"^FAILURE: Build failed with an exception\.?")),
@@ -456,7 +468,20 @@ class CheckCI(BaseStage):
         timeout_minutes: int = 30,
         summarize: bool = True,
         context_lines: int = 20,
+        # Lines of pre-anchor context kept by the anchor pass. Bumped from
+        # the previous hard-coded value of 2 because surefire/failsafe
+        # anchors fire AFTER each failing test's MockMvc request/response
+        # block — ~30 lines of context is needed to keep the actual
+        # exception/response body visible for the LLM.
+        lead_context: int = 30,
         max_log_lines: int = 400,
+        # Before the first status poll, look at the median duration of recent
+        # successful runs and sleep ~80% of that. Saves a lot of polls (and
+        # therefore API calls) when builds take several minutes — the default
+        # poll loop hammers list_workflow_runs every 30s otherwise. Costs one
+        # extra API call upfront, cached for an hour at module level.
+        smart_wait: bool = True,
+        smart_wait_factor: float = 0.8,
     ) -> None:
         self.repo = repo
         self.branch = branch
@@ -466,7 +491,10 @@ class CheckCI(BaseStage):
         self.timeout_minutes = timeout_minutes
         self.summarize = summarize
         self.context_lines = context_lines
+        self.lead_context = lead_context
         self.max_log_lines = max_log_lines
+        self.smart_wait = smart_wait
+        self.smart_wait_factor = smart_wait_factor
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         try:
@@ -498,6 +526,19 @@ class CheckCI(BaseStage):
 
         deadline = asyncio.get_event_loop().time() + self.timeout_minutes * 60
 
+        # Cache the local HEAD once per run() call. We only use it to detect
+        # the "stale completed run" race described below; if we're not in a
+        # git repo (head_sha is None) we just behave as before.
+        local_head = await _git_head_sha()
+
+        # Smart wait is deferred until we've actually seen a pending run.
+        # The original "sleep before first poll" version slept blindly even
+        # when the latest run for local HEAD had already completed, which
+        # delayed the fix loop by a full build cycle for no benefit. Now we
+        # probe first; smart_wait fires once, only if the first observation
+        # is a queued/in_progress run worth waiting on.
+        smart_wait_pending = self.poll and self.smart_wait
+
         while True:
             run_info = await _get_latest_run(gh, owner, repo_name, branch, self.workflow)
             if run_info is None:
@@ -509,8 +550,53 @@ class CheckCI(BaseStage):
 
             status = run_info["status"]
             conclusion = run_info["conclusion"]
+            run_sha = run_info.get("head_sha") or ""
+
+            # Stale-run guard: GitHub's list_workflow_runs endpoint is
+            # eventually consistent. Right after a push, it can return a
+            # previously-completed run (for an older commit on the same
+            # branch) as "the latest" while the run for the new HEAD has
+            # been created but not yet indexed. Without this guard we'd
+            # short-circuit on `status == "completed"` below and report a
+            # stale failure (or success!) for code that's no longer HEAD.
+            #
+            # If the latest run's head_sha is a strict ancestor of local
+            # HEAD, treat it as not-yet-the-real-run and keep polling
+            # (subject to the same timeout) until the new run appears.
+            if (
+                self.poll
+                and status == "completed"
+                and local_head
+                and run_sha
+                and await _is_ancestor(run_sha, local_head)
+            ):
+                if asyncio.get_event_loop().time() >= deadline:
+                    return StageResult(
+                        name="", success=False,
+                        error=(
+                            f"CI timed out after {self.timeout_minutes} minutes "
+                            f"waiting for a workflow run on {local_head[:8]}; "
+                            f"latest indexed run is for ancestor {run_sha[:8]}."
+                        ),
+                    )
+                log.debug(
+                    "Latest run %s is for ancestor %s of local HEAD %s — "
+                    "waiting %ds for the new run to be indexed",
+                    run_info["run_id"], run_sha[:8], local_head[:8],
+                    self.poll_interval,
+                )
+                await asyncio.sleep(self.poll_interval)
+                continue
 
             if status == "completed":
+                head_match = bool(local_head and run_sha and run_sha == local_head)
+                log.info(
+                    "Latest run %s for %s is completed (%s) — using it directly%s.",
+                    run_info["run_id"],
+                    (run_sha[:8] if run_sha else "?"),
+                    conclusion,
+                    " (matches local HEAD)" if head_match else "",
+                )
                 logs = ""
                 if conclusion != "success":
                     logs = await _get_failed_logs(gh, owner, repo_name, run_info["run_id"])
@@ -519,6 +605,7 @@ class CheckCI(BaseStage):
                             logs,
                             context_lines=self.context_lines,
                             max_lines=self.max_log_lines,
+                            lead_context=self.lead_context,
                         )
 
                 output = {
@@ -550,6 +637,29 @@ class CheckCI(BaseStage):
                     },
                 )
 
+            # The latest run is pending (queued / in_progress). Smart wait
+            # is worth doing here — sleep ~80% of typical duration before
+            # the next poll instead of hammering at poll_interval. Fires
+            # at most once per CheckCI invocation.
+            if smart_wait_pending:
+                smart_wait_pending = False
+                estimated = await _estimate_typical_duration(
+                    gh, owner, repo_name, self.workflow, branch,
+                )
+                if estimated is not None and estimated > self.poll_interval:
+                    remaining = max(0, deadline - asyncio.get_event_loop().time())
+                    wait_secs = max(0, min(int(estimated * self.smart_wait_factor), int(remaining)))
+                    if wait_secs > 0:
+                        log.info(
+                            "Latest run %s is %s; typical successful run for %s "
+                            "is ~%ds, sleeping %ds before next poll.",
+                            run_info["run_id"], status,
+                            self.workflow or "any workflow",
+                            int(estimated), wait_secs,
+                        )
+                        await asyncio.sleep(wait_secs)
+                        continue
+
             if asyncio.get_event_loop().time() >= deadline:
                 return StageResult(
                     name="", success=False,
@@ -565,6 +675,82 @@ def _create_client(token: str) -> Any:
     from githubkit import GitHub
 
     return GitHub(token)
+
+
+# Module-level cache of typical run durations. Keyed by
+# (owner, repo, workflow, branch); value is (cached_at_monotonic_seconds,
+# duration_seconds). 1-hour TTL is a sane "build durations don't change
+# wildly within an hour" assumption — long enough to amortise the lookup
+# across all CheckCI invocations within a single retry loop, short enough
+# that a slowdown will be picked up on the next pipeline run.
+_DURATION_CACHE: dict[tuple[str, str, str | None, str], tuple[float, float]] = {}
+_DURATION_CACHE_TTL_SECONDS = 3600.0
+
+
+def _cached_duration(key: tuple[str, str, str | None, str]) -> float | None:
+    entry = _DURATION_CACHE.get(key)
+    if entry is None:
+        return None
+    cached_at, secs = entry
+    if asyncio.get_event_loop().time() - cached_at > _DURATION_CACHE_TTL_SECONDS:
+        _DURATION_CACHE.pop(key, None)
+        return None
+    return secs
+
+
+async def _estimate_typical_duration(
+    gh: Any, owner: str, repo: str, workflow: str | None, branch: str,
+) -> float | None:
+    """Median wall-clock duration of recent successful runs, in seconds.
+
+    Costs one API call (cached for an hour). Returns None when no successful
+    runs are available — callers should skip the smart pre-wait in that case.
+
+    Looks at the latest 5 successful runs on the given branch. If the branch
+    has no successful history (typical for a freshly created feature branch)
+    we fall back to the workflow's recent successful runs across all
+    branches, since the rough duration of "test-pg.yml on main" is still a
+    decent estimate for "test-pg.yml on this branch".
+    """
+    key = (owner, repo, workflow, branch)
+    cached = _cached_duration(key)
+    if cached is not None:
+        return cached
+
+    async def _fetch(use_branch: bool) -> list:
+        kwargs: dict[str, Any] = {
+            "owner": owner, "repo": repo, "status": "success", "per_page": 5,
+        }
+        if use_branch:
+            kwargs["branch"] = branch
+        if workflow:
+            kwargs["workflow_id"] = workflow
+            resp = await gh.rest.actions.async_list_workflow_runs(**kwargs)
+        else:
+            resp = await gh.rest.actions.async_list_workflow_runs_for_repo(**kwargs)
+        return list(resp.parsed_data.workflow_runs)
+
+    try:
+        runs = await _fetch(use_branch=True)
+        if not runs:
+            runs = await _fetch(use_branch=False)
+    except Exception as exc:
+        log.debug("Could not estimate run duration: %s", exc)
+        return None
+
+    durations: list[float] = []
+    for r in runs:
+        start = getattr(r, "run_started_at", None) or getattr(r, "created_at", None)
+        end = getattr(r, "updated_at", None)
+        if start and end:
+            durations.append((end - start).total_seconds())
+    if not durations:
+        return None
+
+    durations.sort()
+    median = durations[len(durations) // 2]
+    _DURATION_CACHE[key] = (asyncio.get_event_loop().time(), median)
+    return median
 
 
 async def _get_latest_run(
@@ -592,11 +778,55 @@ async def _get_latest_run(
         "status": r.status or "",
         "conclusion": r.conclusion,
         "url": r.html_url,
+        "head_sha": r.head_sha or "",
     }
 
 
+async def _git_head_sha() -> str | None:
+    """Return the local HEAD SHA, or None if not in a git repo."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "HEAD",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    val = stdout.decode().strip()
+    return val or None
+
+
+async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+    """Return True if ``ancestor`` is a strict ancestor of ``descendant``.
+
+    Uses ``git merge-base --is-ancestor``. Returns False on any git error
+    (missing commit, not a repo, etc.) so callers fall through to normal
+    behaviour rather than getting stuck waiting forever.
+    """
+    if not ancestor or not descendant or ancestor == descendant:
+        return False
+    proc = await asyncio.create_subprocess_exec(
+        "git", "merge-base", "--is-ancestor", ancestor, descendant,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate()
+    return proc.returncode == 0
+
+
 async def _get_failed_logs(gh: Any, owner: str, repo: str, run_id: int) -> str:
-    """Fetch failed job names, step names, and raw logs for a failed run."""
+    """Fetch failed-job and -step names, plus the log content for a failed run.
+
+    Preferred path is the run-log zip's per-step files (e.g.
+    ``build/17_test.txt``). GitHub serves these already-split by step, so
+    we can return just the failing step's content with zero parsing
+    required downstream — sidestepping the fact that the runner's
+    ``##[group]`` labels don't match the API's step ``name:``.
+
+    Falls back to the per-job ``download_job_logs_for_workflow_run``
+    response (full job log, all steps concatenated) when the zip is
+    unavailable or doesn't contain a file for the failed step.
+    """
     resp = await gh.rest.actions.async_list_jobs_for_workflow_run(
         owner=owner, repo=repo, run_id=run_id, per_page=100,
     )
@@ -605,6 +835,17 @@ async def _get_failed_logs(gh: Any, owner: str, repo: str, run_id: int) -> str:
     failed_jobs = [j for j in jobs if j.conclusion in ("failure", "cancelled")]
     if not failed_jobs:
         return ""
+
+    # Try the per-step zip first — much smaller and pre-sliced by GitHub.
+    try:
+        per_step = await _fetch_failed_step_logs_from_zip(
+            gh, owner, repo, run_id, failed_jobs,
+        )
+    except Exception:
+        log.debug("Per-step zip fetch failed for run %d", run_id, exc_info=True)
+        per_step = ""
+    if per_step:
+        return per_step
 
     parts: list[str] = []
     for job in failed_jobs:
@@ -630,6 +871,69 @@ async def _get_failed_logs(gh: Any, owner: str, repo: str, run_id: int) -> str:
             except Exception:
                 log.debug("Could not fetch run logs for %d", run_id, exc_info=True)
 
+    return "\n\n".join(parts)
+
+
+async def _fetch_failed_step_logs_from_zip(
+    gh: Any,
+    owner: str,
+    repo: str,
+    run_id: int,
+    failed_jobs: list,
+) -> str:
+    """Return only the failed steps' logs by reading the run-log zip.
+
+    GitHub Actions packs the run logs as ``<job_name>/<step_number>_<step_name>.txt``
+    inside the zip. Step name characters that aren't filesystem-safe
+    (slashes, colons, etc.) are replaced with underscores, so we match
+    by ``<job_name>/<step_number>_`` prefix rather than reconstructing
+    the full filename.
+
+    Returns an empty string when the zip can't be downloaded or contains
+    no matching files; the caller is expected to fall back to the
+    per-job log download.
+    """
+    resp = await gh.rest.actions.async_download_workflow_run_logs(
+        owner=owner, repo=repo, run_id=run_id,
+    )
+    content = resp.content if hasattr(resp, "content") else bytes(resp)
+
+    parts: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        names = zf.namelist()
+        for job in failed_jobs:
+            failed_steps = [
+                s for s in (job.steps or [])
+                if s.conclusion in ("failure", "cancelled")
+            ]
+            if not failed_steps:
+                continue
+
+            parts.append(f"## Failed job: {job.name}")
+            parts.append(
+                "Failed steps: " + ", ".join(s.name for s in failed_steps)
+            )
+
+            for step in failed_steps:
+                prefix = f"{job.name}/{step.number}_"
+                matches = [n for n in names if n.startswith(prefix)]
+                if not matches:
+                    log.debug(
+                        "[per-step-zip] no file for %s step #%d (%s)",
+                        job.name, step.number, step.name,
+                    )
+                    return ""
+                # Should be exactly one match; defensive sort if not.
+                step_file = sorted(matches)[0]
+                body = zf.read(step_file).decode(errors="replace")
+                parts.append(
+                    f"### Step {step.number}: {step.name}\n"
+                    f"(file: {step_file})\n\n"
+                    f"{body.rstrip()}"
+                )
+
+    if not parts:
+        return ""
     return "\n\n".join(parts)
 
 
@@ -786,3 +1090,129 @@ async def _extract_run_logs(gh: Any, owner: str, repo: str, run_id: int) -> str:
             if name.endswith(".txt"):
                 log_parts.append(f"--- {name} ---\n{zf.read(name).decode(errors='replace')}")
         return "\n".join(log_parts)
+
+
+# --- standalone CLI -------------------------------------------------------
+#
+# Run from the repo root:
+#
+#   uv run python -m norn.stages.check_ci
+#   uv run python -m norn.stages.check_ci --workflow ci.yml --branch main
+#   uv run python -m norn.stages.check_ci --repo owner/proj --poll
+#   uv run python -m norn.stages.check_ci --no-summarize --max-lines 5000
+#   uv run python -m norn.stages.check_ci --json > result.json
+#
+# The CLI mirrors the constructor — every flag corresponds to a kwarg of
+# ``CheckCI``. Default output is human-readable; ``--json`` dumps the
+# raw ``StageResult.output`` dict.
+
+def _cli_main() -> int:
+    import argparse
+    import json
+    import sys
+
+    from norn.models import PipelineContext
+
+    parser = argparse.ArgumentParser(
+        prog="python -m norn.stages.check_ci",
+        description=(
+            "Run CheckCI standalone and print whatever the stage would return. "
+            "Useful for debugging the log summarizer (anchor coverage, "
+            "max_log_lines tuning) without spinning up a pipeline."
+        ),
+    )
+    parser.add_argument("--repo", help="owner/name; auto-detected from git origin if omitted")
+    parser.add_argument("--branch", help="branch name; auto-detected from current git branch if omitted")
+    parser.add_argument("--workflow", help='workflow filename (e.g. "ci.yml") or workflow id')
+    parser.add_argument("--poll", action="store_true", help="poll until the run completes")
+    parser.add_argument("--poll-interval", type=int, default=30, metavar="SECS")
+    parser.add_argument("--timeout", type=int, default=30, metavar="MINUTES",
+                        help="poll timeout in minutes (only with --poll)")
+    parser.add_argument("--no-summarize", action="store_true",
+                        help="skip the layered extractor and return raw per-job logs")
+    parser.add_argument("--context-lines", type=int, default=20,
+                        help="context window for the marker/keyword fallback pass")
+    parser.add_argument("--lead-context", type=int, default=30,
+                        help=(
+                            "lines of pre-anchor context kept by the anchor pass. "
+                            "Bump for JVM tests when surefire/failsafe failure "
+                            "markers fire after long MockMvc request/response blocks "
+                            "you want included."
+                        ))
+    parser.add_argument("--max-lines", type=int, default=400,
+                        help="cap on log lines returned")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the raw output dict as JSON instead of pretty-printing")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="enable DEBUG logging (repeat for more)")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.DEBUG if args.verbose >= 1 else logging.INFO,
+            format="%(name)s [%(levelname)s] %(message)s",
+        )
+        # The module-level WARNING pin on httpx is too aggressive when the
+        # user explicitly asks for verbose — re-enable INFO so they see the
+        # request URLs they almost certainly want for debugging.
+        logging.getLogger("httpx").setLevel(logging.INFO)
+
+    stage = CheckCI(
+        repo=args.repo,
+        branch=args.branch,
+        workflow=args.workflow,
+        poll=args.poll,
+        poll_interval=args.poll_interval,
+        timeout_minutes=args.timeout,
+        summarize=not args.no_summarize,
+        context_lines=args.context_lines,
+        lead_context=args.lead_context,
+        max_log_lines=args.max_lines,
+    )
+    ctx = PipelineContext()
+    result = asyncio.run(stage.run(ctx))
+
+    if args.json:
+        payload = {
+            "success": result.success,
+            "error": result.error,
+            "output": result.output,
+        }
+        json.dump(payload, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+        return 0 if result.success else 1
+
+    # Human-readable rendering. Falls back to plain print if rich isn't
+    # installed (it usually is — norn depends on it — but keep this resilient
+    # for someone running the file in isolation).
+    try:
+        from norn.ui import console
+        emit = console.print
+    except Exception:
+        def emit(*a: Any, **kw: Any) -> None:
+            print(*a)
+
+    out = result.output if isinstance(result.output, dict) else {}
+    status_color = "green" if result.success else "red"
+    emit(f"\n[bold {status_color}]── CheckCI result ──[/bold {status_color}]")
+    emit(f"  success    : {result.success}")
+    if result.error:
+        emit(f"  error      : {result.error}")
+    if out:
+        emit(f"  run_id     : {out.get('run_id')}")
+        emit(f"  name       : {out.get('name')}")
+        emit(f"  status     : {out.get('status')}")
+        emit(f"  conclusion : {out.get('conclusion')}")
+        emit(f"  url        : {out.get('url')}")
+        logs = out.get("logs", "") or ""
+        emit(f"  logs       : {len(logs)} chars\n")
+        if logs:
+            emit(f"[bold]── extracted logs ──[/bold]")
+            # Print logs without rich markup interpretation — they often
+            # contain `[INFO]` etc. that rich would misparse as markup.
+            print(logs)
+    return 0 if result.success else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli_main())

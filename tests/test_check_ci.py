@@ -16,9 +16,11 @@ def _make_run(
     status: str = "completed",
     conclusion: str | None = "success",
     html_url: str = "https://github.com/org/repo/actions/runs/123",
+    head_sha: str = "deadbeef",
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        id=run_id, name=name, status=status, conclusion=conclusion, html_url=html_url,
+        id=run_id, name=name, status=status, conclusion=conclusion,
+        html_url=html_url, head_sha=head_sha,
     )
 
 
@@ -106,6 +108,146 @@ async def test_failed_run_fetches_logs(_patch_env):
     assert result.output["conclusion"] == "failure"
     assert "Failed job: build" in result.output["logs"]
     assert "test_foo FAILED" in result.output["logs"]
+
+
+@pytest.mark.asyncio
+async def test_failed_logs_prefers_per_step_zip(_patch_env, monkeypatch):
+    """When the run-log zip contains per-step .txt files, _get_failed_logs
+    must return only the failing step's content (not the whole job log)."""
+    import io
+    import zipfile
+
+    _patch_env()
+    failed_step = SimpleNamespace(
+        number=17, name="test", conclusion="failure",
+    )
+    other_step = SimpleNamespace(
+        number=18, name="cleanup", conclusion="success",
+    )
+    failed_job = SimpleNamespace(
+        id=1, name="build", conclusion="failure",
+        steps=[other_step, failed_step],
+    )
+
+    # Build a zip whose path layout mirrors GitHub's per-step format.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("0_build.txt", "ALL OF JOB LOG (concatenated)")
+        zf.writestr("build/17_test.txt", "FAILING STEP CONTENT")
+        zf.writestr("build/18_cleanup.txt", "PASSING STEP CONTENT")
+    zip_bytes = buf.getvalue()
+
+    gh = MagicMock()
+    jobs_resp = SimpleNamespace(parsed_data=SimpleNamespace(jobs=[failed_job]))
+    gh.rest.actions.async_list_jobs_for_workflow_run = AsyncMock(return_value=jobs_resp)
+    gh.rest.actions.async_download_workflow_run_logs = AsyncMock(
+        return_value=SimpleNamespace(content=zip_bytes),
+    )
+
+    from norn.stages.check_ci import _get_failed_logs
+    result = await _get_failed_logs(gh, "org", "repo", 123)
+
+    assert "FAILING STEP CONTENT" in result
+    # Don't pull in passing-step files.
+    assert "PASSING STEP CONTENT" not in result
+    # And don't fall back to the per-job download when the zip path works.
+    assert "ALL OF JOB LOG" not in result
+    # The Failed steps header still ships so downstream stages know the name.
+    assert "Failed steps: test" in result
+
+
+@pytest.mark.asyncio
+async def test_failed_logs_falls_back_to_job_when_zip_lacks_step_files(_patch_env):
+    """When the zip is in the old form (only ``0_build.txt``), fall back to
+    the per-job log download — the failing step's lines are in there too."""
+    import io
+    import zipfile
+
+    _patch_env()
+    failed_step = SimpleNamespace(
+        number=17, name="test", conclusion="failure",
+    )
+    failed_job = SimpleNamespace(
+        id=1, name="build", conclusion="failure",
+        steps=[failed_step],
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        # Only the legacy flat file — no per-step entries.
+        zf.writestr("0_build.txt", "doesnt matter, no match")
+    zip_bytes = buf.getvalue()
+
+    gh = MagicMock()
+    jobs_resp = SimpleNamespace(parsed_data=SimpleNamespace(jobs=[failed_job]))
+    gh.rest.actions.async_list_jobs_for_workflow_run = AsyncMock(return_value=jobs_resp)
+    gh.rest.actions.async_download_workflow_run_logs = AsyncMock(
+        return_value=SimpleNamespace(content=zip_bytes),
+    )
+    gh.rest.actions.async_download_job_logs_for_workflow_run = AsyncMock(
+        return_value=SimpleNamespace(text="PER-JOB LOG (full)"),
+    )
+
+    from norn.stages.check_ci import _get_failed_logs
+    result = await _get_failed_logs(gh, "org", "repo", 123)
+
+    assert "PER-JOB LOG (full)" in result
+    assert "Failed steps: test" in result
+
+
+@pytest.mark.asyncio
+async def test_smart_wait_skipped_when_latest_run_already_completed(_patch_env, monkeypatch):
+    """If the latest run is already completed, smart_wait must not fire."""
+    _patch_env()
+    failed_step = _make_step(name="Run tests", conclusion="failure")
+    failed_job = _make_job(job_id=10, name="build", conclusion="failure", steps=[failed_step])
+    gh = _mock_gh(
+        [_make_run(run_id=999, name="Build", conclusion="failure")],
+        jobs=[failed_job],
+        job_log="boom",
+    )
+
+    estimate_mock = AsyncMock(return_value=1200.0)
+    monkeypatch.setattr("norn.stages.check_ci._estimate_typical_duration", estimate_mock)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("norn.stages.check_ci.asyncio.sleep", sleep_mock)
+
+    with patch("norn.stages.check_ci._create_client", return_value=gh):
+        stage = CheckCI()
+        result = await stage.run(PipelineContext())
+
+    assert not result.success
+    assert result.output["run_id"] == 999
+    estimate_mock.assert_not_called()
+    sleep_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_smart_wait_fires_when_latest_run_pending(_patch_env, monkeypatch):
+    """When the latest run is still running, smart_wait should sleep once."""
+    _patch_env()
+    pending = _make_run(run_id=42, status="in_progress", conclusion=None)
+    completed = _make_run(run_id=42, status="completed", conclusion="success")
+    runs_iter = iter([
+        SimpleNamespace(parsed_data=SimpleNamespace(workflow_runs=[pending])),
+        SimpleNamespace(parsed_data=SimpleNamespace(workflow_runs=[completed])),
+    ])
+    gh = _mock_gh([pending])
+    gh.rest.actions.async_list_workflow_runs_for_repo = AsyncMock(side_effect=lambda **_: next(runs_iter))
+
+    estimate_mock = AsyncMock(return_value=600.0)
+    monkeypatch.setattr("norn.stages.check_ci._estimate_typical_duration", estimate_mock)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("norn.stages.check_ci.asyncio.sleep", sleep_mock)
+
+    with patch("norn.stages.check_ci._create_client", return_value=gh):
+        stage = CheckCI(poll=True)
+        result = await stage.run(PipelineContext())
+
+    assert result.success
+    assert result.output["run_id"] == 42
+    estimate_mock.assert_called_once()
+    sleep_mock.assert_awaited()
 
 
 @pytest.mark.asyncio

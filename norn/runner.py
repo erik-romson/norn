@@ -209,7 +209,12 @@ async def _run_stage(
             "[%s] Agent stage — session=%s attempt=%d fork=%s",
             stage.name, session_id, attempt, fork_session,
         )
-        agent_kwargs: dict = {"session_id": session_id, "attempt": attempt, "fork_session": fork_session}
+        agent_kwargs: dict = {
+            "session_id": session_id,
+            "attempt": attempt,
+            "fork_session": fork_session,
+            "stage_name": stage.name,
+        }
         mcp_tools = getattr(stage.impl, "mcp_tools", None)
         if isinstance(mcp_tools, list) and mcp_tools:
             from claude_agent_sdk import create_sdk_mcp_server
@@ -655,14 +660,38 @@ async def run_pipeline(
 
     # Restore state from a prior checkpoint
     if resume_checkpoint:
-        for name in resume_checkpoint.completed_stages:
+        # A loop is atomic: its body stages are only valid as cache when ALL
+        # of them passed in the same iteration. If only a subset is present,
+        # the loop crashed mid-attempt — drop those partial entries so the
+        # loop replays cleanly with fresh outputs (otherwise downstream
+        # stages like ``fix`` would replay against the *original* failure
+        # rather than the current one).
+        restored = list(resume_checkpoint.completed_stages)
+        restored_set = set(restored)
+        dropped: set[str] = set()
+        for item in items:
+            if isinstance(item, Loop):
+                body_names = {s.name for s in item.stages}
+                in_cache = body_names & restored_set
+                if in_cache and not body_names.issubset(restored_set):
+                    dropped.update(in_cache)
+        if dropped:
+            log.info(
+                "[resume] dropping %d partial-loop cache entries: %s",
+                len(dropped),
+                ", ".join(sorted(dropped)),
+            )
+            restored = [n for n in restored if n not in dropped]
+            restored_set -= dropped
+
+        for name in restored:
             ctx.results[name] = StageResult(
                 name=name,
                 success=True,
                 output=resume_checkpoint.results.get(name),
             )
-        ctx.checkpoint_stages = set(resume_checkpoint.completed_stages)
-        completed_stages = list(resume_checkpoint.completed_stages)
+        ctx.checkpoint_stages = restored_set
+        completed_stages = list(restored)
         if current_session is None:
             current_session = resume_checkpoint.session_id
 

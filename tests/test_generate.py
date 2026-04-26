@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from norn.models import PipelineContext, StageResult
@@ -547,3 +548,44 @@ async def test_mcp_servers_not_set_when_not_provided():
         await gen.run(PipelineContext())
 
     assert "mcp_servers" not in captured_kwargs
+
+
+@pytest.mark.asyncio
+async def test_generate_surfaces_cli_stderr_on_process_failure():
+    """CLI stderr should replace the SDK placeholder error text."""
+
+    class FakeProcessError(Exception):
+        def __init__(self, message: str, stderr: str | None = None) -> None:
+            self.stderr = stderr
+            super().__init__(message)
+
+    async def fake_query(*, prompt, options):
+        assert prompt == "do stuff"
+        assert callable(options.stderr)
+        options.stderr("You've hit your limit · resets 6:30pm (Europe/Oslo)")
+        raise FakeProcessError(
+            "Fatal error in message reader: Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details",
+            stderr="Check stderr output for details",
+        )
+        yield
+
+    def fake_options_cls(**kw):
+        return SimpleNamespace(**kw)
+
+    gen = Generate(prompt="do stuff")
+
+    with patch.dict("sys.modules", {"claude_agent_sdk": MagicMock()}):
+        import claude_agent_sdk as sdk_mod
+
+        sdk_mod.query = fake_query
+        sdk_mod.AssistantMessage = type("AssistantMessage", (), {})
+        sdk_mod.ResultMessage = type("ResultMessage", (), {})
+        sdk_mod.ClaudeAgentOptions = fake_options_cls
+
+        result = await gen.run(PipelineContext())
+
+    assert not result.success
+    assert result.error is not None
+    assert "You've hit your limit" in result.error
+    assert "Check stderr output for details" not in result.error
