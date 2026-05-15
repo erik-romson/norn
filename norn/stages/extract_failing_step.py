@@ -203,19 +203,10 @@ async def _haiku_compress(
     text: str,
     *,
     model: str,
+    provider: str = "claude-code",
 ) -> str | None:
-    """One-shot Haiku call. Returns ``None`` on any failure."""
-    try:
-        from claude_agent_sdk import (
-            AssistantMessage,
-            ClaudeAgentOptions,
-            query,
-        )
-    except ImportError:
-        log.warning("claude-agent-sdk not installed — skipping Haiku compression")
-        return None
-
-    from norn.stages.generate import MODEL_MAP
+    """One-shot completion call. Returns ``None`` on any failure."""
+    from norn.agents.complete import complete_text
 
     user_msg = (
         "Compress the following failing-step log per the rules above.\n\n"
@@ -224,31 +215,12 @@ async def _haiku_compress(
         "----- END STEP LOG -----"
     )
 
-    chunks: list[str] = []
-    stderr_lines: list[str] = []
-    try:
-        async for msg in query(
-            prompt=user_msg,
-            options=ClaudeAgentOptions(
-                model=MODEL_MAP.get(model, model),
-                system_prompt=_HAIKU_SYSTEM_PROMPT,
-                allowed_tools=[],
-                max_turns=1,
-                stderr=lambda line: stderr_lines.append(line),
-            ),
-        ):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if hasattr(block, "text"):
-                        chunks.append(block.text)
-    except Exception as e:
-        log.warning("ExtractFailingStep Haiku call failed: %s", e)
-        if stderr_lines:
-            log.warning("SDK stderr:\n%s", "\n".join(stderr_lines[-30:]))
-        return None
-
-    compressed = "".join(chunks).strip()
-    return compressed or None
+    return await complete_text(
+        user_msg,
+        provider=provider,
+        model=model,
+        system_prompt=_HAIKU_SYSTEM_PROMPT,
+    )
 
 
 class ExtractFailingStep(BaseStage):
@@ -361,7 +333,7 @@ class ExtractFailingStep(BaseStage):
                 len(current), len(body),
             )
 
-        compressed = await _haiku_compress(body, model=self.model)
+        compressed = await _haiku_compress(body, model=self.model, provider=ctx.agent_provider)
         if not compressed:
             log.warning(
                 "[extract_failing_step] Haiku returned no content — returning python slice",

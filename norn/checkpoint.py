@@ -22,7 +22,7 @@ class Checkpoint:
     Attributes:
         pipeline: Name of the pipeline that created this checkpoint.
         timestamp: ISO-8601 timestamp of the last save.
-        session_id: Claude session ID for agent session resumption.
+        session_id: Agent session ID for agent session resumption.
         completed_stages: Ordered list of stage names that finished successfully.
         results: Serialised stage outputs keyed by stage name.
         usage: Reserved for future per-stage usage data.
@@ -36,6 +36,7 @@ class Checkpoint:
     results: dict[str, Any]
     usage: list[dict[str, Any]]
     file_checkpoint_id: str | None = None
+    agent_provider: str = "claude-code"
 
 
 def checkpoint_file(config_path: str) -> Path:
@@ -49,6 +50,7 @@ def save_checkpoint(
     session_id: str | None,
     completed_stages: list[str],
     stage_outputs: dict[str, Any],
+    agent_provider: str = "claude-code",
 ) -> None:
     """Atomically write checkpoint state beside the config file."""
     path = checkpoint_file(config_path)
@@ -60,6 +62,7 @@ def save_checkpoint(
         "results": stage_outputs,
         "usage": [],
         "file_checkpoint_id": None,
+        "agent_provider": agent_provider,
     }
     tmp = path.with_suffix(".checkpoint.tmp")
     tmp.write_text(json.dumps(data, indent=2))
@@ -82,6 +85,7 @@ def load_checkpoint(config_path: str) -> Checkpoint | None:
             results=data.get("results", {}),
             usage=data.get("usage", []),
             file_checkpoint_id=data.get("file_checkpoint_id"),
+            agent_provider=data.get("agent_provider", "claude-code"),
         )
     except Exception:
         log.warning("Failed to load checkpoint from %s — ignoring", path)

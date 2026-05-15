@@ -300,17 +300,17 @@ async def test_resume_keeps_complete_loop_cache():
 
 
 class McpToolStage(BaseStage):
-    """Agent stage that declares mcp_tools and records the mcp_servers kwarg."""
+    """Agent stage that declares mcp_tools and records the mcp_tools kwarg."""
 
     needs_agent = True
     mcp_tools: list = []  # will be set per-test
 
     def __init__(self, tools: list) -> None:
         self.mcp_tools = tools
-        self.received_mcp_servers: dict | None = None
+        self.received_mcp_tools: list | None = None
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
-        self.received_mcp_servers = kwargs.get("mcp_servers")
+        self.received_mcp_tools = kwargs.get("mcp_tools")
         return StageResult(name="", success=True, output="ok")
 
 
@@ -320,40 +320,54 @@ class NoMcpToolStage(BaseStage):
     needs_agent = True
 
     def __init__(self) -> None:
-        self.received_mcp_servers: dict | None = None
+        self.received_mcp_tools: list | None = None
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
-        self.received_mcp_servers = kwargs.get("mcp_servers")
+        self.received_mcp_tools = kwargs.get("mcp_tools")
         return StageResult(name="", success=True, output="ok")
 
 
 @pytest.mark.asyncio
-async def test_runner_passes_mcp_servers_when_mcp_tools_set():
-    """Runner creates and passes mcp_servers when a stage declares mcp_tools."""
-    from unittest.mock import MagicMock, patch
+async def test_runner_passes_mcp_tools_when_mcp_tools_set():
+    """Runner passes mcp_tools kwarg to the stage without importing Claude SDK."""
+    from unittest.mock import MagicMock
 
     fake_tool = MagicMock()
-    fake_tool.name = "my_tool"
-    fake_server = {"type": "sdk", "name": "stage_name", "instance": object()}
-
     stage = McpToolStage(tools=[fake_tool])
     p = Pipeline("test").stage("stage_name", stage)
 
-    with patch("claude_agent_sdk.create_sdk_mcp_server", return_value=fake_server) as mock_create:
-        ctx = await run_pipeline(p)
+    ctx = await run_pipeline(p)
 
     assert ctx.get("stage_name") == "ok"
-    mock_create.assert_called_once_with("stage_name", tools=[fake_tool])
-    assert stage.received_mcp_servers == {"stage_name": fake_server}
+    assert stage.received_mcp_tools == [fake_tool]
 
 
 @pytest.mark.asyncio
-async def test_runner_no_mcp_servers_when_no_mcp_tools():
-    """Runner does not pass mcp_servers when a stage has no mcp_tools."""
+async def test_runner_no_mcp_tools_kwarg_when_no_mcp_tools():
+    """Runner does not pass mcp_tools when a stage has no mcp_tools."""
     stage = NoMcpToolStage()
     p = Pipeline("test").stage("s1", stage)
 
     ctx = await run_pipeline(p)
 
     assert ctx.get("s1") == "ok"
-    assert stage.received_mcp_servers is None
+    assert stage.received_mcp_tools is None
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_mcp_tools_with_non_claude_provider():
+    """Runner returns a clear stage failure when mcp_tools are used with a non-claude-code provider."""
+    from unittest.mock import MagicMock
+    from norn.runner import PipelineError
+
+    fake_tool = MagicMock()
+    stage = McpToolStage(tools=[fake_tool])
+    p = Pipeline("test").stage("stage_name", stage)
+
+    with pytest.raises(PipelineError) as exc_info:
+        await run_pipeline(p, agent_provider="opencode")
+
+    result = exc_info.value.result
+    assert not result.success
+    assert "opencode" in result.error
+    assert "MCP" in result.error or "mcp_tools" in result.error

@@ -253,6 +253,61 @@ async def test_checkpoint_saved_after_loop_stage(tmp_path):
     assert cp.results["s1"] == "loop-out"
 
 
+def test_save_and_load_checkpoint_with_provider(tmp_path):
+    """agent_provider is persisted and loaded correctly."""
+    config = str(tmp_path / "pipeline.py")
+    save_checkpoint(
+        config,
+        pipeline_name="test",
+        session_id="sess-xyz",
+        completed_stages=["s1"],
+        stage_outputs={"s1": "out"},
+        agent_provider="opencode",
+    )
+
+    cp = load_checkpoint(config)
+    assert cp is not None
+    assert cp.agent_provider == "opencode"
+
+
+def test_load_legacy_checkpoint_defaults_to_claude_code(tmp_path):
+    """A checkpoint without agent_provider is treated as claude-code."""
+    config = str(tmp_path / "pipeline.py")
+    # Write a checkpoint that predates the agent_provider field
+    path = checkpoint_file(config)
+    import json
+    data = {
+        "pipeline": "test",
+        "timestamp": "2025-01-01T00:00:00Z",
+        "session_id": None,
+        "completed_stages": [],
+        "results": {},
+        "usage": [],
+    }
+    path.write_text(json.dumps(data))
+
+    cp = load_checkpoint(config)
+    assert cp is not None
+    assert cp.agent_provider == "claude-code"
+
+
+def test_save_checkpoint_writes_provider_field(tmp_path):
+    """The agent_provider field is written to the JSON file."""
+    config = str(tmp_path / "pipeline.py")
+    save_checkpoint(
+        config,
+        pipeline_name="test",
+        session_id=None,
+        completed_stages=[],
+        stage_outputs={},
+        agent_provider="opencode",
+    )
+
+    import json
+    data = json.loads(checkpoint_file(config).read_text())
+    assert data["agent_provider"] == "opencode"
+
+
 @pytest.mark.asyncio
 async def test_resume_checkpoint_in_loop_drops_partial_cache():
     """A loop is atomic: when only some of its body stages are in the

@@ -187,6 +187,7 @@ def _append_stage_log(
             model=usage.model if usage else None,
             session_id=usage.session_id if usage else None,
             error=error,
+            provider=usage.provider if usage else None,
         )
     )
     _persist_history_snapshot(ctx)
@@ -217,10 +218,29 @@ async def _run_stage(
         }
         mcp_tools = getattr(stage.impl, "mcp_tools", None)
         if isinstance(mcp_tools, list) and mcp_tools:
-            from claude_agent_sdk import create_sdk_mcp_server
-            mcp_server = create_sdk_mcp_server(stage.name, tools=mcp_tools)
-            agent_kwargs["mcp_servers"] = {stage.name: mcp_server}
-            log.debug("[%s] Attached MCP server with %d tool(s)", stage.name, len(mcp_tools))
+            if ctx.agent_provider != "claude-code":
+                error = (
+                    f"Stage '{stage.name}' declares mcp_tools but provider "
+                    f"'{ctx.agent_provider}' does not support MCP tools. "
+                    "MCP tools are only available with the 'claude-code' provider."
+                )
+                result = StageResult(name=stage.name, success=False, error=error)
+                elapsed = time.monotonic() - start
+                ctx.results[stage.name] = result
+                _append_stage_log(
+                    ctx,
+                    stage_name=stage.name,
+                    status="failed",
+                    success=False,
+                    attempt=attempt,
+                    duration_ms=int(elapsed * 1000),
+                    error=error,
+                )
+                ui.print_stage_failure(stage.name, elapsed, result)
+                ui.print_running_total(ctx.usage_tracker, budgets)
+                return result
+            agent_kwargs["mcp_tools"] = mcp_tools
+            log.debug("[%s] Attached MCP tools (%d tool(s))", stage.name, len(mcp_tools))
         coro = stage.impl.run(ctx, **agent_kwargs)
     else:
         coro = stage.impl.run(ctx)
@@ -315,7 +335,7 @@ def _save_checkpoint_state(
         for name in completed_stages
         if name in ctx.results
     }
-    save_checkpoint(config_path, pipeline_name, session_id, completed_stages, stage_outputs)
+    save_checkpoint(config_path, pipeline_name, session_id, completed_stages, stage_outputs, ctx.agent_provider)
 
 
 async def _run_loop(
@@ -335,7 +355,7 @@ async def _run_loop(
     """Run a do-while loop: execute all stages, retry from top on failure.
 
     Agent-backed stages (Generate) within the same loop share a session so
-    Claude remembers prior errors when retrying.
+    the agent remembers prior errors when retrying.
 
     Returns the final session_id used (if any), so the caller can persist it.
     """
@@ -552,6 +572,7 @@ def _append_history_snapshot(
         failed_stage=failed_stage,
         in_progress=in_progress,
         stage_log=list(ctx.stage_log),
+        agent_provider=ctx.agent_provider,
     )
     try:
         append_run(config_path, record)
@@ -591,6 +612,7 @@ async def run_pipeline(
     alert_manager: AlertManager | None = None,
     fork_session: bool = False,
     step_mode: bool = False,
+    agent_provider: str = "claude-code",
 ) -> PipelineContext:
     """Execute a pipeline definition, returning the final context.
 
@@ -609,6 +631,7 @@ async def run_pipeline(
     """
     ui.print_pipeline_start(pipeline.name, resume_session)
     ctx = PipelineContext(params=dict(params or {}))
+    ctx.agent_provider = agent_provider
     if pipeline.default_model:
         ctx.params.setdefault("default_model", pipeline.default_model)
     start_time = time.monotonic()

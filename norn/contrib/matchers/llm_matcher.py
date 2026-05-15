@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 
 class LLMMatcher(RepoMatcher):
-    def __init__(self, model: str = "claude-sonnet-4-6") -> None:
+    def __init__(self, model: str = "sonnet") -> None:
         self._model = model
 
     async def match(self, issue: IssueContext, ctx: PipelineContext) -> MatchResult | None:
@@ -25,11 +25,7 @@ class LLMMatcher(RepoMatcher):
         if not repos:
             return None
 
-        try:
-            from claude_agent_sdk import query, ClaudeAgentOptions
-        except ImportError:
-            log.warning("claude-agent-sdk not available for LLMMatcher")
-            return None
+        from norn.agents.complete import complete_text
 
         prompt = f"""Given this Jira issue, which GitHub repository is most likely affected?
 
@@ -43,19 +39,14 @@ Available repositories:
 
 Return JSON only: {{"repo": "<owner/name>", "confidence": 0.0, "reasoning": "..."}}"""
 
-        chunks: list[str] = []
-        try:
-            from claude_agent_sdk import AssistantMessage
-            async for msg in query(prompt=prompt, options=ClaudeAgentOptions(model=self._model)):
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if hasattr(block, "text"):
-                            chunks.append(block.text)
-        except Exception as e:
-            log.warning("LLMMatcher query failed: %s", e)
+        raw = await complete_text(
+            prompt,
+            provider=ctx.agent_provider,
+            model=self._model,
+        )
+        if not raw:
             return None
 
-        raw = "".join(chunks)
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         if not m:
             return None

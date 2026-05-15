@@ -43,6 +43,7 @@ class UsageRecord:
     is_error: bool = False
     attempt: int = 1
     model: str | None = None
+    provider: str | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -138,6 +139,7 @@ class StageLogEntry:
     model: str | None = None
     session_id: str | None = None
     error: str | None = None
+    provider: str | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -202,6 +204,7 @@ class PipelineContext:
     retries: int = 0
     pipeline_skills: list[Any] = field(default_factory=list)
     pipeline_profile: SessionProfile | None = None
+    agent_provider: str = "claude-code"
 
     def get(self, stage_name: str) -> Any:
         """Get output from a previous stage."""

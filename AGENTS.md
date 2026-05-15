@@ -13,7 +13,7 @@ This is the canonical repo instruction file for agents. Keep user-facing setup a
 
 ## CLI State And Args
 - `--resume` is checkpoint-based: it loads `<config>.checkpoint`, restores outputs, and skips completed stages as cached.
-- `--continue` only resumes the Claude session from the checkpoint; it reruns stages.
+- `--continue` only resumes the agent session from the checkpoint; it reruns stages.
 - Runtime state is `<config>.checkpoint` and `<config>.history`, not `.session`; these files are gitignored.
 - External pipeline files outside the workspace write new state beside a same-named file in the current working directory, with the external path only used as a read fallback.
 - Positional args after the config are joined into `{param.args}`; `--arg KEY=VALUE` becomes `{param.KEY}`; `--skip` must match the exact human stage name, including spaces.
@@ -27,16 +27,22 @@ This is the canonical repo instruction file for agents. Keep user-facing setup a
 
 ## Stage Semantics
 - All stage `run()` methods are async and return `StageResult`; leave `name=""` in custom stages because the runner sets the real stage name.
-- Set `needs_agent = True` only for stages that need Claude SDK kwargs; non-agent stages must not import `claude-agent-sdk`.
+- Set `needs_agent = True` only for stages that need agent provider kwargs; non-agent stages must not import `claude-agent-sdk`.
 - A `Loop` retries the whole body from the top after any failing stage, not just the failed stage.
-- `clear_context()` drops only the current Claude session; prior `StageResult` outputs remain available through `ctx.get("stage name")`.
+- `clear_context()` drops only the current agent session; prior `StageResult` outputs remain available through `ctx.get("stage name")`.
 - `Parallel` runs stages concurrently and each agent-backed stage starts with a fresh session.
 
+## Agent Provider
+- Default provider is `claude-code` (Claude Agent SDK). `opencode` is also supported via the OpenCode CLI.
+- Select provider via `--agent-provider` CLI flag, `NORN_AGENT_PROVIDER` env var, or `Pipeline.agent_provider(...)` (priority in that order).
+- Checkpoint and history records store `agent_provider`; `--resume`/`--continue` with a mismatched provider exits with an error.
+- Hooks, MCP tools, and non-`project` `setting_sources` are `claude-code`-only and fail fast with other providers.
+
 ## Generate Stage Quirks
-- If `permission_mode` or `allowed_tools` is set, Claude writes files through tools and `Generate.output_file` is ignored.
-- Use absolute paths in prompts for agent-backed file edits; bundled/dogfooding pipelines do this because the bundled Claude CLI may resolve its project root differently.
-- Use `setting_sources=["project"]` when a Generate stage should load repo guidance such as `CLAUDE.md`.
-- Model shorthands are repo-defined in `norn/stages/generate.py`: `opus`, `sonnet`, and `haiku` map to concrete Claude model IDs.
+- If `permission_mode` or `allowed_tools` is set, the agent writes files through tools and `Generate.output_file` is ignored.
+- Use absolute paths in prompts for agent-backed file edits; bundled/dogfooding pipelines do this because the bundled CLI may resolve its project root differently.
+- Use `setting_sources=["project"]` when a Generate stage should load repo guidance such as `AGENTS.md` or `CLAUDE.md`.
+- Model shorthands are repo-defined in `norn/stages/generate.py`: `opus`, `sonnet`, and `haiku` map to provider-specific model IDs.
 
 ## Config And Secrets
 - The CLI loads env files automatically in this order: `~/.norn/env`, then `.norn.env`; explicit process env vars win.

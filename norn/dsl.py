@@ -222,6 +222,7 @@ class Pipeline:
     pipeline_skills: list[str | Skill] = field(default_factory=list)
     github_org: str | None = None
     project_keys: list[str] = field(default_factory=list)
+    agent_provider_name: str | None = None
     _credential_provider: str = field(default="env", init=False, repr=False, compare=False)
     _credential_kwargs: dict = field(default_factory=dict, init=False, repr=False, compare=False)
     _session_profile: SessionProfile | None = field(default=None, init=False, repr=False, compare=False)
@@ -389,6 +390,7 @@ class Pipeline:
             pipeline_skills=list(self.pipeline_skills),
             github_org=self.github_org,
             project_keys=list(self.project_keys),
+            agent_provider_name=self.agent_provider_name,
         )
         derived._credential_provider = self._credential_provider
         derived._credential_kwargs = dict(self._credential_kwargs)
@@ -404,6 +406,15 @@ class Pipeline:
         """Set the credential provider and optional kwargs for this pipeline."""
         self._credential_provider = provider
         self._credential_kwargs = dict(kwargs)
+        return self
+
+    def agent_provider(self, name: str) -> Pipeline:
+        """Set the agent provider for all Generate stages in this pipeline.
+
+        Args:
+            name: Provider name — ``"claude-code"`` or ``"opencode"``.
+        """
+        self.agent_provider_name = name
         return self
 
     def session_profile(self, profile: SessionProfile) -> Pipeline:

@@ -2,7 +2,8 @@ from unittest.mock import patch
 
 import pytest
 
-from norn.cli import _expand_file_refs, _primary_state_key, _state_key_candidates, main
+from norn.cli import _assert_provider_compatible, _expand_file_refs, _primary_state_key, _state_key_candidates, main
+from norn.checkpoint import Checkpoint, save_checkpoint
 from norn.history import RunRecord, StageHistoryEntry, append_run
 from norn.models import StageLogEntry
 
@@ -47,6 +48,18 @@ def test_expand_relative_path():
 
 
 # --- list subcommand ---
+
+
+def test_continue_help_says_agent_not_claude(capsys):
+    """--continue help text should not say 'Claude remembers'; it should be provider-neutral."""
+    import argparse
+    # Trigger argparse to print help text and capture it
+    with pytest.raises(SystemExit):
+        with patch("sys.argv", ["norn", "run", "--help"]):
+            main()
+    captured = capsys.readouterr()
+    assert "Claude remembers" not in captured.out
+    assert "agent remembers" in captured.out
 
 
 def test_list_shows_bundled_pipelines(capsys):
@@ -194,6 +207,94 @@ def test_history_for_external_config_prefers_cwd_state(capsys, tmp_path, monkeyp
 
     captured = capsys.readouterr()
     assert "#1" in captured.out
+
+
+# --- provider compatibility checks ---
+
+
+def test_assert_provider_compatible_raises_on_mismatch():
+    """_assert_provider_compatible exits when providers differ."""
+    cp = Checkpoint(
+        pipeline="test",
+        timestamp="2026-01-01T00:00:00Z",
+        session_id=None,
+        completed_stages=[],
+        results={},
+        usage=[],
+        agent_provider="opencode",
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        _assert_provider_compatible("claude-code", cp, "resume")
+    assert exc_info.value.code == 1
+
+
+def test_assert_provider_compatible_passes_on_match():
+    """_assert_provider_compatible does not exit when providers match."""
+    cp = Checkpoint(
+        pipeline="test",
+        timestamp="2026-01-01T00:00:00Z",
+        session_id=None,
+        completed_stages=[],
+        results={},
+        usage=[],
+        agent_provider="claude-code",
+    )
+    # Must not raise
+    _assert_provider_compatible("claude-code", cp, "resume")
+
+
+def test_resume_fails_with_mismatched_provider(tmp_path):
+    """--resume exits with error when the selected provider differs from checkpoint."""
+    config = tmp_path / "pipeline.py"
+    config.write_text(
+        "from norn.dsl import Pipeline\nconfig = Pipeline('test')\n"
+    )
+    save_checkpoint(str(config), "test", None, [], {}, agent_provider="opencode")
+
+    with patch("sys.argv", ["norn", "run", str(config), "--resume", "--agent-provider", "claude-code"]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+
+def test_continue_fails_with_mismatched_provider(tmp_path):
+    """--continue exits with error when the selected provider differs from checkpoint."""
+    config = tmp_path / "pipeline.py"
+    config.write_text(
+        "from norn.dsl import Pipeline\nconfig = Pipeline('test')\n"
+    )
+    save_checkpoint(str(config), "test", "sess-abc", [], {}, agent_provider="opencode")
+
+    with patch("sys.argv", ["norn", "run", str(config), "--continue", "--agent-provider", "claude-code"]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+
+def test_resume_allows_matching_provider(tmp_path):
+    """--resume proceeds normally when the selected provider matches the checkpoint."""
+    config = tmp_path / "pipeline.py"
+    config.write_text(
+        "from norn.dsl import Pipeline\nconfig = Pipeline('test')\n"
+    )
+    save_checkpoint(str(config), "test", None, [], {}, agent_provider="claude-code")
+
+    # No stages to run; should complete without raising
+    with patch("sys.argv", ["norn", "run", str(config), "--resume"]):
+        main()
+
+
+def test_continue_allows_matching_provider(tmp_path):
+    """--continue proceeds normally when the selected provider matches the checkpoint."""
+    config = tmp_path / "pipeline.py"
+    config.write_text(
+        "from norn.dsl import Pipeline\nconfig = Pipeline('test')\n"
+    )
+    save_checkpoint(str(config), "test", None, [], {}, agent_provider="claude-code")
+
+    # No session_id in checkpoint -> "No saved session found" path, but no error
+    with patch("sys.argv", ["norn", "run", str(config), "--continue"]):
+        main()
 
 
 def test_run_external_config_writes_state_in_cwd(tmp_path, monkeypatch):

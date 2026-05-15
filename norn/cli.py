@@ -57,6 +57,29 @@ def _load_checkpoint_for_config(config_arg: str, *, cwd: Path | None = None) -> 
     return None
 
 
+def _assert_provider_compatible(
+    resolved_provider: str,
+    checkpoint: "Checkpoint",
+    mode: str,
+) -> None:
+    """Exit with an error if the resolved provider doesn't match the checkpoint provider.
+
+    Args:
+        resolved_provider: The provider selected for this run.
+        checkpoint: The loaded checkpoint to compare against.
+        mode: Either ``"resume"`` or ``"continue"`` for the error message.
+    """
+    checkpoint_provider = checkpoint.agent_provider
+    if resolved_provider != checkpoint_provider:
+        print(
+            f"Error: cannot --{mode} with provider '{resolved_provider}': "
+            f"checkpoint was created with '{checkpoint_provider}'. "
+            f"Re-run with --agent-provider {checkpoint_provider} to continue this session.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _load_history_for_config(config_arg: str, *, cwd: Path | None = None) -> list:
     """Load history using primary state resolution with legacy fallback."""
     for candidate in _state_key_candidates(config_arg, cwd=cwd):
@@ -143,7 +166,7 @@ def main() -> None:
         "--continue",
         action="store_true",
         dest="continue_session",
-        help="Continue the previous session (re-runs all stages but Claude remembers the conversation)",
+        help="Continue the previous session (re-runs all stages but the agent remembers the conversation)",
     )
     run_parser.add_argument(
         "--dry-run",
@@ -154,6 +177,12 @@ def main() -> None:
         "--step",
         action="store_true",
         help="Interactive stepping mode: prompt before each stage",
+    )
+    run_parser.add_argument(
+        "--agent-provider",
+        default=None,
+        metavar="PROVIDER",
+        help="Agent provider to use (e.g. claude-code, opencode). Overrides NORN_AGENT_PROVIDER and pipeline setting.",
     )
 
     history_parser = sub.add_parser("history", help="Show run history for a pipeline config")
@@ -333,11 +362,18 @@ def main() -> None:
         print_dry_run(pipeline)
         return
 
+    from norn.agents import resolve_agent_provider
+
+    resolved_provider = resolve_agent_provider(pipeline, cli_provider=args.agent_provider)
+
     resume_session: str | None = None
     resume_checkpoint: Checkpoint | None = None
 
     if args.resume or args.continue_session:
         checkpoint = _load_checkpoint_for_config(args.config)
+        if checkpoint is not None:
+            mode = "resume" if args.resume else "continue"
+            _assert_provider_compatible(resolved_provider, checkpoint, mode)
         if args.resume and checkpoint:
             resume_checkpoint = checkpoint
             resume_session = checkpoint.session_id
@@ -357,17 +393,16 @@ def main() -> None:
     alert_manager = AlertManager(channels=pipeline.alert_channels) if pipeline.alert_channels else None
 
     try:
-        asyncio.run(
-            run_pipeline(
-                pipeline,
-                params=params,
-                resume_session=resume_session,
-                resume_checkpoint=resume_checkpoint,
-                config_path=config_path_for_checkpoint,
-                alert_manager=alert_manager,
-                step_mode=args.step,
-            )
-        )
+        asyncio.run(run_pipeline(
+            pipeline,
+            params=params,
+            resume_session=resume_session,
+            resume_checkpoint=resume_checkpoint,
+            config_path=config_path_for_checkpoint,
+            alert_manager=alert_manager,
+            step_mode=args.step,
+            agent_provider=resolved_provider,
+        ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
     except PipelineError as e:
         from norn.ui import console

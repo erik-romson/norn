@@ -60,6 +60,7 @@ class RunRecord:
     failed_stage: str | None = None
     in_progress: bool = False
     stage_log: list[StageLogEntry] = field(default_factory=list)
+    agent_provider: str = "claude-code"
 
 
 def history_file(config_path: str) -> Path:
@@ -82,6 +83,7 @@ def append_run(config_path: str, record: RunRecord) -> None:
         "session_id": record.session_id,
         "failed_stage": record.failed_stage,
         "in_progress": record.in_progress,
+        "agent_provider": record.agent_provider,
         "stage_log": [
             {
                 "name": entry.name,
@@ -100,6 +102,7 @@ def append_run(config_path: str, record: RunRecord) -> None:
                 "num_turns": entry.num_turns,
                 "model": entry.model,
                 "session_id": entry.session_id,
+                "provider": entry.provider,
             }
             for entry in record.stage_log
         ],
@@ -144,6 +147,7 @@ def load_history(config_path: str) -> list[RunRecord]:
                     model=entry.get("model"),
                     session_id=entry.get("session_id"),
                     error=entry.get("error"),
+                    provider=entry.get("provider"),
                 )
                 for entry in data.get("stage_log", [])
             ]
@@ -160,6 +164,7 @@ def load_history(config_path: str) -> list[RunRecord]:
                 failed_stage=data.get("failed_stage"),
                 in_progress=data.get("in_progress", False),
                 stage_log=stage_log,
+                agent_provider=data.get("agent_provider", "claude-code"),
             )
             records_by_id[record.run_id] = record
         except Exception:

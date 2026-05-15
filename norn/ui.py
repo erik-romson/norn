@@ -85,8 +85,8 @@ def print_stage_running(name: str) -> float:
     return time.monotonic()
 
 
-def print_calling_claude(stage_name: str, model: str | None) -> None:
-    """Announce that a Generate stage is about to invoke the SDK.
+def print_calling_agent(stage_name: str, provider: str, model: str | None) -> None:
+    """Announce that a Generate stage is about to invoke the agent provider.
 
     Prints on its own line (with newline) so it survives past the
     agent's streamed token output, which writes directly to stdout.
@@ -96,16 +96,16 @@ def print_calling_claude(stage_name: str, model: str | None) -> None:
     model_label = f" ({model})" if model else ""
     # Newline first so we don't land on the runner's open ⏳ spinner line.
     console.print(
-        f"\n    [yellow]→ calling Claude{model_label}…[/yellow] [dim]({stage_name})[/dim]",
+        f"\n    [yellow]→ calling agent ({provider}){model_label}…[/yellow] [dim]({stage_name})[/dim]",
         highlight=False,
     )
 
 
 def print_got_reply(stage_name: str, elapsed: float) -> None:
-    """Announce that the SDK query finished, before the runner emits
+    """Announce that the agent query finished, before the runner emits
     its final ✓/✗ result line.
 
-    Pairs with ``print_calling_claude``.
+    Pairs with ``print_calling_agent``.
     """
     console.print(
         f"    [cyan]← got reply[/cyan] [dim]({stage_name}, {elapsed:.1f}s)[/dim]",

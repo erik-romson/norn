@@ -213,32 +213,20 @@ async def test_keyword_matcher_no_org():
 
 @pytest.mark.asyncio
 async def test_llm_matcher_hit():
-    import sys
-
     issue = _make_issue(summary="Login broken", description="users cannot log in")
     ctx = _make_ctx()
     ctx.params["github_org"] = "acme"
 
-    class FakeAssistantMessage:
-        def __init__(self, content: list) -> None:
-            self.content = content
-
-    fake_block = MagicMock()
-    fake_block.text = '{"repo": "acme/auth-service", "confidence": 0.85, "reasoning": "login"}'
-    fake_msg = FakeAssistantMessage([fake_block])
-
-    async def fake_query(prompt: str, options: object = None):  # noqa: ARG001
-        yield fake_msg
-
-    fake_sdk = MagicMock()
-    fake_sdk.query = fake_query
-    fake_sdk.ClaudeAgentOptions = MagicMock
-    fake_sdk.AssistantMessage = FakeAssistantMessage
+    async def fake_complete(prompt, *, provider, model, system_prompt=None, cwd=None, env=None):
+        return '{"repo": "acme/auth-service", "confidence": 0.85, "reasoning": "login"}'
 
     with patch(
         "norn.contrib.matchers.llm_matcher.list_org_repos",
         new=AsyncMock(return_value=["acme/auth-service"]),
-    ), patch.dict(sys.modules, {"claude_agent_sdk": fake_sdk}):
+    ), patch(
+        "norn.agents.complete.complete_text",
+        new=fake_complete,
+    ):
         from norn.contrib.matchers.llm_matcher import LLMMatcher
         matcher = LLMMatcher()
         result = await matcher.match(issue, ctx)
@@ -261,6 +249,59 @@ async def test_llm_matcher_no_repos():
         from norn.contrib.matchers.llm_matcher import LLMMatcher
         matcher = LLMMatcher()
         result = await matcher.match(issue, ctx)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_llm_matcher_passes_ctx_provider():
+    """LLMMatcher should pass ctx.agent_provider to complete_text."""
+    issue = _make_issue(summary="Login broken", description="users cannot log in")
+    ctx = _make_ctx()
+    ctx.params["github_org"] = "acme"
+    ctx.agent_provider = "opencode"
+
+    captured: dict = {}
+
+    async def fake_complete(prompt, *, provider, model, system_prompt=None, cwd=None, env=None):
+        captured["provider"] = provider
+        captured["model"] = model
+        return '{"repo": "acme/auth-service", "confidence": 0.9, "reasoning": "test"}'
+
+    with patch(
+        "norn.contrib.matchers.llm_matcher.list_org_repos",
+        new=AsyncMock(return_value=["acme/auth-service"]),
+    ), patch(
+        "norn.agents.complete.complete_text",
+        new=fake_complete,
+    ):
+        from norn.contrib.matchers.llm_matcher import LLMMatcher
+        matcher = LLMMatcher()
+        await matcher.match(issue, ctx)
+
+    assert captured["provider"] == "opencode"
+
+
+@pytest.mark.asyncio
+async def test_llm_matcher_complete_text_returns_none():
+    """LLMMatcher returns None when complete_text returns None."""
+    issue = _make_issue(summary="Login broken", description="users cannot log in")
+    ctx = _make_ctx()
+    ctx.params["github_org"] = "acme"
+
+    async def fake_complete(prompt, *, provider, model, system_prompt=None, cwd=None, env=None):
+        return None
+
+    with patch(
+        "norn.contrib.matchers.llm_matcher.list_org_repos",
+        new=AsyncMock(return_value=["acme/auth-service"]),
+    ), patch(
+        "norn.agents.complete.complete_text",
+        new=fake_complete,
+    ):
+        from norn.contrib.matchers.llm_matcher import LLMMatcher
+        matcher = LLMMatcher()
+        result = await matcher.match(issue, ctx)
+
     assert result is None
 
 

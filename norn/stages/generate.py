@@ -17,14 +17,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# The SDK emits an INFO-level "Using bundled Claude Code CLI: <path>" line on
-# every transport spawn. That breaks the inline ⏳→✓ stage indicator (the line
-# lands between the spinner and its success/failure replacement) and clutters
-# the run log with the same path repeated on every Generate call. Pin the SDK
-# logger to WARNING to keep real errors but drop the spawn chatter — same
-# pattern check_ci.py uses for httpx/httpcore.
-logging.getLogger("claude_agent_sdk").setLevel(logging.WARNING)
-
 MODEL_MAP: dict[str, str] = {
     "opus": "claude-opus-4-6",
     "sonnet": "claude-sonnet-4-6",
@@ -51,13 +43,13 @@ def _render_cli_exception(
     stderr_lines: list[str],
     assistant_chunks: list[str] | None = None,
 ) -> str:
-    """Merge the SDK exception with captured CLI stderr, if available.
+    """Merge the provider exception with captured stderr, if available.
 
-    When the SDK exception's stderr is the bare "Check stderr output for
+    When the exception's stderr is the bare "Check stderr output for
     details" placeholder AND no stderr lines were captured (e.g. the failure
     happened in the assistant message stream — usage-limit messages,
     invalid-API-key messages, etc.), fall back to the tail of the
-    assistant output. That's where Claude itself prints "You've hit your
+    assistant output. That's where the agent prints "You've hit your
     limit", so without this fallback the user gets a useless error.
     """
     message = ui.mask(str(exc)).strip() or exc.__class__.__name__
@@ -83,11 +75,12 @@ def _render_cli_exception(
 
 
 class Generate(BaseStage):
-    """Send a prompt to Claude via the claude-agent-sdk.
+    """Send a prompt to an agent provider.
 
-    This is the primary AI-powered stage. It calls the Claude Agent SDK's
-    ``query()`` function, streams the response, tracks token usage and cost,
-    and captures file artifacts written by the agent.
+    This is the primary AI-powered stage. It delegates to whichever
+    ``AgentProvider`` is selected for the pipeline run (via
+    ``ctx.agent_provider``), streams the response, tracks token usage and
+    cost, and captures file artifacts written by the agent.
 
     Prompts can be provided directly or via a named template. Placeholders
     like ``{stage_name.output}`` and ``{param.key}`` are resolved before
@@ -117,8 +110,7 @@ class Generate(BaseStage):
         setting_sources: Config sources to load (e.g. ``["project"]`` loads
             CLAUDE.md).
         add_dirs: Additional directories the agent may access.
-        hooks: SDK-level hooks dict (``PreToolUse``, ``PostToolUse``).
-            A ``PostToolUse`` hook for artifact tracking is always added.
+        hooks: Provider-level hooks dict (``PreToolUse``, ``PostToolUse``).
         env: Environment variables for the agent. Supports
             ``{secret.NAME}`` placeholders.
         skills: List of skill names or ``Skill`` objects to inject into
@@ -222,16 +214,8 @@ class Generate(BaseStage):
         attempt: int = kwargs.get("attempt", 1)
         fork_session: bool = kwargs.get("fork_session", False)
         mcp_servers: dict | None = kwargs.get("mcp_servers")
+        mcp_tools: list | None = kwargs.get("mcp_tools")
         stage_name: str = kwargs.get("stage_name", "claude")
-
-        try:
-            from claude_agent_sdk import query
-        except ImportError:
-            return StageResult(
-                name="",
-                success=False,
-                error="claude-agent-sdk is not installed. Install with: uv add claude-agent-sdk",
-            )
 
         # Resolve prompt: either from a named template or directly from self.prompt
         tmpl: PromptTemplate | None = None
@@ -251,146 +235,185 @@ class Generate(BaseStage):
                 f"## {label}\n{content}" for label, content in ctx.injected_context
             )
 
-        stderr_lines: list[str] = []
-        try:
-            from claude_agent_sdk import (
-                AssistantMessage,
-                ClaudeAgentOptions,
-                ResultMessage,
-            )
+        resolved_model = self.model or ctx.params.get("default_model")
 
-            chunks: list[str] = []
-            artifacts: list[str] = []
-            structured_output: Any = None
-            resolved_model = self.model or ctx.params.get("default_model")
-            usage_record = UsageRecord(stage_name="", attempt=attempt, model=resolved_model)
+        # Resolve effective settings: stage-level overrides pipeline-level profile
+        _pp = ctx.pipeline_profile
+        effective_allowed_tools = self.allowed_tools
+        effective_permission_mode = self.permission_mode
+        effective_max_turns = self.max_turns
+        effective_env = self.env
+        effective_hooks = self.hooks
+        if _pp:
+            if effective_allowed_tools is None:
+                effective_allowed_tools = _pp.allowed_tools
+            if effective_permission_mode is None:
+                effective_permission_mode = _pp.permission_mode
+            if effective_max_turns is None:
+                effective_max_turns = _pp.max_turns
+            if effective_env is None and _pp.env:
+                effective_env = _pp.env
+            if effective_hooks is None and _pp.blocked_patterns:
+                from norn.profiles import build_block_hooks
+                effective_hooks = build_block_hooks(_pp.blocked_patterns)
 
-            # Resolve effective settings: stage-level overrides pipeline-level profile
-            _pp = ctx.pipeline_profile
-            effective_allowed_tools = self.allowed_tools
-            effective_permission_mode = self.permission_mode
-            effective_max_turns = self.max_turns
-            effective_env = self.env
-            effective_hooks = self.hooks
-            if _pp:
-                if effective_allowed_tools is None:
-                    effective_allowed_tools = _pp.allowed_tools
-                if effective_permission_mode is None:
-                    effective_permission_mode = _pp.permission_mode
-                if effective_max_turns is None:
-                    effective_max_turns = _pp.max_turns
-                if effective_env is None and _pp.env:
-                    effective_env = _pp.env
-                if effective_hooks is None and _pp.blocked_patterns:
-                    from norn.profiles import build_block_hooks
-                    effective_hooks = build_block_hooks(_pp.blocked_patterns)
+        # Build system_prompt from skills, template, context injection, and project guidance
+        system_prompt_parts: list[str] = []
 
-            async def _track_artifacts(input_data: dict, tool_use_id: str, context: Any) -> dict:
-                if input_data.get("tool_name") in ("Write", "Edit", "NotebookEdit"):
-                    file_path = input_data.get("tool_input", {}).get("file_path")
-                    if file_path and file_path not in artifacts:
-                        artifacts.append(file_path)
-                return {}
+        # Resolve portable project guidance when setting_sources includes "project"
+        resolved_setting_sources = list(self.setting_sources) if self.setting_sources else None
+        if resolved_setting_sources and "project" in resolved_setting_sources:
+            from norn.agents.guidance import resolve_project_guidance
 
-            opt_kwargs: dict[str, Any] = {}
-            if session_id:
-                opt_kwargs["resume"] = session_id
-            if fork_session and session_id:
-                opt_kwargs["fork_session"] = True
-            if effective_allowed_tools:
-                opt_kwargs["allowed_tools"] = effective_allowed_tools
-            if effective_permission_mode:
-                opt_kwargs["permission_mode"] = effective_permission_mode
-            if effective_max_turns is not None:
-                opt_kwargs["max_turns"] = effective_max_turns
-            if self.cwd:
-                opt_kwargs["cwd"] = self.cwd
-            if self.setting_sources:
-                opt_kwargs["setting_sources"] = self.setting_sources
-            if self.add_dirs:
-                opt_kwargs["add_dirs"] = self.add_dirs
-            if resolved_model:
-                opt_kwargs["model"] = MODEL_MAP.get(resolved_model, resolved_model)
-            if self.thinking:
-                opt_kwargs["thinking"] = self.thinking
-            opt_kwargs["stderr"] = lambda line: stderr_lines.append(line)
+            guidance_text = resolve_project_guidance(cwd=self.cwd)
+            if guidance_text:
+                system_prompt_parts.append(guidance_text)
+                log.debug("[generate] Injected portable project guidance into system_prompt")
+            # Remove "project" so providers don't double-inject
+            resolved_setting_sources.remove("project")
+            if not resolved_setting_sources:
+                resolved_setting_sources = None
 
-            # Build system_prompt from skills, template, and context injection
-            system_prompt_parts: list[str] = []
-
-            # Merge pipeline-level and stage-level skills; prepend to system prompt
-            all_skills: list[Any] = [*(ctx.pipeline_skills or []), *(self.skills or [])]
-            if all_skills:
-                from norn.skills import resolve_skill_content
-                skill_texts = [resolve_skill_content(s) for s in all_skills]
-                system_prompt_parts.append("\n\n".join(skill_texts))
-                log.debug("[generate] Injected %d skill(s) into system_prompt", len(all_skills))
-
-            if tmpl and tmpl.system_prompt:
-                system_prompt_parts.append(tmpl.system_prompt)
-            if context_text:
-                agent_has_tools = bool(effective_allowed_tools or effective_permission_mode or (tmpl and tmpl.system_prompt))
-                if agent_has_tools:
-                    system_prompt_parts.append(context_text)
-                else:
-                    resolved_prompt = f"{context_text}\n\n{resolved_prompt}"
-            if system_prompt_parts:
-                opt_kwargs["system_prompt"] = "\n\n".join(system_prompt_parts)
-
-            if tmpl and tmpl.output_format:
-                opt_kwargs["output_format"] = tmpl.output_format
-
-            if mcp_servers:
-                opt_kwargs["mcp_servers"] = mcp_servers
-
-            # Build env: merge pipeline-level env and stage-level env (with secret resolution)
-            merged_env: dict[str, str] = {}
-            if ctx.env:
-                merged_env.update(ctx.env)
-            if effective_env:
-                merged_env.update(resolve_env(effective_env, ctx))
-            if merged_env:
-                opt_kwargs["env"] = merged_env
-
-            artifact_hook = {"hooks": [_track_artifacts]}
+        # Fail fast: non-portable features are not allowed for non-claude-code providers.
+        # SDK hooks (including those compiled from blocked_patterns via profile) are
+        # Claude Code-only.  MCP tools and non-project setting_sources are also
+        # provider-specific.  Return a clear StageResult so callers don't receive a
+        # raw exception and the error message includes the provider, feature, stage
+        # name, and a hint.
+        if ctx.agent_provider != "claude-code":
             if effective_hooks:
-                merged = dict(effective_hooks)
-                existing = merged.get("PostToolUse", [])
-                merged["PostToolUse"] = [*existing, artifact_hook]
-                opt_kwargs["hooks"] = merged
+                return StageResult(
+                    name="",
+                    success=False,
+                    error=(
+                        f"Stage '{stage_name}' uses hooks, which are not supported by provider "
+                        f"'{ctx.agent_provider}'. SDK hooks are a Claude Code feature. "
+                        f"Use provider 'claude-code' for hook-based features, or remove hooks "
+                        f"from this stage."
+                    ),
+                )
+            if mcp_tools:
+                return StageResult(
+                    name="",
+                    success=False,
+                    error=(
+                        f"Stage '{stage_name}' declares mcp_tools, which are not supported by "
+                        f"provider '{ctx.agent_provider}'. MCP tools are a Claude Code SDK "
+                        f"feature. Use provider 'claude-code' for MCP tool features."
+                    ),
+                )
+            if resolved_setting_sources:
+                unsupported = ", ".join(repr(s) for s in resolved_setting_sources)
+                return StageResult(
+                    name="",
+                    success=False,
+                    error=(
+                        f"Stage '{stage_name}' uses setting_sources {unsupported}, which are "
+                        f"not supported by provider '{ctx.agent_provider}'. Only 'project' is "
+                        f"portable across providers. Use provider 'claude-code' for "
+                        f"provider-specific setting sources, or remove them."
+                    ),
+                )
+
+        # Merge pipeline-level and stage-level skills; prepend to system prompt
+        all_skills: list[Any] = [*(ctx.pipeline_skills or []), *(self.skills or [])]
+        if all_skills:
+            from norn.skills import resolve_skill_content
+            skill_texts = [resolve_skill_content(s) for s in all_skills]
+            system_prompt_parts.append("\n\n".join(skill_texts))
+            log.debug("[generate] Injected %d skill(s) into system_prompt", len(all_skills))
+
+        if tmpl and tmpl.system_prompt:
+            system_prompt_parts.append(tmpl.system_prompt)
+        if context_text:
+            agent_has_tools = bool(effective_allowed_tools or effective_permission_mode or (tmpl and tmpl.system_prompt))
+            if agent_has_tools:
+                system_prompt_parts.append(context_text)
             else:
-                opt_kwargs["hooks"] = {"PostToolUse": [artifact_hook]}
+                resolved_prompt = f"{context_text}\n\n{resolved_prompt}"
 
-            options = ClaudeAgentOptions(**opt_kwargs)
+        system_prompt: str | None = "\n\n".join(system_prompt_parts) if system_prompt_parts else None
 
-            ui.print_calling_claude(stage_name, resolved_model)
+        output_format: dict | None = tmpl.output_format if (tmpl and tmpl.output_format) else None
+
+        # Build env: merge pipeline-level env and stage-level env (with secret resolution)
+        merged_env: dict[str, str] = {}
+        if ctx.env:
+            merged_env.update(ctx.env)
+        if effective_env:
+            merged_env.update(resolve_env(effective_env, ctx))
+
+        # Build the provider-neutral request
+        from norn.agents.base import AgentRequest
+        from norn.agents.permissions import normalize_permissions
+
+        permissions = normalize_permissions(effective_allowed_tools, effective_permission_mode)
+
+        request = AgentRequest(
+            prompt=resolved_prompt,
+            stage_name=stage_name,
+            provider=ctx.agent_provider,
+            model=resolved_model,
+            session_id=session_id,
+            fork_session=fork_session,
+            allowed_tools=effective_allowed_tools,
+            permission_mode=effective_permission_mode,
+            max_turns=effective_max_turns,
+            cwd=self.cwd,
+            env=merged_env,
+            system_prompt=system_prompt,
+            output_format=output_format,
+            thinking=self.thinking,
+            attempt=attempt,
+            add_dirs=self.add_dirs,
+            setting_sources=resolved_setting_sources,
+            hooks=effective_hooks,
+            mcp_servers=mcp_servers,
+            mcp_tools=mcp_tools,
+            permissions=permissions,
+        )
+
+        # Run via the registered provider for this pipeline run
+        from norn.agents.registry import get_provider
+
+        provider = get_provider(ctx.agent_provider)
+
+        chunks: list[str] = []
+        artifacts: list[str] = []
+        structured_output: Any = None
+        usage_record = UsageRecord(stage_name="", attempt=attempt, model=resolved_model)
+
+        try:
+            ui.print_calling_agent(stage_name, ctx.agent_provider, resolved_model)
             _query_start = time.monotonic()
 
-            async for message in query(prompt=resolved_prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            chunks.append(block.text)
-                            print(ui.mask(block.text), end="", flush=True)
+            async for event in provider.run(request):
+                if event.text is not None:
+                    chunks.append(event.text)
+                    print(ui.mask(event.text), end="", flush=True)
 
-                elif isinstance(message, ResultMessage):
-                    usage_record.session_id = message.session_id
-                    usage_record.total_cost_usd = message.total_cost_usd or 0.0
-                    usage_record.duration_ms = message.duration_ms
-                    usage_record.duration_api_ms = message.duration_api_ms
-                    usage_record.num_turns = message.num_turns
-                    usage_record.is_error = message.is_error
-                    if hasattr(message, "structured_output") and message.structured_output is not None:
-                        structured_output = message.structured_output
-                    if message.usage:
-                        usage_record.input_tokens = message.usage.get("input_tokens", 0)
-                        usage_record.output_tokens = message.usage.get("output_tokens", 0)
-                        usage_record.cache_read_input_tokens = message.usage.get(
-                            "cache_read_input_tokens", 0
-                        )
-                        usage_record.cache_creation_input_tokens = message.usage.get(
-                            "cache_creation_input_tokens", 0
-                        )
+                if event.session_id is not None:
+                    if not usage_record.session_id:
+                        usage_record.session_id = event.session_id
+                        log.debug("[generate] Captured session_id: %s", event.session_id)
+                    else:
+                        usage_record.session_id = event.session_id
+
+                if event.structured_output is not None:
+                    structured_output = event.structured_output
+
+                if event.usage is not None:
+                    usage_record.provider = event.usage.provider
+                    usage_record.session_id = event.usage.session_id
+                    usage_record.total_cost_usd = event.usage.total_cost_usd
+                    usage_record.duration_ms = event.usage.duration_ms
+                    usage_record.duration_api_ms = event.usage.duration_api_ms
+                    usage_record.num_turns = event.usage.num_turns
+                    usage_record.is_error = event.usage.is_error
+                    usage_record.input_tokens = event.usage.input_tokens
+                    usage_record.output_tokens = event.usage.output_tokens
+                    usage_record.cache_read_input_tokens = event.usage.cache_read_input_tokens
+                    usage_record.cache_creation_input_tokens = event.usage.cache_creation_input_tokens
                     log.debug(
                         "[generate] ResultMessage: tokens=%d cost=$%.4f duration=%dms turns=%d session=%s",
                         usage_record.total_tokens,
@@ -400,20 +423,9 @@ class Generate(BaseStage):
                         usage_record.session_id,
                     )
 
-                else:
-                    # Capture session_id from init/system messages
-                    if hasattr(message, "session_id") and message.session_id:
-                        if not usage_record.session_id:
-                            usage_record.session_id = message.session_id
-                            log.debug("[generate] Captured session_id from %s: %s",
-                                      type(message).__name__, message.session_id)
-
-                    if hasattr(message, "content"):
-                        for block in message.content:
-                            if hasattr(block, "text"):
-                                chunks.append(block.text)
-                    elif isinstance(message, str):
-                        chunks.append(message)
+                if event.artifact is not None:
+                    if event.artifact not in artifacts:
+                        artifacts.append(event.artifact)
 
             if chunks:
                 print()  # end the streamed output line
@@ -427,9 +439,17 @@ class Generate(BaseStage):
                 return StageResult(name="", success=True, output=structured_output, usage=usage_record, artifacts=artifacts)
 
             # Only write output_file when set AND the agent had no file-writing
-            # tools — otherwise Claude already wrote files via Edit/Write tools
+            # tools — otherwise the agent already wrote files via Edit/Write tools
             # and the raw assistant text is prose, not code.
-            agent_has_file_tools = bool(effective_allowed_tools or effective_permission_mode)
+            # Use normalized permissions; fall back to truthy check on original
+            # fields so unknown tools still disable output_file writing.
+            agent_has_file_tools = (
+                permissions.file_read
+                or permissions.file_edit
+                or permissions.terminal
+                or permissions.plan_only
+                or bool(effective_allowed_tools or effective_permission_mode)
+            )
             if self.output_file and not agent_has_file_tools:
                 code = self._extract_code(raw_output)
                 out_path = pathlib.Path(self.output_file)
@@ -438,9 +458,22 @@ class Generate(BaseStage):
                 return StageResult(name="", success=True, output=code, usage=usage_record, artifacts=artifacts)
 
             return StageResult(name="", success=True, output=raw_output, usage=usage_record, artifacts=artifacts)
+        except ImportError as e:
+            return StageResult(
+                name="",
+                success=False,
+                error=str(e),
+            )
         except Exception as e:
             log.debug("[generate] Exception: %s", e)
+            from norn.agents.base import AgentError
+
+            stderr_lines: list[str] = []
+            original: Exception = e
+            if isinstance(e, AgentError):
+                stderr_lines = e.stderr_lines
+                original = e.original
             return StageResult(
                 name="", success=False,
-                error=_render_cli_exception(e, stderr_lines, chunks),
+                error=_render_cli_exception(original, stderr_lines, chunks),
             )

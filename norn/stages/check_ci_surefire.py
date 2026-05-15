@@ -360,38 +360,26 @@ async def _haiku_summarize(
     *,
     model: str = "haiku",
     app_packages: list[str] | str | None = None,
+    provider: str = "claude-code",
 ) -> str | None:
-    """Run a one-shot Haiku query to compress the extracted failure log.
+    """Run a one-shot completion to compress the extracted failure log.
 
     Returns ``None`` (caller should fall back to the un-compressed text) if
-    the SDK isn't available or the query errors out.
+    the provider errors out or returns empty.
 
     Args:
         text: The extracted Surefire failure block.
-        model: ``claude-agent-sdk`` model shorthand. Defaults to ``"haiku"``.
+        model: Model alias or full ID. Defaults to ``"haiku"``.
         app_packages: Application package globs (e.g.
             ``["com.e4marine.*"]``). Frames matching these are always kept by
             the prompt. ``None`` tells the model to infer from the trace.
+        provider: Agent provider name. Defaults to ``"claude-code"``.
     """
-    try:
-        from claude_agent_sdk import (
-            AssistantMessage,
-            ClaudeAgentOptions,
-            query,
-        )
-    except ImportError:
-        log.warning("claude-agent-sdk not installed — skipping Haiku summarization")
-        return None
-
-    from norn.stages.generate import MODEL_MAP
+    from norn.agents.complete import complete_text
 
     system = _HAIKU_SYSTEM_TEMPLATE.format(
         APP_PACKAGES=_format_app_packages(app_packages),
     )
-    # Compression instructions go in the SYSTEM prompt so they aren't
-    # diluted by claude-agent-sdk's default Claude Code system prompt.
-    # The user message carries only the stacktrace, with a one-line
-    # restatement of the task.
     user_msg = (
         "Compress the following Java stacktrace per the rules above.\n\n"
         "----- BEGIN STACKTRACE -----\n"
@@ -399,31 +387,12 @@ async def _haiku_summarize(
         "----- END STACKTRACE -----"
     )
 
-    chunks: list[str] = []
-    stderr_lines: list[str] = []
-    try:
-        async for msg in query(
-            prompt=user_msg,
-            options=ClaudeAgentOptions(
-                model=MODEL_MAP.get(model, model),
-                system_prompt=system,
-                allowed_tools=[],
-                max_turns=1,
-                stderr=lambda line: stderr_lines.append(line),
-            ),
-        ):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if hasattr(block, "text"):
-                        chunks.append(block.text)
-    except Exception as e:
-        log.warning("Haiku summarization failed: %s", e)
-        if stderr_lines:
-            log.warning("SDK stderr:\n%s", "\n".join(stderr_lines[-30:]))
-        return None
-
-    summary = "".join(chunks).strip()
-    return summary or None
+    return await complete_text(
+        user_msg,
+        provider=provider,
+        model=model,
+        system_prompt=system,
+    )
 
 
 class CheckCISurefire(BaseStage):
@@ -539,7 +508,7 @@ class CheckCISurefire(BaseStage):
                 logs = ""
                 if conclusion != "success":
                     raw = await _get_failed_logs(gh, owner, repo_name, run_info["run_id"])
-                    logs = await self._build_logs(raw)
+                    logs = await self._build_logs(raw, provider=ctx.agent_provider)
 
                 output = {
                     "run_id": run_info["run_id"],
@@ -576,7 +545,7 @@ class CheckCISurefire(BaseStage):
             log.debug("CI status: %s — waiting %ds", status, self.poll_interval)
             await asyncio.sleep(self.poll_interval)
 
-    async def _build_logs(self, raw: str) -> str:
+    async def _build_logs(self, raw: str, *, provider: str = "claude-code") -> str:
         """Extract → optionally compress with Haiku → return final string."""
         if not raw:
             return ""
@@ -605,6 +574,7 @@ class CheckCISurefire(BaseStage):
             body,
             model=self.haiku_model,
             app_packages=self.app_packages,
+            provider=provider,
         )
         if not summary:
             return extracted

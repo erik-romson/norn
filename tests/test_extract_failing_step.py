@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -12,8 +13,8 @@ from norn.stages.extract_failing_step import (
 )
 
 
-def _ctx_with(name: str, result: StageResult) -> PipelineContext:
-    ctx = PipelineContext()
+def _ctx_with(name: str, result: StageResult, *, agent_provider: str = "claude-code") -> PipelineContext:
+    ctx = PipelineContext(agent_provider=agent_provider)
     ctx.results[name] = result
     return ctx
 
@@ -194,7 +195,7 @@ async def test_python_slice_then_haiku():
 
     captured: dict[str, str] = {}
 
-    async def _capture(text: str, *, model: str) -> str:
+    async def _capture(text: str, *, model: str, provider: str = "claude-code") -> str:
         captured["sent_to_haiku"] = text
         return "compressed output"
 
@@ -273,7 +274,7 @@ async def test_python_slice_fails_falls_through_to_haiku_on_raw():
 
     captured: dict[str, str] = {}
 
-    async def _capture(text: str, *, model: str) -> str:
+    async def _capture(text: str, *, model: str, provider: str = "claude-code") -> str:
         captured["sent_to_haiku"] = text
         return "haiku output"
 
@@ -330,7 +331,7 @@ async def test_haiku_input_truncated_when_oversized():
 
     captured: dict[str, str] = {}
 
-    async def _capture(text: str, *, model: str) -> str:
+    async def _capture(text: str, *, model: str, provider: str = "claude-code") -> str:
         captured["sent_to_haiku"] = text
         return "compressed"
 
@@ -352,3 +353,59 @@ async def test_haiku_input_truncated_when_oversized():
     assert "chars omitted from middle" in sent
     assert "HEAD" in sent
     assert "TAIL" in sent
+
+
+@pytest.mark.asyncio
+async def test_haiku_compress_receives_ctx_agent_provider():
+    """When ctx.agent_provider is non-default, _haiku_compress receives it."""
+    log_text = (
+        "Failed steps: Run tests\n"
+        "##[group]Run tests\n"
+        + ("noise\n" * 2000)
+        + "test FAILED\n"
+        "##[endgroup]\n"
+    )
+    ctx = _ctx_with(
+        "check ci",
+        StageResult(name="check ci", success=False, output=log_text),
+        agent_provider="opencode",
+    )
+
+    captured: dict[str, str] = {}
+
+    async def _capture(text: str, *, model: str, provider: str = "claude-code") -> str:
+        captured["provider"] = provider
+        return "compressed"
+
+    with patch(
+        "norn.stages.extract_failing_step._haiku_compress",
+        new=_capture,
+    ):
+        result = await ExtractFailingStep(source_stage="check ci").run(ctx)
+
+    assert result.success
+    assert captured["provider"] == "opencode"
+
+
+@pytest.mark.asyncio
+async def test_haiku_compress_delegates_to_complete_text():
+    """_haiku_compress delegates to complete_text with correct args."""
+    from norn.stages.extract_failing_step import _haiku_compress
+
+    captured: dict[str, Any] = {}
+
+    async def fake_complete(prompt, *, provider, model, system_prompt=None, cwd=None, env=None):
+        captured["provider"] = provider
+        captured["model"] = model
+        captured["system_prompt"] = system_prompt
+        captured["prompt"] = prompt
+        return "result"
+
+    with patch("norn.agents.complete.complete_text", new=fake_complete):
+        result = await _haiku_compress("some log", model="haiku", provider="opencode")
+
+    assert result == "result"
+    assert captured["provider"] == "opencode"
+    assert captured["model"] == "haiku"
+    assert captured["system_prompt"] is not None
+    assert "some log" in captured["prompt"]

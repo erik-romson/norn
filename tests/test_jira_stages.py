@@ -739,7 +739,7 @@ def test_slack_missing_dependency():
         import pytest as _pytest
         with _pytest.raises(ImportError, match="slack-sdk"):
             import asyncio
-            asyncio.get_event_loop().run_until_complete(slack.send(issue, "http://pr"))
+            asyncio.run(slack.send(issue, "http://pr"))
     finally:
         if saved is None:
             sys.modules.pop("slack_sdk", None)
@@ -761,7 +761,7 @@ def test_email_missing_dependency():
         import pytest as _pytest
         with _pytest.raises(ImportError, match="aiosmtplib"):
             import asyncio
-            asyncio.get_event_loop().run_until_complete(email.send(issue, "http://pr"))
+            asyncio.run(email.send(issue, "http://pr"))
     finally:
         if saved is None:
             sys.modules.pop("aiosmtplib", None)

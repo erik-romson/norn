@@ -212,3 +212,50 @@ def test_end_loop_returns_pipeline():
     p = _base_pipeline().derive("d")
     result = p.in_loop("build").end_loop()
     assert result is p
+
+
+# ---------------------------------------------------------------------------
+# agent_provider DSL
+# ---------------------------------------------------------------------------
+
+
+def test_agent_provider_default_is_none():
+    """agent_provider_name defaults to None (resolved later to claude-code)."""
+    p = Pipeline("test")
+    assert p.agent_provider_name is None
+
+
+def test_agent_provider_stores_name():
+    """Pipeline.agent_provider() stores the provider name and returns self."""
+    p = Pipeline("test").agent_provider("opencode")
+    assert p.agent_provider_name == "opencode"
+
+
+def test_agent_provider_returns_pipeline_for_chaining():
+    """Pipeline.agent_provider() returns the pipeline instance for chaining."""
+    p = Pipeline("test")
+    result = p.agent_provider("opencode")
+    assert result is p
+
+
+def test_derive_preserves_agent_provider():
+    """derive() copies agent_provider_name to the derived pipeline."""
+    base = Pipeline("base").agent_provider("opencode")
+    derived = base.derive("child")
+    assert derived.agent_provider_name == "opencode"
+
+
+def test_derive_preserves_none_agent_provider():
+    """derive() copies None agent_provider_name (default) to the derived pipeline."""
+    base = Pipeline("base")
+    derived = base.derive("child")
+    assert derived.agent_provider_name is None
+
+
+def test_derive_agent_provider_is_independent():
+    """Changing agent_provider_name on derived pipeline does not affect parent."""
+    base = Pipeline("base").agent_provider("opencode")
+    derived = base.derive("child")
+    derived.agent_provider("claude-code")
+    assert base.agent_provider_name == "opencode"
+    assert derived.agent_provider_name == "claude-code"

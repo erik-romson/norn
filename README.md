@@ -2,7 +2,7 @@
 
 Generic pipeline framework for orchestrating multi-step AI agent workflows.
 
-Pipelines are Python configs built from stages, loops, parallel blocks, and includes. Norn handles execution, retries, context passing, checkpoints, run history, and Claude Agent SDK calls for agent-backed stages.
+Pipelines are Python configs built from stages, loops, parallel blocks, and includes. Norn handles execution, retries, context passing, checkpoints, run history, and agent calls for agent-backed stages.
 
 ## Install
 
@@ -22,7 +22,9 @@ uv sync --group dev
 
 ## Authentication
 
-Agent-backed `Generate` stages use the Claude Agent SDK and need one of these credentials:
+Agent-backed `Generate` stages need credentials for the configured provider.
+
+For the default `claude-code` provider (Claude Agent SDK):
 
 ```bash
 # API key
@@ -32,6 +34,8 @@ export ANTHROPIC_API_KEY=sk-ant-...
 claude setup-token
 export CLAUDE_CODE_OAUTH_TOKEN=<token from setup-token>
 ```
+
+For the `opencode` provider, OpenCode must be installed and authenticated separately (see [OpenCode docs](https://opencode.ai/docs)).
 
 ## Configuration
 
@@ -80,11 +84,50 @@ uv run python -m norn run pipeline.py --skip "test python"
 uv run python -m norn run pipeline.py --dry-run
 ```
 
+## Agent Provider
+
+`Generate` stages delegate to a pluggable agent provider. The default is `claude-code` (Claude Agent SDK). `opencode` is also supported via the OpenCode CLI.
+
+**Provider selection priority** (highest wins):
+
+1. `--agent-provider` CLI flag
+2. `NORN_AGENT_PROVIDER` environment variable
+3. `Pipeline.agent_provider(...)` in the pipeline definition
+4. Default: `claude-code`
+
+Select the provider at the CLI:
+
+```bash
+uv run python -m norn run pipeline.py --agent-provider opencode
+```
+
+Or in the pipeline definition:
+
+```python
+config = Pipeline("hello").agent_provider("opencode")
+```
+
+Or via environment variable:
+
+```bash
+export NORN_AGENT_PROVIDER=opencode
+```
+
+**OpenCode limitations (first-pass)**
+
+The following features are only supported with `claude-code` and will fail fast when used with `opencode`:
+
+- SDK hooks (including `blocked_patterns`-derived hooks)
+- MCP tools (`mcp_tools` stage parameter)
+- Non-`project` `setting_sources` values
+
+Checkpoint and history records include `agent_provider`. Attempting `--resume` or `--continue` with a different provider than the one that created the checkpoint will exit with an error.
+
 ## Resume And History
 
 Norn writes runtime state beside the config state key:
 
-- `<config>.checkpoint` stores completed stages and the latest Claude session ID.
+- `<config>.checkpoint` stores completed stages and the latest agent session ID.
 - `<config>.history` stores JSONL run history and stage logs.
 
 Use `--resume` to load the checkpoint, restore prior stage outputs, and skip completed stages as cached:
@@ -93,7 +136,7 @@ Use `--resume` to load the checkpoint, restore prior stage outputs, and skip com
 uv run python -m norn run examples/hello.py --resume
 ```
 
-Use `--continue` to resume the Claude session from the checkpoint while rerunning stages:
+Use `--continue` to resume the agent session from the checkpoint while rerunning stages:
 
 ```bash
 uv run python -m norn run examples/hello.py --continue
