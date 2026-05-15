@@ -1,1 +1,1 @@
-read [CLAUDE.md](CLAUDE.md)
+read [AGENTS.md](AGENTS.md)

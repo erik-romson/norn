@@ -264,7 +264,7 @@ Generate(
     allowed_tools=["Read", "Edit", "Bash"],  # Pre-approved tools
     max_turns=20,                    # Max conversation turns
     cwd="/path/to/project",          # Working directory for the agent
-    setting_sources=["project"],     # Load CLAUDE.md and .claude/ settings
+    setting_sources=["project"],     # Load Claude project settings from cwd
     add_dirs=["/extra/dir"],         # Additional allowed directories
     output_file="out.py",            # Write extracted code to file (only when no tools)
     env={"KEY": "value"},            # Environment variables for the agent
