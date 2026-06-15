@@ -671,9 +671,9 @@ def test_resolve_model_claude_code_full_id_passthrough():
 
 
 def test_resolve_model_opencode_aliases():
-    assert resolve_model("opencode", "opus") == "anthropic/claude-opus-4-6"
-    assert resolve_model("opencode", "sonnet") == "anthropic/claude-sonnet-4-6"
-    assert resolve_model("opencode", "haiku") == "anthropic/claude-haiku-4-5-20251001"
+    assert resolve_model("opencode", "opus") == "github-copilot/claude-opus-4.7"
+    assert resolve_model("opencode", "sonnet") == "github-copilot/claude-sonnet-4.6"
+    assert resolve_model("opencode", "haiku") == "github-copilot/claude-sonnet-4.6"
 
 
 def test_resolve_model_opencode_normalises_claude_prefix():
@@ -1352,6 +1352,13 @@ class _FakeProcess:
                 self._index += 1
                 return line
 
+            async def readline(self):
+                if self._index >= len(self._lines):
+                    return b""
+                line = self._lines[self._index]
+                self._index += 1
+                return line
+
         return _AsyncLineIter(lines)
 
     def _make_stderr(self):
@@ -1365,6 +1372,10 @@ class _FakeProcess:
 
     async def wait(self):
         pass
+
+    def kill(self):
+        # Mirror asyncio.subprocess.Process.kill for the watchdog test path.
+        self.killed = True
 
 
 def _patch_subprocess(events, returncode=0, stderr_text=""):
@@ -1463,7 +1474,7 @@ async def test_opencode_cwd_passed_to_cli():
 
 @pytest.mark.asyncio
 async def test_opencode_alias_model_resolution():
-    """Model alias 'sonnet' resolves to anthropic/claude-sonnet-4-6."""
+    """Model alias 'sonnet' resolves to github-copilot/claude-sonnet-4.6."""
     events = [_step_finish_event()]
     captured_cmd: list = []
 
@@ -1478,7 +1489,7 @@ async def test_opencode_alias_model_resolution():
 
     assert "-m" in captured_cmd
     idx = captured_cmd.index("-m")
-    assert captured_cmd[idx + 1] == "anthropic/claude-sonnet-4-6"
+    assert captured_cmd[idx + 1] == "github-copilot/claude-sonnet-4.6"
 
 
 @pytest.mark.asyncio
@@ -1810,6 +1821,91 @@ async def test_opencode_nonzero_exit_raises():
         request = _opencode_request()
         with pytest.raises(OpenCodeError, match="Authentication failed"):
             _ = [e async for e in provider.run(request)]
+
+
+@pytest.mark.asyncio
+async def test_opencode_error_event_raises_even_on_zero_exit():
+    """`error` events surface as OpenCodeError even when the CLI exits 0.
+
+    OpenCode emits e.g. `{"type":"error",...,"error":{"data":{"message":"Model not found: ..."}}}`
+    and exits with status 0. Without this guard the stage would silently
+    report success with 0 tokens — see the model-not-found case that
+    motivated the fix.
+    """
+    error_event = {
+        "type": "error",
+        "timestamp": 1000,
+        "sessionID": "ses_err",
+        "error": {
+            "name": "UnknownError",
+            "data": {"message": "Model not found: github-copilot/claude-sonnet-4.6."},
+        },
+    }
+    sub_patch, _ = _patch_subprocess([error_event], returncode=0)
+    with sub_patch, _patch_which():
+        provider = OpenCodeProvider()
+        request = _opencode_request()
+        with pytest.raises(OpenCodeError, match="Model not found"):
+            _ = [e async for e in provider.run(request)]
+
+
+@pytest.mark.asyncio
+async def test_opencode_watchdog_kills_silent_subprocess(monkeypatch):
+    """If opencode stops producing output, the watchdog kills it and raises.
+
+    Models a wedged upstream API call: stdout returns nothing for longer than
+    the configured idle timeout. The provider should `proc.kill()` and raise
+    `OpenCodeError(TimeoutError(...))` instead of hanging forever.
+    """
+    monkeypatch.setenv("NORN_OPENCODE_IDLE_TIMEOUT", "0.05")
+
+    class _SilentStdout:
+        async def readline(self):
+            # Sleep longer than the watchdog window without yielding a line.
+            await asyncio.sleep(5)
+            return b""
+
+    class _SilentStderr:
+        async def read(self):
+            return b""
+
+    class _SilentProc:
+        returncode = 0
+        stdout = _SilentStdout()
+        stderr = _SilentStderr()
+        killed = False
+
+        async def wait(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    silent = _SilentProc()
+
+    async def _fake_exec(*args, **kwargs):
+        return silent
+
+    with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec), _patch_which():
+        provider = OpenCodeProvider()
+        request = _opencode_request()
+        with pytest.raises(OpenCodeError, match="produced no output"):
+            _ = [e async for e in provider.run(request)]
+
+    assert silent.killed, "watchdog must kill the wedged subprocess"
+
+
+@pytest.mark.asyncio
+async def test_opencode_watchdog_disabled_when_zero(monkeypatch):
+    """Setting NORN_OPENCODE_IDLE_TIMEOUT=0 disables the watchdog."""
+    monkeypatch.setenv("NORN_OPENCODE_IDLE_TIMEOUT", "0")
+    events = [_step_finish_event()]
+    sub_patch, _ = _patch_subprocess(events)
+    with sub_patch, _patch_which():
+        provider = OpenCodeProvider()
+        request = _opencode_request()
+        collected = [e async for e in provider.run(request)]
+    assert any(e.usage is not None for e in collected)
 
 
 @pytest.mark.asyncio

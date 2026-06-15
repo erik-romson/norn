@@ -257,6 +257,18 @@ class OpenCodeProvider:
         step_count: int = 0
         start_time = time.monotonic()
         is_error: bool = False
+        error_messages: list[str] = []
+
+        # Watchdog: kill the subprocess if no stdout line arrives for this many
+        # seconds. opencode has no request timeout of its own; a wedged Copilot
+        # API call would otherwise sit forever in `S+` consuming no CPU. Set
+        # NORN_OPENCODE_IDLE_TIMEOUT=0 to disable.
+        try:
+            idle_timeout = float(os.environ.get("NORN_OPENCODE_IDLE_TIMEOUT", "300"))
+        except ValueError:
+            idle_timeout = 300.0
+        if idle_timeout <= 0:
+            idle_timeout = 0.0
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -270,7 +282,34 @@ class OpenCodeProvider:
             assert proc.stdout is not None
             assert proc.stderr is not None
 
-            async for raw_line in proc.stdout:
+            while True:
+                if idle_timeout > 0:
+                    try:
+                        raw_line = await asyncio.wait_for(
+                            proc.stdout.readline(), timeout=idle_timeout
+                        )
+                    except asyncio.TimeoutError as exc:
+                        # opencode has been silent past the watchdog window.
+                        # Tear the subprocess down so it can't sit forever and
+                        # raise so the stage fails loudly instead of hanging.
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        await proc.wait()
+                        raise OpenCodeError(
+                            TimeoutError(
+                                f"opencode produced no output for {idle_timeout:.0f}s "
+                                f"(likely a stalled upstream API call). "
+                                f"Set NORN_OPENCODE_IDLE_TIMEOUT to adjust or 0 to disable."
+                            ),
+                        ) from exc
+                else:
+                    raw_line = await proc.stdout.readline()
+
+                if not raw_line:
+                    break
+
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
@@ -305,6 +344,20 @@ class OpenCodeProvider:
                         if path not in artifacts:
                             artifacts.append(path)
 
+                elif event_type == "error":
+                    # OpenCode reports model lookup failures, authentication
+                    # problems, etc. as `error` events and then exits with
+                    # status 0 — silently dropping them would let stages that
+                    # never invoked a model report success. Collect the
+                    # message so we can raise once the process finishes.
+                    is_error = True
+                    err = data.get("error", {})
+                    err_data = err.get("data", {}) if isinstance(err, dict) else {}
+                    message = err_data.get("message") if isinstance(err_data, dict) else None
+                    if not message:
+                        message = err.get("name") if isinstance(err, dict) else None
+                    error_messages.append(str(message) if message else "opencode reported an error")
+
                 elif event_type == "step_finish":
                     step_count += 1
                     tokens, cost = self._parse_step_finish(data)
@@ -335,6 +388,16 @@ class OpenCodeProvider:
                 error_msg = stderr_text or f"opencode exited with code {proc.returncode}"
                 raise OpenCodeError(
                     RuntimeError(error_msg),
+                    stderr_lines=stderr_lines,
+                )
+
+            if error_messages:
+                # opencode emits `error` events even when it exits 0 (e.g.
+                # "Model not found: ..."). Surface them so a misconfigured
+                # provider fails the stage instead of silently no-op'ing.
+                joined = "; ".join(error_messages)
+                raise OpenCodeError(
+                    RuntimeError(f"opencode reported error: {joined}"),
                     stderr_lines=stderr_lines,
                 )
 

@@ -17,9 +17,9 @@ MODEL_ALIASES: dict[str, dict[str, str]] = {
         "haiku": "claude-haiku-4-5-20251001",
     },
     "opencode": {
-        "opus": "anthropic/claude-opus-4-6",
-        "sonnet": "anthropic/claude-sonnet-4-6",
-        "haiku": "anthropic/claude-haiku-4-5-20251001",
+        "opus": "github-copilot/claude-opus-4.7",
+        "sonnet": "github-copilot/claude-sonnet-4.6",
+        "haiku": "github-copilot/claude-sonnet-4.6",
     },
 }
 

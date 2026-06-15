@@ -35,7 +35,23 @@ claude setup-token
 export CLAUDE_CODE_OAUTH_TOKEN=<token from setup-token>
 ```
 
-For the `opencode` provider, OpenCode must be installed and authenticated separately (see [OpenCode docs](https://opencode.ai/docs)).
+For the `opencode` provider, OpenCode must be installed and authenticated separately:
+
+```bash
+# 1. Install (Homebrew shown; see https://opencode.ai/docs for other platforms)
+brew install sst/tap/opencode
+
+# 2. Log in to a provider — opens an OAuth flow (GitHub Copilot, Anthropic, etc.)
+opencode providers login
+
+# 3. Verify credentials are stored and the expected models are visible
+opencode providers list
+opencode models | grep -E 'claude|gpt'
+```
+
+Credentials are stored in `~/.local/share/opencode/auth.json` and refreshed automatically. Norn does not pass tokens to the subprocess; the `opencode run` child process reads `auth.json` directly.
+
+The bundled opencode model aliases (`opus`, `sonnet`, `haiku`) map to `github-copilot/claude-*` IDs in `norn/agents/models.py`. If your opencode is authenticated against a different provider (e.g. Anthropic direct), edit `MODEL_ALIASES["opencode"]` to point at the IDs `opencode models` lists.
 
 ## Configuration
 
