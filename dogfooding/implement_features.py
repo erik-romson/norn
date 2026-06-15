@@ -51,6 +51,14 @@ from norn.stages.run_command import RunCommand
 
 PROJECT_DIR = os.getcwd()
 
+# Upper bound (seconds) for a single test/bats run inside the do-while loop.
+# A hung command — e.g. one that backgrounds a server that inherits the
+# capture pipe — fails at this mark instead of wedging the pipeline. Sits
+# comfortably under norn's RunCommand backstop (1h) and is overridable per
+# step via `test_timeout:` / `bats_timeout:` in front-matter (or feature-wide
+# in index.md) for heavier steps such as Docker builds or full-app scans.
+DEFAULT_TEST_TIMEOUT = 1800
+
 
 def _git_toplevel(start: str) -> str:
     """Resolve the git toplevel for ``start`` so all git operations can run
@@ -128,9 +136,11 @@ def _resolve_test_cmd(
         return raw.strip()
     if feature_test_cmd:
         return feature_test_cmd
-    from norn.runner import PipelineError
 
-    raise PipelineError(
+    # Config error at pipeline-build time — raise ValueError so the CLI's
+    # _load_pipeline handler prints it cleanly and exits 1. (PipelineError is
+    # for stage failures and requires a StageResult.)
+    raise ValueError(
         f"{step_file}: missing required `test_cmd:` in front-matter and no "
         f"feature-level fallback in index.md.\n"
         f"Each step must declare the command that validates it. "
@@ -147,6 +157,25 @@ def _resolve_bats_cmd(step_fm: dict, feature_bats_cmd: str | None) -> str | None
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     return feature_bats_cmd
+
+
+def _coerce_timeout(raw: object, where: str) -> float | None:
+    """Parse an optional command timeout (seconds) from front-matter.
+
+    Returns ``None`` when unset so callers can fall back to a feature-level
+    value or the pipeline default. Fails fast (ValueError, printed cleanly by
+    the CLI's ``_load_pipeline`` handler) on a non-numeric or non-positive
+    value rather than silently ignoring a mistyped ``test_timeout:``.
+    """
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: expected a number of seconds, got {raw!r}")
+    if value <= 0:
+        raise ValueError(f"{where}: must be a positive number of seconds, got {value!r}")
+    return value
 
 
 def command_executable(cmd: str) -> str | None:
@@ -258,6 +287,8 @@ index_path = Path(feature_dir) / "index.md"
 shared_context = ""
 feature_test_cmd: str | None = None
 feature_bats_cmd: str | None = None
+feature_test_timeout: float | None = None
+feature_bats_timeout: float | None = None
 
 if index_path.exists():
     fm, body = parse_front_matter(index_path.read_text())
@@ -265,6 +296,8 @@ if index_path.exists():
         feature_test_cmd = fm["test_cmd"].strip()
     if isinstance(fm.get("bats_cmd"), str) and fm["bats_cmd"].strip():
         feature_bats_cmd = fm["bats_cmd"].strip()
+    feature_test_timeout = _coerce_timeout(fm.get("test_timeout"), f"{index_path}: test_timeout")
+    feature_bats_timeout = _coerce_timeout(fm.get("bats_timeout"), f"{index_path}: bats_timeout")
     shared_context = (
         "## Shared context (from index.md — applies to every step)\n\n"
         f"{body}\n\n"
@@ -284,9 +317,9 @@ if not step_files:
     )
 
 if not step_files:
-    from norn.runner import PipelineError
-
-    raise PipelineError(
+    # Config error — ValueError is caught and printed cleanly by the CLI's
+    # _load_pipeline handler (PipelineError needs a StageResult).
+    raise ValueError(
         f"No step-*.md files found in {feature_dir}\n"
         "Usage: norn run dogfooding/implement_features.py <directory>"
     )
@@ -370,6 +403,21 @@ for step_file in step_files:
     # .claude/skills/split-plan/SKILL.md.
     test_cmd = _resolve_test_cmd(step_fm, step_file, feature_test_cmd)
     bats_cmd = _resolve_bats_cmd(step_fm, feature_bats_cmd)
+
+    # Per-step run timeout (seconds), falling back to the feature-level value
+    # then the pipeline default. Steps with long legitimate runs raise it via
+    # `test_timeout:` / `bats_timeout:` in their front-matter. Valid timeouts
+    # are positive, so the `or` chain only skips the unset (None) levels.
+    test_timeout = (
+        _coerce_timeout(step_fm.get("test_timeout"), f"{step_file}: test_timeout")
+        or feature_test_timeout
+        or DEFAULT_TEST_TIMEOUT
+    )
+    bats_timeout = (
+        _coerce_timeout(step_fm.get("bats_timeout"), f"{step_file}: bats_timeout")
+        or feature_bats_timeout
+        or DEFAULT_TEST_TIMEOUT
+    )
 
     # Per-step model override. Steps that need heavier reasoning can opt in
     # to opus via `model: opus` in their front-matter; everything else falls
@@ -496,12 +544,14 @@ for step_file in step_files:
     loop_stages.append(
         Stage(test_name, RunCommand(
             cmd=f"cd {shlex.quote(PROJECT_DIR)} && {test_cmd}",
+            timeout=test_timeout,
         )),
     )
     if bats_cmd:
         loop_stages.append(
             Stage(bats_name, RunCommand(
                 cmd=f"cd {shlex.quote(PROJECT_DIR)} && {bats_cmd}",
+                timeout=bats_timeout,
             )),
         )
 

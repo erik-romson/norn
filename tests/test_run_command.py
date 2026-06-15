@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import time
+
 import pytest
 
 from norn.models import PipelineContext
@@ -85,3 +88,46 @@ async def test_run_command_error_surfaces_last_xtrace_line():
     result = await stage.run(PipelineContext())
     assert not result.success
     assert "last command: + false" in result.error
+
+
+@pytest.mark.asyncio
+async def test_run_command_times_out_fast_instead_of_hanging():
+    """A command that exceeds its timeout fails promptly with a timeout error
+    rather than blocking the pipeline indefinitely."""
+    started = time.monotonic()
+    stage = RunCommand(cmd="sleep 30", timeout=0.3)
+    result = await stage.run(PipelineContext())
+    assert not result.success
+    assert "timed out" in result.error
+    assert result.output["returncode"] is None
+    # Must return near the timeout, nowhere near the 30s sleep.
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.asyncio
+async def test_run_command_timeout_kills_backgrounded_child(tmp_path):
+    """The backstop must reap a backgrounded child that inherited our pipes —
+    otherwise communicate() would never see EOF. Relies on the process-group
+    kill enabled by ``start_new_session=True``."""
+    pidfile = tmp_path / "child.pid"
+    # Background a long sleep (inherits stdout/stderr), then keep the parent
+    # alive so the whole command overruns the timeout.
+    stage = RunCommand(
+        cmd=f"sleep 30 & echo $! > {pidfile}; sleep 30",
+        timeout=0.4,
+    )
+    result = await stage.run(PipelineContext())
+    assert not result.success
+
+    child_pid = int(pidfile.read_text().strip())
+    # killpg should have reaped the backgrounded child too; poll briefly.
+    deadline = time.monotonic() + 3.0
+    alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)  # signal 0 = liveness probe
+            time.sleep(0.05)
+        except ProcessLookupError:
+            alive = False
+            break
+    assert not alive, f"backgrounded child {child_pid} survived the group kill"
