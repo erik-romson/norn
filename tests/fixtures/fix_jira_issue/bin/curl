@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Test shim for curl.
+#
+# Maps fixture URLs to local files; exits 22 for unknown URLs
+# (the exit code curl --fail uses for HTTP 4xx/5xx errors).
+#
+# Supports: -u <auth>  -H <header>  -o <outfile>  -fsS  (and combinations)
+# All other flags are silently ignored.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FIXTURE_DIR="$(dirname "$SCRIPT_DIR")"
+
+URL=""
+OUT_FILE=""
+
+i=0
+args=("$@")
+n=${#args[@]}
+
+while [[ $i -lt $n ]]; do
+  arg="${args[$i]}"
+  case "$arg" in
+    -u | -H)
+      # Flag takes the next token as its value; skip both.
+      i=$(( i + 2 ))
+      continue
+      ;;
+    -o)
+      # -o <file>: capture output file
+      i=$(( i + 1 ))
+      OUT_FILE="${args[$i]}"
+      i=$(( i + 1 ))
+      continue
+      ;;
+    -*)
+      # Other flags (e.g. -fsS, -f, -s, -S, -L): ignore
+      i=$(( i + 1 ))
+      continue
+      ;;
+    *)
+      if [[ "$arg" =~ ^https?:// ]]; then
+        URL="$arg"
+      fi
+      i=$(( i + 1 ))
+      ;;
+  esac
+done
+
+# Strip query string for routing
+URL_PATH="${URL%%\?*}"
+
+_deliver_file() {
+  local src="$1"
+  if [[ -n "$OUT_FILE" ]]; then
+    cp "$src" "$OUT_FILE"
+  else
+    cat "$src"
+  fi
+}
+
+_deliver_str() {
+  local content="$1"
+  if [[ -n "$OUT_FILE" ]]; then
+    printf '%s' "$content" > "$OUT_FILE"
+  else
+    printf '%s' "$content"
+  fi
+}
+
+# Issue endpoint: .../issue/<KEY>?fields=...
+if [[ "$URL_PATH" =~ /issue/([A-Z]+-[0-9]+)$ ]]; then
+  KEY="${BASH_REMATCH[1]}"
+  FIXTURE="${FIXTURE_DIR}/${KEY}.json"
+  if [[ -f "$FIXTURE" ]]; then
+    _deliver_file "$FIXTURE"
+    exit 0
+  fi
+  # Key not found in fixtures -> 404
+  echo "curl: (22) The requested URL returned error: 404" >&2
+  exit 22
+fi
+
+# Attachment endpoint: .../attachments/<id>/<filename>
+if [[ "$URL_PATH" =~ /attachments/[^/]+/[^/]+$ ]]; then
+  _deliver_str "fake attachment content"
+  exit 0
+fi
+
+# Unknown URL
+echo "curl: (22) The requested URL returned error: 404 (unknown fixture URL: ${URL})" >&2
+exit 22

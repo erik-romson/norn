@@ -19,14 +19,15 @@ from norn.loader import (
     load_org_config,
     load_pipeline as _load_pipeline_from_file,
 )
+from norn.responder import NonInteractiveResponder
 from norn.runner import PipelineError, run_pipeline
-
 from norn.state import (
     _load_checkpoint_for_config,
     _load_history_for_config,
     _primary_state_key,
     _state_key_candidates,
 )
+
 log = logging.getLogger(__name__)
 
 _ISSUE_KEY_RE = re.compile(r"^[A-Z]+-\d+$")
@@ -94,7 +95,6 @@ def _load_pipeline(config_path: str) -> Pipeline:
         sys.exit(1)
 
 
-def main() -> None:
 # ---------------------------------------------------------------------------
 # `norn ui` — single unified launcher app (Launcher → Args → Run screens)
 # ---------------------------------------------------------------------------
@@ -124,6 +124,7 @@ def _run_ui(pipeline_arg: str | None) -> None:
     app.run()
 
 
+def main() -> None:
     apply_env_files()
 
     parser = argparse.ArgumentParser(prog="norn", description="Run a pipeline config")
@@ -179,6 +180,11 @@ def _run_ui(pipeline_arg: str | None) -> None:
         metavar="PROVIDER",
         help="Agent provider to use (e.g. claude-code, opencode). Overrides NORN_AGENT_PROVIDER and pipeline setting.",
     )
+    run_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="abort on every prompt; for child processes",
+    )
 
     history_parser = sub.add_parser("history", help="Show run history for a pipeline config")
     history_parser.add_argument("config", help="Path to the pipeline config .py file")
@@ -213,12 +219,6 @@ def _run_ui(pipeline_arg: str | None) -> None:
         help="Output raw Mermaid syntax instead of Markdown",
     )
 
-    args, remaining = parser.parse_known_args()
-
-    if args.command == "history":
-        from norn import ui as _ui
-
-        if args.compare and args.run:
     ui_parser = sub.add_parser("ui", help="Launch the Textual TUI for a pipeline run")
     ui_parser.add_argument(
         "pipeline",
@@ -227,6 +227,12 @@ def _run_ui(pipeline_arg: str | None) -> None:
         help="Path to pipeline config .py file or bundled pipeline name (optional)",
     )
 
+    args, remaining = parser.parse_known_args()
+
+    if args.command == "history":
+        from norn import ui as _ui
+
+        if args.compare and args.run:
             parser.error("--run cannot be used with --compare")
         records = _load_history_for_config(args.config)
         if args.run is not None:
@@ -325,16 +331,19 @@ def _run_ui(pipeline_arg: str | None) -> None:
             print(to_markdown(pipeline, config_path))
         return
 
-    if args.command != "run":
-        parser.print_help()
-        sys.exit(1)
-
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(message)s")
     if args.command == "ui":
         _run_ui(args.pipeline)
         return
 
+    if args.command != "run":
+        parser.print_help()
+        sys.exit(1)
+
+    if args.step and args.non_interactive:
+        parser.error("--step and --non-interactive are mutually exclusive")
+
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(message)s")
 
     params = _parse_args(args.arg)
     params["args"] = _expand_file_refs(" ".join(remaining))
@@ -399,6 +408,8 @@ def _run_ui(pipeline_arg: str | None) -> None:
 
     alert_manager = AlertManager(channels=pipeline.alert_channels) if pipeline.alert_channels else None
 
+    input_responder = NonInteractiveResponder() if args.non_interactive else None
+
     try:
         asyncio.run(run_pipeline(
             pipeline,
@@ -409,6 +420,7 @@ def _run_ui(pipeline_arg: str | None) -> None:
             alert_manager=alert_manager,
             step_mode=args.step,
             agent_provider=resolved_provider,
+            input_responder=input_responder,
         ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
     except PipelineError as e:
