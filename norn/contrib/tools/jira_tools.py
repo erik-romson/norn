@@ -40,9 +40,11 @@ async def jira_get_issue(args: dict) -> dict:
             "is_error": True,
         }
 
+    from norn.contrib.extractors.adf import field_to_text
+
     jira = JIRA(url, basic_auth=(email, token))
     issue = jira.issue(issue_key, expand="renderedFields")
-    comments = [c.body for c in jira.comments(issue_key)]
+    comments = [field_to_text(c.body) for c in jira.comments(issue_key)]
     attachments = [
         {"filename": a.filename, "size": a.size}
         for a in issue.fields.attachment
@@ -50,7 +52,7 @@ async def jira_get_issue(args: dict) -> dict:
     result = {
         "key": issue.key,
         "summary": issue.fields.summary,
-        "description": issue.fields.description,
+        "description": field_to_text(issue.fields.description),
         "labels": issue.fields.labels,
         "components": [c.name for c in issue.fields.components],
         "comments": comments,
@@ -93,7 +95,9 @@ async def jira_get_attachments(args: dict) -> dict:
 
     for attachment in issue.fields.attachment:
         data = attachment.get()
-        dest = out_dir / attachment.filename
+        # Prefix with the attachment id to avoid collisions when the same
+        # filename appears more than once on an issue.
+        dest = out_dir / f"{attachment.id}_{attachment.filename}"
         dest.write_bytes(data)
         saved.append({"filename": attachment.filename, "path": str(dest), "size": attachment.size})
 

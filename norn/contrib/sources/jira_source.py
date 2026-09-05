@@ -55,10 +55,12 @@ class JiraSource(IssueSource):
             token = os.environ.get("JIRA_TOKEN", "")
 
         def _fetch_sync():
+            from norn.contrib.extractors.adf import field_to_text
+
             client = self._make_client(email, token)
             issue = client.issue(issue_key, expand="renderedFields")
 
-            description = issue.fields.description or ""
+            description = field_to_text(issue.fields.description)
             labels = list(issue.fields.labels or [])
             components = [c.name for c in (issue.fields.components or [])]
             linked = [
@@ -70,13 +72,15 @@ class JiraSource(IssueSource):
             comments = []
             if self.include_comments:
                 for c in client.comments(issue_key):
-                    comments.append(c.body)
+                    comments.append(field_to_text(c.body))
 
             attachments = []
             if self.include_attachments:
                 self.attachment_dir.mkdir(parents=True, exist_ok=True)
                 for att in (issue.fields.attachment or []):
-                    dest = self.attachment_dir / att.filename
+                    # Prefix with the attachment id to avoid collisions when the
+                    # same filename appears more than once on an issue.
+                    dest = self.attachment_dir / f"{att.id}_{att.filename}"
                     with open(dest, "wb") as f:
                         f.write(att.get())
                     attachments.append(dest)
