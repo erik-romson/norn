@@ -5,7 +5,10 @@ import time
 
 import pytest
 
+from norn.event_sink import EventSink
+from norn.events import CommandOutput
 from norn.models import PipelineContext
+from norn.ui import register_secrets
 from norn.stages.run_command import RunCommand
 
 
@@ -131,3 +134,122 @@ async def test_run_command_timeout_kills_backgrounded_child(tmp_path):
             alive = False
             break
     assert not alive, f"backgrounded child {child_pid} survived the group kill"
+
+
+# ---------------------------------------------------------------------------
+# Live output streaming
+# ---------------------------------------------------------------------------
+
+
+def _streaming_ctx() -> tuple[PipelineContext, list]:
+    """A context whose sink records every event it receives."""
+    seen: list = []
+    sink = EventSink(on_event=seen.append)
+    return PipelineContext(event_sink=sink, run_id="run-1"), seen
+
+
+def _command_output(seen: list) -> list[CommandOutput]:
+    return [e for e in seen if isinstance(e, CommandOutput)]
+
+
+@pytest.mark.asyncio
+async def test_run_command_streams_output_as_command_output_events():
+    """Output reaches the seam while the command runs, tagged by stream."""
+    ctx, seen = _streaming_ctx()
+    stage = RunCommand(cmd="echo out-line; echo err-line >&2")
+    result = await stage.run(ctx, node_id="stage:build", attempt=1)
+
+    assert result.success
+    events = _command_output(seen)
+    assert [(e.stream, e.text) for e in events] == [
+        ("stdout", "out-line"),
+        ("stderr", "err-line"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streamed_events_carry_the_stage_node_id_and_ordered_seq():
+    """Events key to the runner's graph node so the TUI files them correctly."""
+    ctx, seen = _streaming_ctx()
+    stage = RunCommand(cmd="printf 'a\\nb\\nc\\n'")
+    await stage.run(ctx, node_id="loop:tests/stage:run", attempt=2)
+
+    events = _command_output(seen)
+    assert events, "expected streamed output"
+    assert {e.key.stage_id for e in events} == {"loop:tests/stage:run"}
+    assert {e.key.attempt for e in events} == {2}
+    assert {e.key.run_id for e in events} == {"run-1"}
+    seqs = [e.key.seq for e in events]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+
+
+@pytest.mark.asyncio
+async def test_streaming_does_not_change_captured_output():
+    """StageResult still carries the command's complete output."""
+    ctx, _ = _streaming_ctx()
+    stage = RunCommand(cmd="printf 'one\\ntwo\\n'; printf 'no-newline-tail'")
+    result = await stage.run(ctx, node_id="stage:x")
+
+    assert result.output["stdout"] == "one\ntwo\nno-newline-tail"
+    assert result.output["returncode"] == 0
+
+
+@pytest.mark.asyncio
+async def test_trailing_line_without_newline_is_still_streamed():
+    """The final flush emits a partial last line rather than swallowing it."""
+    ctx, seen = _streaming_ctx()
+    stage = RunCommand(cmd="printf 'partial'")
+    await stage.run(ctx, node_id="stage:x")
+
+    assert [e.text for e in _command_output(seen)] == ["partial"]
+
+
+@pytest.mark.asyncio
+async def test_streamed_output_is_redacted_at_the_seam():
+    """A registered secret never reaches a consumer through streamed output."""
+    register_secrets(["hunter2-swordfish"])
+    ctx, seen = _streaming_ctx()
+    stage = RunCommand(cmd="echo token=hunter2-swordfish")
+    result = await stage.run(ctx, node_id="stage:x")
+
+    streamed = "".join(e.text for e in _command_output(seen))
+    assert "hunter2-swordfish" not in streamed
+    # The captured result is the runner's own copy and is masked where it is
+    # displayed or persisted, not here.
+    assert "hunter2-swordfish" in result.output["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_long_line_beyond_the_readline_limit_survives():
+    """Chunked reads avoid StreamReader's 64KiB line-length limit."""
+    ctx, _ = _streaming_ctx()
+    size = 200_000
+    stage = RunCommand(cmd=f"printf 'x%.0s' $(seq 1 {size})")
+    result = await stage.run(ctx, node_id="stage:x")
+
+    assert result.success
+    assert len(result.output["stdout"]) == size
+
+
+@pytest.mark.asyncio
+async def test_timeout_returns_the_output_captured_before_the_kill():
+    """Partial output is the only clue to where a wedged command stopped."""
+    ctx, seen = _streaming_ctx()
+    stage = RunCommand(cmd="echo before-hang; sleep 30", timeout=0.6)
+    result = await stage.run(ctx, node_id="stage:x")
+
+    assert not result.success
+    assert "timed out" in result.error
+    assert "before-hang" in result.output["stdout"]
+    assert [e.text for e in _command_output(seen)] == ["before-hang"]
+
+
+@pytest.mark.asyncio
+async def test_no_streaming_without_a_node_id():
+    """Driven outside the runner there is no node to attribute output to."""
+    ctx, seen = _streaming_ctx()
+    stage = RunCommand(cmd="echo unattributed")
+    result = await stage.run(ctx)
+
+    assert result.output["stdout"] == "unattributed\n"
+    assert _command_output(seen) == []

@@ -314,6 +314,14 @@ async def test_fix_blocked_patterns_passed_as_hooks():
 
 
 @pytest.mark.asyncio
+def _eof_stream(data: bytes) -> asyncio.StreamReader:
+    """A StreamReader pre-loaded with *data* and already at EOF."""
+    reader = asyncio.StreamReader()
+    reader.feed_data(data)
+    reader.feed_eof()
+    return reader
+
+
 async def test_verify_test_runs_detected_command(tmp_path):
     from norn.contrib.stages.verify_test import VerifyTest
 
@@ -323,9 +331,13 @@ async def test_verify_test_runs_detected_command(tmp_path):
     ctx = _make_ctx(issue=issue, plan=plan)
 
     async def _fake_proc(*args, **kwargs):
+        # VerifyTest delegates to RunCommand, which streams its output: it
+        # reads proc.stdout/proc.stderr directly rather than calling
+        # communicate(), so the fake needs real StreamReaders at EOF.
         proc = AsyncMock()
         proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"1 passed", b""))
+        proc.stdout = _eof_stream(b"1 passed")
+        proc.stderr = _eof_stream(b"")
         return proc
 
     with patch("asyncio.create_subprocess_shell", side_effect=_fake_proc) as mock_proc:

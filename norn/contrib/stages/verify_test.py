@@ -13,6 +13,9 @@ if TYPE_CHECKING:
 
 class VerifyTest(BaseStage):
     needs_agent = False
+    # Delegates to RunCommand and forwards **kwargs, so opting in here is
+    # what makes the build/test output stream to the transcript.
+    emits_events = True
 
     async def run(self, ctx: PipelineContext, **kwargs) -> StageResult:
         r = ctx.results.get("read_issue")
