@@ -10,10 +10,12 @@ import pytest
 
 from norn.metrics import (
     BUDGET_HEADROOM_PCT,
+    CONTEXT_BLOAT_TOKENS,
     COST_SHARE_SINGLE_PCT,
     COST_SHARE_TOP3_PCT,
     LOW_CACHE_MIN_TURNS,
     LOW_CACHE_RATIO,
+    MODEL_MIX_SURPRISE_OUTPUT_PCT,
     OVERSIZED_PROMPT_CHARS,
     PRIOR_RUNS_LIMIT,
     REGRESSION_FACTOR,
@@ -822,3 +824,231 @@ class TestUnresolvedPlaceholdersFunc:
         assert unresolved_placeholders("just normal text") == []
         assert unresolved_placeholders(None) == []
         assert unresolved_placeholders("") == []
+
+
+# ---------------------------------------------------------------------------
+# context-bloat rule
+# ---------------------------------------------------------------------------
+
+
+def _make_stage_sm(**overrides: Any) -> StageMetrics:
+    base = dict(
+        name="gen", node_id="gen", attempt=1, kind="agent", status="passed",
+        success=True, cost_usd=0.05, cost_share=100.0, billed_input_tokens=1000,
+        output_tokens=500, cache_hit_ratio=0.0, turns=3, tokens_per_turn=500.0,
+        tool_uses=2, tool_errors=0, prompt_chars=100, system_prompt_chars=0,
+        unresolved_placeholders=[], duration_ms=1000, model="sonnet",
+        model_id="claude-sonnet-4-6", result_subtype="success",
+        stop_reason=None, nonfatal_error=False,
+    )
+    base.update(overrides)
+    return StageMetrics(**base)
+
+
+class TestContextBloat:
+    def test_fires_above_threshold(self):
+        m = _make_run_metrics(stages=[
+            _make_stage_sm(context_peak_tokens=CONTEXT_BLOAT_TOKENS + 1),
+        ])
+        findings = find_issues(m)
+        assert any(f.rule == "context-bloat" for f in findings)
+
+    def test_does_not_fire_at_or_below_threshold(self):
+        m = _make_run_metrics(stages=[
+            _make_stage_sm(context_peak_tokens=CONTEXT_BLOAT_TOKENS),
+        ])
+        findings = find_issues(m)
+        assert not any(f.rule == "context-bloat" for f in findings)
+
+    def test_does_not_fire_when_none(self):
+        m = _make_run_metrics(stages=[
+            _make_stage_sm(context_peak_tokens=None),
+        ])
+        findings = find_issues(m)
+        assert not any(f.rule == "context-bloat" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# model-mix-surprise rule
+# ---------------------------------------------------------------------------
+
+
+class TestModelMixSurprise:
+    def test_fires_when_other_model_exceeds_30pct(self):
+        m = _make_run_metrics(stages=[
+            _make_stage_sm(
+                model_id="claude-sonnet-4-6",
+                model_mix={
+                    "claude-sonnet-4-6": {"calls": 8, "input": 8000, "cache_read": 0, "cache_creation": 0, "output": 600},
+                    "claude-haiku-4-5": {"calls": 2, "input": 2000, "cache_read": 0, "cache_creation": 0, "output": 400},
+                },
+            ),
+        ])
+        findings = find_issues(m)
+        assert any(f.rule == "model-mix-surprise" for f in findings)
+
+    def test_does_not_fire_when_below_30pct(self):
+        m = _make_run_metrics(stages=[
+            _make_stage_sm(
+                model_id="claude-sonnet-4-6",
+                model_mix={
+                    "claude-sonnet-4-6": {"calls": 9, "input": 9000, "cache_read": 0, "cache_creation": 0, "output": 900},
+                    "claude-haiku-4-5": {"calls": 1, "input": 1000, "cache_read": 0, "cache_creation": 0, "output": 50},
+                },
+            ),
+        ])
+        findings = find_issues(m)
+        assert not any(f.rule == "model-mix-surprise" for f in findings)
+
+    def test_does_not_fire_with_single_model(self):
+        m = _make_run_metrics(stages=[
+            _make_stage_sm(
+                model_id="claude-sonnet-4-6",
+                model_mix={
+                    "claude-sonnet-4-6": {"calls": 10, "input": 10000, "cache_read": 0, "cache_creation": 0, "output": 1000},
+                },
+            ),
+        ])
+        findings = find_issues(m)
+        assert not any(f.rule == "model-mix-surprise" for f in findings)
+
+    def test_does_not_fire_when_model_mix_none(self):
+        m = _make_run_metrics(stages=[
+            _make_stage_sm(model_mix=None),
+        ])
+        findings = find_issues(m)
+        assert not any(f.rule == "model-mix-surprise" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Integration: compute_metrics writes model_mix and context_peak_tokens
+# ---------------------------------------------------------------------------
+
+
+class TestTranscriptIntegration:
+    def test_context_peak_and_model_mix_from_transcript(self, tmp_path, monkeypatch):
+        """compute_metrics reads transcript and writes model_mix + context_peak_tokens."""
+        import json
+        from pathlib import Path
+        from norn.metrics import compute_metrics
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+        cwd = "/integration/test"
+        session_id = "sess-integ"
+        slug = cwd.replace("/", "-")
+
+        # Write transcript
+        transcript_dir = tmp_path / ".claude" / "projects" / slug
+        transcript_dir.mkdir(parents=True)
+        lines = [
+            {
+                "type": "assistant",
+                "timestamp": "2026-09-05T10:00:10.000Z",
+                "requestId": "req_1",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 5000, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0, "output_tokens": 300},
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-09-05T10:00:20.000Z",
+                "requestId": "req_2",
+                "message": {
+                    "id": "msg_2",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 8000, "cache_read_input_tokens": 2000,
+                               "cache_creation_input_tokens": 0, "output_tokens": 500},
+                },
+            },
+        ]
+        (transcript_dir / f"{session_id}.jsonl").write_text(
+            "\n".join(json.dumps(l) for l in lines)
+        )
+
+        # Build run dir manually to avoid colon issues in filenames from make_run_dir
+        rd = tmp_path / "integ.runs" / "1"
+        stages_dir = rd / "stages"
+        stages_dir.mkdir(parents=True)
+        (rd / "run.json").write_text(json.dumps({
+            "pipeline": "test",
+            "run_id": 1,
+            "provider": "claude-code",
+            "success": True,
+            "duration_ms": 5000,
+            "totals": {"retries": 0},
+            "cwd": cwd,
+        }))
+        (stages_dir / "0001-gen-a1.json").write_text(json.dumps({
+            "node_id": "gen",
+            "attempt": 1,
+            "status": "passed",
+            "success": True,
+            "started_at": "2026-09-05T10:00:00.000Z",
+            "finished_at": "2026-09-05T10:01:00.000Z",
+            "duration_ms": 1000,
+            "usage": {
+                "input_tokens": 13000,
+                "output_tokens": 800,
+                "cache_read_input_tokens": 2000,
+                "cache_creation_input_tokens": 0,
+                "total_cost_usd": 0.10,
+                "duration_ms": 800,
+                "num_turns": 2,
+                "model_id": "claude-sonnet-4-6",
+                "model": "sonnet",
+                "result_subtype": "success",
+                "stop_reason": None,
+                "tool_uses": 0,
+                "tool_errors": 0,
+                "session_id": session_id,
+            },
+        }))
+
+        m = compute_metrics(rd)
+        assert len(m.stages) == 1
+        sm = m.stages[0]
+        assert sm.model_mix is not None
+        assert "claude-sonnet-4-6" in sm.model_mix
+        # context_peak = max(5000+0, 8000+2000) = 10000
+        assert sm.context_peak_tokens == 10000
+        assert sm.context_growth == [5000, 10000]
+
+    def test_missing_transcript_sets_field(self, tmp_path, monkeypatch):
+        """When transcript file is absent, stage.transcript == 'missing'."""
+        import json
+        from pathlib import Path
+        from norn.metrics import compute_metrics
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+        rd = make_run_dir(tmp_path, run_json={
+            "pipeline": "test",
+            "run_id": 1,
+            "provider": "claude-code",
+            "success": True,
+            "duration_ms": 5000,
+            "totals": {"retries": 0},
+            "cwd": "/some/project",
+        }, stages=[
+            _make_stage_record(
+                node_id="gen",
+                usage=_agent_usage(session_id="sess-absent"),
+            ),
+        ])
+        m = compute_metrics(rd)
+        assert m.stages[0].transcript == "missing"
+
+    def test_no_cwd_skips_transcripts(self, tmp_path):
+        """When run.json has no cwd, transcript integration is silently skipped."""
+        from norn.metrics import compute_metrics
+        rd = make_run_dir(tmp_path, stages=[
+            _make_stage_record(node_id="gen", usage=_agent_usage()),
+        ])
+        # run_json has no cwd
+        m = compute_metrics(rd)
+        assert m.stages[0].model_mix is None
+        assert m.stages[0].context_peak_tokens is None

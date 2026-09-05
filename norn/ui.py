@@ -376,6 +376,29 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
             _print_run_findings(state_key, run_id)
         return
 
+    # Load journal metrics for optional Peak ctx column
+    _peak_ctx_by_name: dict[str, int] = {}
+    if state_key is not None:
+        from norn.journal import runs_dir as _runs_dir
+        from norn.metrics import load_metrics as _load_metrics
+        _rd = _runs_dir(state_key)
+        if _rd.is_dir():
+            _jm = _load_metrics(_rd / str(run_id))
+            if _jm is not None:
+                for _sm in _jm.stages:
+                    if _sm.context_peak_tokens is not None:
+                        # Store under both full node_id and bare name for matching
+                        _peak_ctx_by_name[_sm.name] = _sm.context_peak_tokens
+                        # Also index by bare stage name (strip "stage:" prefix)
+                        _bare = _sm.name.split("/")[-1]
+                        for _prefix in ("stage:", "loop:", "parallel:"):
+                            if _bare.startswith(_prefix):
+                                _bare = _bare[len(_prefix):]
+                                break
+                        _peak_ctx_by_name.setdefault(_bare, _sm.context_peak_tokens)
+
+    _has_peak_ctx = bool(_peak_ctx_by_name)
+
     # Use a wide-enough console so the step log table is not truncated when
     # stdout is not a TTY (e.g. pytest capture, CI pipe) where Rich defaults
     # to 80 columns.  The table has 12 columns and needs ~160 chars for all
@@ -392,6 +415,8 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
     table.add_column("Tools (x)", justify="right")
     table.add_column("API", justify="right")
     table.add_column("Wall", justify="right")
+    if _has_peak_ctx:
+        table.add_column("Peak ctx", justify="right")
     table.add_column("Model", overflow="fold")
     table.add_column("Info", overflow="fold")
 
@@ -417,7 +442,9 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
             info = mask(entry.error).strip().splitlines()[-1]
         turns_str = str(entry.num_turns) if entry.num_turns else "-"
         tools_str = f"{entry.tool_uses} ({entry.tool_errors}x)" if entry.tool_errors else (str(entry.tool_uses) if entry.tool_uses else "-")
-        table.add_row(
+        peak_ctx = _peak_ctx_by_name.get(entry.name) or _peak_ctx_by_name.get(f"stage:{entry.name}")
+        peak_ctx_str = f"{peak_ctx:,}" if peak_ctx is not None else "-"
+        row = [
             entry.name,
             str(entry.attempt),
             status_labels.get(entry.status, entry.status),
@@ -428,9 +455,11 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
             tools_str,
             api,
             f"{entry.duration_ms / 1000:.1f}s",
-            entry.model or "-",
-            info or "-",
-        )
+        ]
+        if _has_peak_ctx:
+            row.append(peak_ctx_str)
+        row.extend([entry.model or "-", info or "-"])
+        table.add_row(*row)
 
     wide.print()
     wide.print(table)

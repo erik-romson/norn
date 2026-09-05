@@ -1005,6 +1005,7 @@ async def run_pipeline(
             budgets=[str(b) for b in (pipeline.budgets or [])],
             default_model=pipeline.default_model,
             started_at=datetime.now(timezone.utc).isoformat(),
+            cwd=str(ctx.working_dir or os.getcwd()),
         )
         ctx.journal = _journal
         ctx.event_sink = JournalSink(ctx.event_sink, _journal)

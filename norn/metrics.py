@@ -35,6 +35,8 @@ COST_SHARE_TOP3_PCT = 40
 REGRESSION_FACTOR = 1.5
 QUOTA_PRESSURE_PCT = 80
 PRIOR_RUNS_LIMIT = 5
+CONTEXT_BLOAT_TOKENS = 150_000
+MODEL_MIX_SURPRISE_OUTPUT_PCT = 30
 
 # Regex for unresolved placeholders like ``{param.args}`` in prompts
 _PLACEHOLDER_RE = re.compile(r"\{[^{}]+\.\w+\}")
@@ -71,6 +73,11 @@ class StageMetrics:
     result_subtype: str | None
     stop_reason: str | None
     nonfatal_error: bool
+    # Transcript-derived fields (optional; None when transcripts unavailable)
+    model_mix: dict | None = None
+    context_peak_tokens: int | None = None
+    context_growth: list | None = None
+    transcript: str | None = None
 
 
 @dataclass
@@ -339,6 +346,10 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
             nonfatal_error=nonfatal,
         ))
 
+    # Integrate transcript data for claude-code runs
+    if provider == "claude-code":
+        _apply_transcript_data(run_json, stage_records, stage_metrics_list)
+
     # Fill cost_share
     for sm in stage_metrics_list:
         sm.cost_share = _safe_ratio(sm.cost_usd, total_cost) * 100.0
@@ -385,6 +396,75 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
         codex_cost_usd_estimate=codex_cost,
         stages=stage_metrics_list,
     )
+
+
+def _apply_transcript_data(
+    run_json: dict,
+    stage_records: list[dict],
+    stage_metrics_list: list[StageMetrics],
+) -> None:
+    """Integrate per-turn transcript data into agent stage metrics.
+
+    Reads local claude-code transcript files, attributes calls to stages by
+    session_id and timestamp window, and writes ``model_mix``,
+    ``context_peak_tokens``, and ``context_growth`` onto each
+    :class:`StageMetrics`.  A missing transcript file is recorded as
+    ``transcript="missing"`` on the stage.
+
+    No-ops when ``cwd`` is absent from *run_json* (run was not journaled with
+    step-04 or later).
+    """
+    try:
+        from norn import transcripts as _transcripts
+    except Exception:
+        log.warning("metrics: could not import transcripts module", exc_info=True)
+        return
+
+    cwd = run_json.get("cwd", "")
+    if not cwd:
+        return
+
+    # Read each unique session's transcript exactly once
+    session_calls: dict[str, list] = {}
+    missing_sessions: set[str] = set()
+
+    for rec in stage_records:
+        session_id = (rec.get("usage") or {}).get("session_id")
+        if not session_id:
+            continue
+        if session_id in session_calls or session_id in missing_sessions:
+            continue
+        path = _transcripts.transcript_path(cwd, session_id)
+        if path.exists():
+            session_calls[session_id] = _transcripts.read_assistant_calls(path, session_id=session_id)
+        else:
+            missing_sessions.add(session_id)
+            log.debug("metrics: transcript missing for session %s", session_id)
+
+    if not session_calls and not missing_sessions:
+        return
+
+    # Attribute all calls across all sessions to stage records
+    all_calls = [c for calls in session_calls.values() for c in calls]
+    attribution = _transcripts.attribute(all_calls, stage_records)
+
+    # Write results back into stage_metrics_list (parallel to stage_records)
+    for i, rec in enumerate(stage_records):
+        if i >= len(stage_metrics_list):
+            break
+        sm = stage_metrics_list[i]
+        session_id = (rec.get("usage") or {}).get("session_id")
+        node_id = rec.get("node_id", "")
+        attempt = rec.get("attempt", 1)
+        stage_key = f"{node_id}:{attempt}"
+
+        if session_id and session_id in missing_sessions:
+            sm.transcript = "missing"
+        elif stage_key in attribution:
+            data = attribution[stage_key]
+            sm.model_mix = data.model_mix
+            sm.context_peak_tokens = data.context_peak_tokens
+            sm.context_growth = data.context_growth
 
 
 def _extract_quota(run_json: dict) -> QuotaMetrics | None:
@@ -573,6 +653,35 @@ def find_issues(metrics: RunMetrics, prior: list[RunMetrics] | None = None) -> l
                 evidence=f"cost_share={sm.cost_share:.0f}%",
                 suggestion="Consider whether this stage can be made cheaper or split.",
             ))
+
+        # context-bloat
+        if sm.context_peak_tokens is not None and sm.context_peak_tokens > CONTEXT_BLOAT_TOKENS:
+            findings.append(Finding(
+                rule="context-bloat",
+                severity="warn",
+                stage=sm.name,
+                evidence=f"context_peak_tokens={sm.context_peak_tokens:,}",
+                suggestion="Context is near the model window; every later turn pays to re-read everything.",
+            ))
+
+        # model-mix-surprise
+        if sm.kind == "agent" and sm.model_mix is not None and len(sm.model_mix) > 1:
+            total_output = sum(v.get("output", 0) for v in sm.model_mix.values())
+            if total_output > 0:
+                for model_id, stats in sm.model_mix.items():
+                    if model_id != sm.model_id:
+                        pct = stats.get("output", 0) / total_output * 100
+                        if pct > MODEL_MIX_SURPRISE_OUTPUT_PCT:
+                            findings.append(Finding(
+                                rule="model-mix-surprise",
+                                severity="info",
+                                stage=sm.name,
+                                evidence=(
+                                    f"{model_id} produced {pct:.0f}% of output "
+                                    f"(requested: {sm.model_id or sm.model or 'unknown'})"
+                                ),
+                                suggestion="Check whether sub-agents are using an unexpected model.",
+                            ))
 
     # retry-waste (run-level)
     if metrics.cost_usd > 0 and metrics.failed_attempt_cost_usd > 0:

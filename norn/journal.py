@@ -251,6 +251,7 @@ class RunJournal:
                     "stop_reason": result.usage.stop_reason,
                     "tool_uses": result.usage.tool_uses,
                     "tool_errors": result.usage.tool_errors,
+                    "session_id": result.usage.session_id,
                 }
 
         try:
