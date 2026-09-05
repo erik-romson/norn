@@ -19,6 +19,7 @@ import time
 from typing import Any, AsyncIterator
 
 from norn.agents.base import AgentError, AgentEvent, AgentRequest, AgentUsage
+from norn.agents.capabilities import AgentCapabilities, CostMode
 from norn.agents.models import resolve_model
 
 log = logging.getLogger(__name__)
@@ -43,68 +44,35 @@ class OpenCodeProvider:
 
     name: str = "opencode"
 
+    capabilities: AgentCapabilities = AgentCapabilities(
+        block_kinds=frozenset({"text"}),
+        cost_mode=CostMode.ZERO_UNKNOWN,
+        supports_structured_output=False,
+        supports_fork=False,
+        supports_hooks=False,
+        supports_mcp=False,
+        supports_thinking=False,
+        file_edit_without_terminal=False,
+        session_resumable=True,
+        session_forkable=False,
+        session_attachable=False,
+        live_model_switch=False,
+        model_alias_table="opencode",
+        can_list_models=False,
+    )
+
     # ------------------------------------------------------------------ #
     # Feature-gate helpers
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _reject_unsupported(request: AgentRequest) -> None:
-        """Fail fast for features that cannot be represented safely."""
-        if request.output_format is not None:
-            raise OpenCodeError(
-                ValueError(
-                    "Structured output (output_format) is not supported by the opencode provider. "
-                    "Remove output_format or switch to a provider that supports it."
-                ),
-            )
+    def _reject_unsupported(self, request: AgentRequest) -> None:
+        """Fail fast for features not declared in this provider's capabilities."""
+        from norn.agents.capabilities import validate_capabilities
 
-        if request.fork_session:
-            raise OpenCodeError(
-                ValueError(
-                    "fork_session is not supported by the opencode provider. "
-                    "OpenCode does not expose fork semantics."
-                ),
-            )
-
-        if request.setting_sources:
-            raise OpenCodeError(
-                ValueError(
-                    f"setting_sources {request.setting_sources!r} are not supported by the opencode provider. "
-                    f"Only 'project' is portable and must be resolved by Norn before reaching the provider."
-                ),
-            )
-
-        if request.hooks:
-            raise OpenCodeError(
-                ValueError(
-                    "hooks are not supported by the opencode provider. "
-                    "Hooks are a Claude Code SDK feature."
-                ),
-            )
-
-        if request.mcp_servers:
-            raise OpenCodeError(
-                ValueError(
-                    "mcp_servers are not supported by the opencode provider. "
-                    "MCP server configuration is provider-specific."
-                ),
-            )
-
-        if request.mcp_tools:
-            raise OpenCodeError(
-                ValueError(
-                    "mcp_tools are not supported by the opencode provider. "
-                    "MCP tool injection is a Claude Code SDK feature."
-                ),
-            )
-
-        if request.thinking:
-            raise OpenCodeError(
-                ValueError(
-                    "thinking budget is not supported by the opencode provider. "
-                    "OpenCode does not expose a thinking/reasoning budget parameter."
-                ),
-            )
+        try:
+            validate_capabilities(request, self.capabilities, self.name)
+        except ValueError as exc:
+            raise OpenCodeError(exc) from exc
 
     # ------------------------------------------------------------------ #
     # Permission mapping

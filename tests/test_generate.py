@@ -763,7 +763,8 @@ async def test_claude_provider_creates_mcp_server_from_mcp_tools():
         mcp_tools=[fake_tool],
     )
 
-    with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}):
+    mock_types = MagicMock()
+    with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk, "claude_agent_sdk.types": mock_types}):
         provider = ClaudeCodeProvider()
         _events = [event async for event in provider.run(request)]
 
@@ -867,13 +868,14 @@ async def test_settings_local_json_not_read(fake_provider, tmp_path):
 async def test_unsupported_setting_source_non_claude_fails():
     """Non-portable setting_sources fail for non-Claude providers as StageResult."""
     gen = Generate(prompt="do stuff", setting_sources=["user"])
-    # Use a non-claude-code context; no provider registration needed (returns before get_provider)
-    ctx = _ctx_for_fake()
+    # opencode is a registered provider that does not support non-project setting_sources
+    ctx = PipelineContext()
+    ctx.agent_provider = "opencode"
     result = await gen.run(ctx)
     assert not result.success
     assert result.error is not None
     assert "setting_sources" in result.error.lower() or "'user'" in result.error
-    assert _FakeProvider.name in result.error
+    assert "opencode" in result.error
 
 
 @pytest.mark.asyncio
@@ -1186,7 +1188,9 @@ async def test_claude_provider_receives_original_allowed_tools():
         permissions=normalize_permissions(["Read", "Bash"], "acceptEdits"),
     )
 
-    with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}):
+    from unittest.mock import MagicMock as _MagicMock  # noqa: PLC0415
+    mock_types = _MagicMock()
+    with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk, "claude_agent_sdk.types": mock_types}):
         provider = ClaudeCodeProvider()
         _events = [event async for event in provider.run(request)]
 
@@ -1220,7 +1224,9 @@ async def test_claude_provider_receives_bypass_permissions_mode():
         permissions=normalize_permissions(None, "bypassPermissions"),
     )
 
-    with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk}):
+    from unittest.mock import MagicMock as _MagicMock  # noqa: PLC0415
+    mock_types = _MagicMock()
+    with patch.dict(sys.modules, {"claude_agent_sdk": mock_sdk, "claude_agent_sdk.types": mock_types}):
         provider = ClaudeCodeProvider()
         _events = [event async for event in provider.run(request)]
 

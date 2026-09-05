@@ -274,14 +274,20 @@ class Generate(BaseStage):
             if not resolved_setting_sources:
                 resolved_setting_sources = None
 
-        # Fail fast: non-portable features are not allowed for non-claude-code providers.
-        # SDK hooks (including those compiled from blocked_patterns via profile) are
-        # Claude Code-only.  MCP tools and non-project setting_sources are also
-        # provider-specific.  Return a clear StageResult so callers don't receive a
-        # raw exception and the error message includes the provider, feature, stage
-        # name, and a hint.
-        if ctx.agent_provider != "claude-code":
-            if effective_hooks:
+        # Fetch the provider early so we can inspect its capability descriptor.
+        # This call is intentionally outside the try/except below: an unknown
+        # provider name is a configuration error that should fail loudly.
+        from norn.agents.registry import get_provider
+
+        provider = get_provider(ctx.agent_provider)
+
+        # Fail fast: gate non-portable features against the provider's declared
+        # capabilities rather than hard-coding provider names.  Providers that
+        # have no capabilities attribute (e.g. lightweight test stubs) skip the
+        # check so that unit tests are not forced to declare full descriptors.
+        _caps = getattr(provider, "capabilities", None)
+        if _caps is not None:
+            if effective_hooks and not _caps.supports_hooks:
                 return StageResult(
                     name="",
                     success=False,
@@ -292,7 +298,7 @@ class Generate(BaseStage):
                         f"from this stage."
                     ),
                 )
-            if mcp_tools:
+            if mcp_tools and not _caps.supports_mcp:
                 return StageResult(
                     name="",
                     success=False,
@@ -302,7 +308,7 @@ class Generate(BaseStage):
                         f"feature. Use provider 'claude-code' for MCP tool features."
                     ),
                 )
-            if resolved_setting_sources:
+            if resolved_setting_sources and not _caps.supports_setting_sources:
                 unsupported = ", ".join(repr(s) for s in resolved_setting_sources)
                 return StageResult(
                     name="",
@@ -373,11 +379,7 @@ class Generate(BaseStage):
             permissions=permissions,
         )
 
-        # Run via the registered provider for this pipeline run
-        from norn.agents.registry import get_provider
-
-        provider = get_provider(ctx.agent_provider)
-
+        # Run via the registered provider (already fetched above for capability gating)
         chunks: list[str] = []
         artifacts: list[str] = []
         structured_output: Any = None
