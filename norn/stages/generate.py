@@ -359,7 +359,7 @@ class Generate(BaseStage):
             merged_env.update(resolve_env(effective_env, ctx))
 
         # Build the provider-neutral request
-        from norn.agents.base import AgentRequest
+        from norn.agents.base import AgentRequest, ToolResultBlock, ToolUseBlock
         from norn.agents.permissions import normalize_permissions
 
         permissions = normalize_permissions(effective_allowed_tools, effective_permission_mode)
@@ -426,6 +426,11 @@ class Generate(BaseStage):
                     event=event,
                 ))
 
+                if isinstance(event.block, ToolUseBlock):
+                    usage_record.tool_uses += 1
+                if isinstance(event.block, ToolResultBlock) and not event.block.ok:
+                    usage_record.tool_errors += 1
+
                 if event.text is not None:
                     chunks.append(event.text)
 
@@ -451,6 +456,9 @@ class Generate(BaseStage):
                     usage_record.output_tokens = event.usage.output_tokens
                     usage_record.cache_read_input_tokens = event.usage.cache_read_input_tokens
                     usage_record.cache_creation_input_tokens = event.usage.cache_creation_input_tokens
+                    usage_record.model_id = event.usage.model_id
+                    usage_record.result_subtype = event.usage.result_subtype
+                    usage_record.stop_reason = event.usage.stop_reason
                     log.debug(
                         "[generate] ResultMessage: tokens=%d cost=$%.4f duration=%dms turns=%d session=%s",
                         usage_record.total_tokens,

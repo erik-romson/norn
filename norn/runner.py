@@ -266,6 +266,11 @@ def _append_stage_log(
             session_id=usage.session_id if usage else None,
             error=error,
             provider=usage.provider if usage else None,
+            model_id=usage.model_id if usage else None,
+            result_subtype=usage.result_subtype if usage else None,
+            stop_reason=usage.stop_reason if usage else None,
+            tool_uses=usage.tool_uses if usage else 0,
+            tool_errors=usage.tool_errors if usage else 0,
         )
     )
     _persist_history_snapshot(ctx)

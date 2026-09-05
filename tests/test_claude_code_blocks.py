@@ -36,8 +36,9 @@ from norn.agents.claude_code import ClaudeCodeProvider
 class _FakeAssistantMessage:
     """Minimal stand-in for claude_agent_sdk.AssistantMessage."""
 
-    def __init__(self, content: list) -> None:
+    def __init__(self, content: list, model: str | None = None) -> None:
         self.content = content
+        self.model = model
 
 
 class _FakeUserMessage:
@@ -57,9 +58,31 @@ class _FakeResultMessage:
     num_turns = 1
     is_error = False
     structured_output = None
+    subtype = None
+    stop_reason = None
     usage = {
         "input_tokens": 10,
         "output_tokens": 5,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+class _FakeResultMessageWithSubtype(_FakeResultMessage):
+    """ResultMessage with subtype and stop_reason populated."""
+
+    session_id = "sess-subtype-test"
+    total_cost_usd = 0.0
+    duration_ms = 200
+    duration_api_ms = 150
+    num_turns = 5
+    is_error = True
+    structured_output = None
+    subtype = "error_max_turns"
+    stop_reason = "max_tokens"
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 50,
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0,
     }
@@ -445,3 +468,54 @@ async def test_result_message_only_no_block_events():
     """A stream with only a ResultMessage produces no block events."""
     events = await _run([_FakeResultMessage()])
     assert all(e.block is None for e in events)
+
+
+# ---------------------------------------------------------------------------
+# New provider fields: model_id, result_subtype, stop_reason
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_model_id_captured_from_assistant_message():
+    """model_id on the usage event is set from the first AssistantMessage.model."""
+    events = await _run([
+        _FakeAssistantMessage([_FakeTextBlock("hello")], model="claude-sonnet-4-6"),
+        _FakeResultMessage(),
+    ])
+    usage_events = [e for e in events if e.usage is not None]
+    assert len(usage_events) == 1
+    assert usage_events[0].usage.model_id == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_result_subtype_and_stop_reason_from_result_message():
+    """result_subtype and stop_reason are captured from ResultMessage."""
+    events = await _run([
+        _FakeAssistantMessage([_FakeTextBlock("partial response")], model="claude-sonnet-4-6"),
+        _FakeResultMessageWithSubtype(),
+    ])
+    usage_events = [e for e in events if e.usage is not None]
+    assert len(usage_events) == 1
+    u = usage_events[0].usage
+    assert u.result_subtype == "error_max_turns"
+    assert u.stop_reason == "max_tokens"
+
+
+@pytest.mark.asyncio
+async def test_model_id_none_when_no_assistant_message():
+    """model_id is None when there is no AssistantMessage in the stream."""
+    events = await _run([_FakeResultMessage()])
+    usage_events = [e for e in events if e.usage is not None]
+    assert len(usage_events) == 1
+    assert usage_events[0].usage.model_id is None
+
+
+@pytest.mark.asyncio
+async def test_result_subtype_none_when_not_set():
+    """result_subtype and stop_reason are None when not set on ResultMessage."""
+    events = await _run([_FakeResultMessage()])
+    usage_events = [e for e in events if e.usage is not None]
+    assert len(usage_events) == 1
+    u = usage_events[0].usage
+    assert u.result_subtype is None
+    assert u.stop_reason is None

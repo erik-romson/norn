@@ -326,6 +326,93 @@ def test_stage_log_error_round_trips(tmp_path):
     assert log[1].error is None
 
 
+def test_new_stage_log_fields_round_trip(tmp_path):
+    """model_id, result_subtype, stop_reason, tool_uses, tool_errors survive append→load."""
+    config = str(tmp_path / "pipeline.py")
+    record = RunRecord(
+        run_id=1,
+        timestamp="2026-03-25T09:00:00+00:00",
+        success=True,
+        total_cost_usd=0.05,
+        total_tokens=500,
+        duration_ms=3000,
+        stages=[],
+        retries=0,
+        stage_log=[
+            StageLogEntry(
+                name="gen",
+                status="passed",
+                success=True,
+                attempt=1,
+                model_id="claude-sonnet-4-6",
+                result_subtype="success",
+                stop_reason="end_turn",
+                tool_uses=5,
+                tool_errors=1,
+            )
+        ],
+    )
+    append_run(config, record)
+    records = load_history(config)
+    assert len(records) == 1
+    entry = records[0].stage_log[0]
+    assert entry.model_id == "claude-sonnet-4-6"
+    assert entry.result_subtype == "success"
+    assert entry.stop_reason == "end_turn"
+    assert entry.tool_uses == 5
+    assert entry.tool_errors == 1
+
+
+def test_old_history_line_loads_with_new_field_defaults(tmp_path):
+    """A pre-existing history line without new fields loads with defaults (backward compat)."""
+    config = str(tmp_path / "pipeline.py")
+    # Write a JSONL line without the new fields (simulating old history file)
+    import json
+    from norn.history import history_file
+    old_line = json.dumps({
+        "run_id": 1,
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "success": True,
+        "total_cost_usd": 0.1,
+        "total_tokens": 1000,
+        "duration_ms": 5000,
+        "stages": [{"name": "s", "success": True, "cost": 0.1}],
+        "retries": 0,
+        "stage_log": [
+            {
+                "name": "s",
+                "status": "passed",
+                "success": True,
+                "attempt": 1,
+                "duration_ms": 5000,
+                "cost_usd": 0.1,
+                "running_total_cost_usd": 0.1,
+                "running_total_tokens": 1000,
+                "input_tokens": 800,
+                "output_tokens": 200,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "duration_api_ms": 4000,
+                "num_turns": 2,
+                "model": "sonnet",
+                "session_id": "sess-old",
+                "provider": "claude-code",
+                "error": None,
+                # Note: no model_id, result_subtype, stop_reason, tool_uses, tool_errors
+            }
+        ],
+    })
+    history_file(config).write_text(old_line + "\n")
+    records = load_history(config)
+    assert len(records) == 1
+    entry = records[0].stage_log[0]
+    assert entry.model_id is None
+    assert entry.result_subtype is None
+    assert entry.stop_reason is None
+    assert entry.tool_uses == 0
+    assert entry.tool_errors == 0
+
+
 async def test_retries_counted_in_history(tmp_path):
     from norn.dsl import Loop
 

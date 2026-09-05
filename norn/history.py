@@ -118,6 +118,11 @@ def append_run(config_path: str, record: RunRecord) -> None:
                 "model": entry.model,
                 "session_id": entry.session_id,
                 "provider": entry.provider,
+                "model_id": entry.model_id,
+                "result_subtype": entry.result_subtype,
+                "stop_reason": entry.stop_reason,
+                "tool_uses": entry.tool_uses,
+                "tool_errors": entry.tool_errors,
                 # Mask on write so secrets never land on disk.
                 # load_history reads the masked form back as-is.
                 "error": _mask_error(entry.error),
@@ -166,6 +171,11 @@ def load_history(config_path: str) -> list[RunRecord]:
                     session_id=entry.get("session_id"),
                     error=entry.get("error"),
                     provider=entry.get("provider"),
+                    model_id=entry.get("model_id"),
+                    result_subtype=entry.get("result_subtype"),
+                    stop_reason=entry.get("stop_reason"),
+                    tool_uses=entry.get("tool_uses", 0),
+                    tool_errors=entry.get("tool_errors", 0),
                 )
                 for entry in data.get("stage_log", [])
             ]

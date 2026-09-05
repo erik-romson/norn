@@ -129,6 +129,9 @@ class AgentCapabilities:
     # Default False so existing capability declarations stay valid; real
     # providers that support non-portable setting_sources set this explicitly.
     supports_setting_sources: bool = False
+    # Default False so existing capability declarations stay valid; providers
+    # that report result_subtype (e.g. claude-code) set this explicitly.
+    reports_result_subtype: bool = False
 
 
 def validate_capabilities(

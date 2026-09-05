@@ -90,6 +90,7 @@ class ClaudeCodeProvider:
         model_alias_table="claude-code",
         can_list_models=False,
         supports_setting_sources=True,
+        reports_result_subtype=True,
     )
 
     async def run(self, request: AgentRequest) -> AsyncIterator[AgentEvent]:
@@ -182,10 +183,13 @@ class ClaudeCodeProvider:
         options = ClaudeAgentOptions(**opt_kwargs)
 
         session_id: str | None = None
+        model_id: str | None = None
 
         try:
             async for message in query(prompt=request.prompt, options=options):
                 if isinstance(message, AssistantMessage):
+                    if model_id is None and hasattr(message, "model") and message.model:
+                        model_id = message.model
                     for block in message.content:
                         if isinstance(block, SdkToolUseBlock):
                             yield AgentEvent(block=ToolUseBlock(
@@ -239,6 +243,9 @@ class ClaudeCodeProvider:
                         duration_api_ms=message.duration_api_ms,
                         num_turns=message.num_turns,
                         is_error=message.is_error,
+                        model_id=model_id,
+                        result_subtype=message.subtype if hasattr(message, "subtype") else None,
+                        stop_reason=message.stop_reason if hasattr(message, "stop_reason") else None,
                     )
                     if message.usage:
                         usage.input_tokens = message.usage.get("input_tokens", 0)

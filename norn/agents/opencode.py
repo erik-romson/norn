@@ -374,6 +374,8 @@ class OpenCodeProvider:
                 yield AgentEvent(session_id=session_id)
 
             # Emit usage
+            # Note: model_id, result_subtype, stop_reason are not reported by opencode;
+            # they remain None (AgentUsage defaults). reports_result_subtype=False in capabilities.
             usage = AgentUsage(
                 provider="opencode",
                 model=request.model,

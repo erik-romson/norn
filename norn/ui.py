@@ -171,16 +171,21 @@ def print_usage_report(name: str, tracker: UsageTracker, config_path: str | None
     table.add_column("Stage", style="cyan")
     table.add_column("Input", justify="right")
     table.add_column("Output", justify="right")
+    table.add_column("Turns", justify="right")
+    table.add_column("Tools (x)", justify="right")
     table.add_column("Cost", justify="right")
     table.add_column("Time", justify="right")
 
     for rec in tracker.records:
         model_suffix = f" ({rec.model})" if rec.model else ""
         label = f"{rec.stage_name} (att {rec.attempt}){model_suffix}" if rec.attempt > 1 else f"{rec.stage_name}{model_suffix}"
+        tools_str = f"{rec.tool_uses} ({rec.tool_errors}x)" if rec.tool_errors else str(rec.tool_uses)
         table.add_row(
             label,
             f"{rec.input_tokens:,}",
             f"{rec.output_tokens:,}",
+            str(rec.num_turns),
+            tools_str,
             f"${rec.total_cost_usd:.4f}",
             f"{rec.duration_api_ms / 1000:.1f}s",
         )
@@ -193,9 +198,16 @@ def print_usage_report(name: str, tracker: UsageTracker, config_path: str | None
         else 0
     )
 
+    billed_pct = (
+        tracker.total_billed_input_tokens / tracker.total_input_tokens * 100
+        if tracker.total_input_tokens > 0
+        else 0
+    )
+
     console.print()
     console.print(f"  [bold]Totals[/bold]")
     console.print(f"  Input tokens:     {tracker.total_input_tokens:>10,}   [dim](cache read: {tracker.total_cache_read_tokens:,} / {cache_pct:.0f}%)[/dim]")
+    console.print(f"  Billed input:     {tracker.total_billed_input_tokens:>10,}   [dim](cache read: {tracker.total_cache_read_tokens:,} / {billed_pct:.0f}%)[/dim]")
     console.print(f"  Output tokens:    {tracker.total_output_tokens:>10,}")
     console.print(f"  Total cost:         [bold]${tracker.total_cost_usd:>9.4f}[/bold]")
     console.print(f"  API time:         {tracker.total_api_duration_ms / 1000:>10.1f}s")
@@ -313,6 +325,8 @@ def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
     table.add_column("Cost", justify="right")
     table.add_column("Running", justify="right")
     table.add_column("Tokens", justify="right")
+    table.add_column("Turns", justify="right")
+    table.add_column("Tools (x)", justify="right")
     table.add_column("API", justify="right")
     table.add_column("Wall", justify="right")
     table.add_column("Model", overflow="fold")
@@ -338,6 +352,8 @@ def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
         info = info_labels.get(entry.status, "")
         if entry.error:
             info = mask(entry.error).strip().splitlines()[-1]
+        turns_str = str(entry.num_turns) if entry.num_turns else "-"
+        tools_str = f"{entry.tool_uses} ({entry.tool_errors}x)" if entry.tool_errors else (str(entry.tool_uses) if entry.tool_uses else "-")
         table.add_row(
             entry.name,
             str(entry.attempt),
@@ -345,6 +361,8 @@ def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
             cost,
             running,
             tokens,
+            turns_str,
+            tools_str,
             api,
             f"{entry.duration_ms / 1000:.1f}s",
             entry.model or "-",

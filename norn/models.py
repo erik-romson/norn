@@ -58,10 +58,20 @@ class UsageRecord:
     attempt: int = 1
     model: str | None = None
     provider: str | None = None
+    model_id: str | None = None        # model the provider actually used
+    result_subtype: str | None = None   # provider's terminal status, e.g. "success", "error_max_turns"
+    stop_reason: str | None = None      # API stop reason of the last turn, when reported
+    tool_uses: int = 0
+    tool_errors: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def billed_input_tokens(self) -> int:
+        """Tokens that count toward billing: input + cache creation + cache read."""
+        return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
 
 
 @dataclass
@@ -119,6 +129,18 @@ class UsageTracker:
         return sum(r.num_turns for r in self.records)
 
     @property
+    def total_billed_input_tokens(self) -> int:
+        return sum(r.billed_input_tokens for r in self.records)
+
+    @property
+    def total_tool_uses(self) -> int:
+        return sum(r.tool_uses for r in self.records)
+
+    @property
+    def total_tool_errors(self) -> int:
+        return sum(r.tool_errors for r in self.records)
+
+    @property
     def last_session_id(self) -> str | None:
         """Return the most recent session_id from usage records."""
         for r in reversed(self.records):
@@ -154,6 +176,11 @@ class StageLogEntry:
     session_id: str | None = None
     error: str | None = None
     provider: str | None = None
+    model_id: str | None = None
+    result_subtype: str | None = None
+    stop_reason: str | None = None
+    tool_uses: int = 0
+    tool_errors: int = 0
 
     @property
     def total_tokens(self) -> int:

@@ -97,3 +97,58 @@ def test_usage_tracker_totals_are_cumulative_across_stages():
 
 
 import pytest
+
+
+def test_billed_input_tokens_sums_all_cache_types():
+    """billed_input_tokens = input + cache_creation + cache_read."""
+    r = UsageRecord(
+        stage_name="gen",
+        input_tokens=100,
+        cache_creation_input_tokens=50,
+        cache_read_input_tokens=30,
+    )
+    assert r.billed_input_tokens == 180
+
+
+def test_billed_input_tokens_no_cache():
+    """billed_input_tokens equals input_tokens when no cache tokens."""
+    r = UsageRecord(stage_name="gen", input_tokens=500)
+    assert r.billed_input_tokens == 500
+
+
+def test_usage_tracker_total_billed_input_tokens():
+    """total_billed_input_tokens sums billed_input_tokens across all records."""
+    t = UsageTracker()
+    t.add(UsageRecord(
+        stage_name="a",
+        input_tokens=100,
+        cache_creation_input_tokens=20,
+        cache_read_input_tokens=10,
+    ))
+    t.add(UsageRecord(
+        stage_name="b",
+        input_tokens=200,
+        cache_creation_input_tokens=0,
+        cache_read_input_tokens=50,
+    ))
+    # stage a: 100 + 20 + 10 = 130; stage b: 200 + 0 + 50 = 250; total: 380
+    assert t.total_billed_input_tokens == 380
+
+
+def test_usage_tracker_total_tool_uses_and_errors():
+    """total_tool_uses and total_tool_errors aggregate across all records."""
+    t = UsageTracker()
+    t.add(UsageRecord(stage_name="a", tool_uses=3, tool_errors=1))
+    t.add(UsageRecord(stage_name="b", tool_uses=5, tool_errors=0))
+    assert t.total_tool_uses == 8
+    assert t.total_tool_errors == 1
+
+
+def test_usage_record_new_fields_default_to_none_and_zero():
+    """New fields model_id, result_subtype, stop_reason, tool_uses, tool_errors have correct defaults."""
+    r = UsageRecord(stage_name="gen")
+    assert r.model_id is None
+    assert r.result_subtype is None
+    assert r.stop_reason is None
+    assert r.tool_uses == 0
+    assert r.tool_errors == 0

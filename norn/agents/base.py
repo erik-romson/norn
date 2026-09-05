@@ -77,6 +77,9 @@ class AgentUsage:
     duration_api_ms: int = 0
     num_turns: int = 0
     is_error: bool = False
+    model_id: str | None = None        # model the provider actually used
+    result_subtype: str | None = None   # provider's terminal status, e.g. "success", "error_max_turns"
+    stop_reason: str | None = None      # API stop reason of the last turn, when reported
 
 
 @dataclass(frozen=True)

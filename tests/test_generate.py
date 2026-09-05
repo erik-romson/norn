@@ -456,6 +456,67 @@ async def test_usage_record_model_is_stage_model(fake_provider):
     assert result.usage.model == "sonnet"
 
 
+@pytest.mark.asyncio
+async def test_tool_uses_counted_from_block_events(fake_provider):
+    """ToolUseBlock events increment usage_record.tool_uses."""
+    from norn.agents.base import ToolUseBlock, ToolResultBlock
+    fake_provider.events = [
+        AgentEvent(block=ToolUseBlock(name="Read", input_summary="/a.py")),
+        AgentEvent(block=ToolUseBlock(name="Edit", input_summary="/b.py")),
+        AgentEvent(block=ToolUseBlock(name="Bash", input_summary="ls")),
+        AgentEvent(block=ToolResultBlock(ok=False, summary="permission denied")),
+        AgentEvent(usage=AgentUsage(
+            provider="test",
+            input_tokens=10,
+            output_tokens=5,
+        )),
+    ]
+    gen = Generate(prompt="hi")
+    result = await gen.run(_ctx_for_fake())
+    assert result.usage is not None
+    assert result.usage.tool_uses == 3
+    assert result.usage.tool_errors == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_errors_only_count_failed_results(fake_provider):
+    """Only ToolResultBlock(ok=False) increments tool_errors; ok=True does not."""
+    from norn.agents.base import ToolUseBlock, ToolResultBlock
+    fake_provider.events = [
+        AgentEvent(block=ToolUseBlock(name="Read", input_summary="/a.py")),
+        AgentEvent(block=ToolResultBlock(ok=True, summary="file contents")),
+        AgentEvent(block=ToolUseBlock(name="Bash", input_summary="ls")),
+        AgentEvent(block=ToolResultBlock(ok=False, summary="error")),
+        AgentEvent(usage=AgentUsage(provider="test")),
+    ]
+    gen = Generate(prompt="hi")
+    result = await gen.run(_ctx_for_fake())
+    assert result.usage is not None
+    assert result.usage.tool_uses == 2
+    assert result.usage.tool_errors == 1
+
+
+@pytest.mark.asyncio
+async def test_model_id_result_subtype_stop_reason_copied_from_usage(fake_provider):
+    """model_id, result_subtype, stop_reason from AgentUsage are copied to UsageRecord."""
+    fake_provider.events = [
+        AgentEvent(usage=AgentUsage(
+            provider="test",
+            model_id="claude-sonnet-4-6",
+            result_subtype="error_max_turns",
+            stop_reason="max_tokens",
+            input_tokens=50,
+            output_tokens=20,
+        )),
+    ]
+    gen = Generate(prompt="hi")
+    result = await gen.run(_ctx_for_fake())
+    assert result.usage is not None
+    assert result.usage.model_id == "claude-sonnet-4-6"
+    assert result.usage.result_subtype == "error_max_turns"
+    assert result.usage.stop_reason == "max_tokens"
+
+
 # ---------------------------------------------------------------------------
 # output_file behaviour
 # ---------------------------------------------------------------------------
