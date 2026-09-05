@@ -230,8 +230,9 @@ def print_history_table(records: list[RunRecord], *, state_key: str | None = Non
         console.print("[dim]No history found.[/dim]")
         return
 
-    # Pre-load ratings for all runs when a state key is available
+    # Pre-load ratings and evaluation scores for all runs when a state key is available
     _ratings: dict[int, dict] = {}
+    _eval_scores: dict[int, int] = {}
     if state_key is not None:
         from norn.journal import run_dir as _run_dir, runs_dir as _runs_dir
         from norn.rating import load_rating as _load_rating
@@ -239,9 +240,18 @@ def print_history_table(records: list[RunRecord], *, state_key: str | None = Non
         _rd_base = _runs_dir(state_key)
         if _rd_base.is_dir():
             for r in records:
-                rating = _load_rating(_run_dir(state_key, r.run_id))
+                _rd = _run_dir(state_key, r.run_id)
+                rating = _load_rating(_rd)
                 if rating is not None:
                     _ratings[r.run_id] = rating
+                _eval_path = _rd / "evaluation.json"
+                if _eval_path.exists():
+                    try:
+                        import json as _json
+                        _eval_data = _json.loads(_eval_path.read_text())
+                        _eval_scores[r.run_id] = _eval_data.get("score", 0)
+                    except Exception:
+                        pass
 
     table = Table(show_edge=False)
     table.add_column("Run", justify="right")
@@ -267,7 +277,8 @@ def print_history_table(records: list[RunRecord], *, state_key: str | None = Non
         ts = r.timestamp[:16].replace("T", " ")
         rating_data = _ratings.get(r.run_id)
         rating_str = f"{rating_data['score']}/5" if rating_data else "-"
-        score_str = "-"  # evaluation.json score — Phase 6, not yet implemented
+        eval_score = _eval_scores.get(r.run_id)
+        score_str = f"{eval_score}/10" if eval_score is not None else "-"
         table.add_row(f"#{r.run_id}", ts, status, cost, duration, rating_str, score_str, info)
 
     console.print(table)
@@ -542,4 +553,29 @@ def print_findings(findings: list, metrics: object | None = None) -> None:
         )
 
     console.print(table)
+    console.print()
+
+
+def print_evaluation_summary(result: object) -> None:
+    """Print evaluation summary: score, per-stage grades, cost, feedback path."""
+    score = getattr(result, "score", 0)
+    stage_scores = getattr(result, "stage_scores", {})
+    cost_usd = getattr(result, "cost_usd", 0.0)
+    feedback_path = getattr(result, "feedback_path", None)
+
+    console.print(f"\n  [bold]Evaluation score:[/bold] {score}/10")
+
+    if stage_scores:
+        table = Table(title="Stage Grades", title_style="bold", show_edge=False)
+        table.add_column("Stage", style="cyan")
+        table.add_column("Score", justify="right")
+
+        for name, s in stage_scores.items():
+            table.add_row(name, f"{s}/5")
+
+        console.print(table)
+
+    console.print(f"\n  [dim]Evaluation cost: ${cost_usd:.4f}[/dim]")
+    if feedback_path:
+        console.print(f"  [dim]Feedback: {feedback_path}[/dim]")
     console.print()

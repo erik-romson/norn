@@ -185,6 +185,11 @@ def main() -> None:
         action="store_true",
         help="abort on every prompt; for child processes",
     )
+    run_parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Run LLM evaluation after the pipeline completes (or fails)",
+    )
 
     history_parser = sub.add_parser("history", help="Show run history for a pipeline config")
     history_parser.add_argument("config", help="Path to the pipeline config .py file")
@@ -238,6 +243,52 @@ def main() -> None:
         help="Run ID to rate (default: latest run)",
     )
     rate_parser.add_argument("--note", default=None, metavar="TEXT", help="Optional annotation")
+
+    evaluate_parser = sub.add_parser("evaluate", help="Run LLM evaluation on a completed pipeline run")
+    evaluate_parser.add_argument("config", help="Path to the pipeline config .py file or bundled pipeline name")
+    evaluate_parser.add_argument(
+        "--run",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Run ID to evaluate (default: latest run)",
+    )
+    evaluate_parser.add_argument(
+        "--model",
+        default=None,
+        metavar="MODEL",
+        help="Feedback model shorthand (default: sonnet)",
+    )
+    evaluate_parser.add_argument(
+        "--judge-model",
+        default=None,
+        metavar="MODEL",
+        help="Judge model shorthand (default: haiku)",
+    )
+    evaluate_parser.add_argument(
+        "--no-judge",
+        action="store_true",
+        help="Skip per-stage judge pass",
+    )
+    evaluate_parser.add_argument(
+        "--stages",
+        default=None,
+        metavar="GLOB",
+        help="Only judge stages matching this glob pattern",
+    )
+    evaluate_parser.add_argument(
+        "--max-cost",
+        type=float,
+        default=5.0,
+        metavar="USD",
+        help="Maximum evaluation cost in USD (default: 5.0)",
+    )
+    evaluate_parser.add_argument(
+        "--agent-provider",
+        default=None,
+        metavar="PROVIDER",
+        help="Agent provider to use for evaluation",
+    )
 
     args, remaining = parser.parse_known_args()
 
@@ -401,6 +452,47 @@ def main() -> None:
         _console.print(f"  [green]✓[/green] Rated run #{run_id} as [bold]{args.score}/5[/bold]")
         return
 
+    if args.command == "evaluate":
+        from norn.evaluate import EvaluationError, evaluate_run
+        from norn.journal import latest_run_id as _latest_run_id, runs_dir as _runs_dir
+        from norn import ui as _ui
+
+        # Find state key
+        _eval_state_key: str | None = None
+        for candidate in _state_key_candidates(args.config):
+            if _runs_dir(candidate).is_dir():
+                _eval_state_key = candidate
+                break
+
+        if _eval_state_key is None:
+            print(f"no journaled runs for {args.config}", file=sys.stderr)
+            sys.exit(1)
+
+        if args.run is not None:
+            _eval_run_id = args.run
+        else:
+            _eval_run_id = _latest_run_id(_eval_state_key)
+            if _eval_run_id is None:
+                print(f"no journaled runs for {args.config}", file=sys.stderr)
+                sys.exit(1)
+
+        try:
+            result = asyncio.run(evaluate_run(
+                _eval_state_key,
+                _eval_run_id,
+                provider_name=args.agent_provider,
+                judge=not args.no_judge,
+                judge_model=args.judge_model or "haiku",
+                feedback_model=args.model or "sonnet",
+                stage_glob=args.stages,
+                max_cost_usd=args.max_cost,
+            ))
+            _ui.print_evaluation_summary(result)
+        except EvaluationError as exc:
+            print(f"Evaluation error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     if args.command != "run":
         parser.print_help()
         sys.exit(1)
@@ -480,6 +572,7 @@ def main() -> None:
 
     input_responder = NonInteractiveResponder() if args.non_interactive else None
 
+    pipeline_failed = False
     try:
         asyncio.run(run_pipeline(
             pipeline,
@@ -495,6 +588,7 @@ def main() -> None:
         ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
     except PipelineError as e:
+        pipeline_failed = True
         from norn.ui import console
         console.print(f"\n[bold red]Pipeline failed:[/bold red] {e}")
         # Print findings from the latest run journal
@@ -511,6 +605,23 @@ def main() -> None:
                     _ui.print_findings(_ff)
         except Exception:
             pass  # best-effort; don't mask the real failure
+
+    # Post-run evaluation (on both success and failure)
+    if args.evaluate:
+        try:
+            from norn.evaluate import EvaluationError, evaluate_run as _evaluate_run
+            from norn.journal import latest_run_id as _eval_rid
+            from norn import ui as _eval_ui
+
+            _rid = _eval_rid(config_path_for_checkpoint)
+            if _rid is not None:
+                result = asyncio.run(_evaluate_run(config_path_for_checkpoint, _rid))
+                _eval_ui.print_evaluation_summary(result)
+        except Exception as exc:
+            from norn.ui import console as _ec
+            _ec.print(f"[yellow]Evaluation failed: {exc}[/yellow]")
+
+    if pipeline_failed:
         sys.exit(1)
 
 
