@@ -307,6 +307,52 @@ async def test_workflow_filter(_patch_env):
 
 
 @pytest.mark.asyncio
+async def test_workflow_not_registered_falls_back_to_branch_runs(_patch_env):
+    """A 404 from the per-workflow runs endpoint (workflow only runs via
+    workflow_call, or never triggered) falls back to the branch's latest
+    run across all workflows instead of crashing."""
+    from githubkit.exception import RequestFailed
+
+    _patch_env()
+    gh = _mock_gh([_make_run(run_id=300, name="build and deploy")])
+    not_found = MagicMock()
+    not_found.status_code = 404
+    gh.rest.actions.async_list_workflow_runs = AsyncMock(
+        side_effect=RequestFailed(not_found),
+    )
+
+    with patch("norn.stages.check_ci._create_client", return_value=gh):
+        stage = CheckCI(workflow="ci.yml")
+        result = await stage.run(PipelineContext())
+
+    assert result.success
+    gh.rest.actions.async_list_workflow_runs_for_repo.assert_called_once_with(
+        owner="org", repo="repo", branch="main", per_page=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_workflow_non_404_error_propagates(_patch_env):
+    """Only 404 triggers the fallback — other API errors still raise."""
+    from githubkit.exception import RequestFailed
+
+    _patch_env()
+    gh = _mock_gh([_make_run(run_id=301)])
+    forbidden = MagicMock()
+    forbidden.status_code = 403
+    gh.rest.actions.async_list_workflow_runs = AsyncMock(
+        side_effect=RequestFailed(forbidden),
+    )
+
+    with patch("norn.stages.check_ci._create_client", return_value=gh):
+        stage = CheckCI(workflow="ci.yml")
+        with pytest.raises(RequestFailed):
+            await stage.run(PipelineContext())
+
+    gh.rest.actions.async_list_workflow_runs_for_repo.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_no_token(_patch_env):
     _patch_env(token=None)
 

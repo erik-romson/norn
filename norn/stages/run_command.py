@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
+import itertools
 import os
 import signal
-from typing import Any
+from typing import Any, Callable
 
+from norn.events import CommandOutput, EventKey
 from norn.models import PipelineContext, StageResult
 from norn.secrets import resolve_env
 from norn.stages.base import BaseStage
@@ -17,6 +20,68 @@ from norn.stages.base import BaseStage
 # Generous on purpose so real builds and test suites finish well inside it.
 # Pass ``timeout=None`` to wait indefinitely, or a smaller value to tighten it.
 DEFAULT_TIMEOUT_SECONDS = 3600.0
+
+# How often streamed output is flushed to the event seam. Output is batched
+# rather than emitted per line: a verbose build emits thousands of lines a
+# second, and one event per line would swamp the TUI's per-event refresh.
+# One flush every 150ms keeps the transcript feeling live while capping the
+# event rate at ~7/s no matter how loud the command is.
+FLUSH_INTERVAL_SECONDS = 0.15
+
+# Read size for the process pipes. Chunked reads (rather than ``readline()``)
+# avoid StreamReader's 64KiB line-length limit, which raises ValueError on a
+# command that emits one very long line — e.g. a minified bundle or a base64
+# payload.
+READ_CHUNK_BYTES = 65536
+
+
+class _OutputStream:
+    """Captures one process pipe and hands out whole lines for live display.
+
+    Two jobs, deliberately separate:
+
+    * **Capture** — every decoded chunk is kept so ``StageResult.output``
+      carries the command's complete output, exactly as before streaming.
+    * **Display** — ``take_lines()`` returns only the text up to the last
+      newline, holding a partial trailing line back until it completes, so
+      the transcript never shows a half-written line as its own entry.
+
+    Decoding is incremental so a multi-byte character split across two reads
+    is reassembled instead of becoming two replacement characters.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._captured: list[str] = []
+        self._pending = ""
+
+    def feed(self, data: bytes) -> None:
+        """Decode and store *data*, queueing it for display."""
+        text = self._decoder.decode(data)
+        if text:
+            self._captured.append(text)
+            self._pending += text
+
+    def take_lines(self, *, final: bool = False) -> str:
+        """Return queued whole lines, or everything queued when *final*."""
+        if final:
+            tail = self._decoder.decode(b"", final=True)
+            if tail:
+                self._captured.append(tail)
+                self._pending += tail
+            pending, self._pending = self._pending, ""
+            return pending
+        head, sep, rest = self._pending.rpartition("\n")
+        if not sep:
+            return ""
+        self._pending = rest
+        return head
+
+    @property
+    def text(self) -> str:
+        """The complete decoded output seen so far."""
+        return "".join(self._captured)
 
 
 class RunCommand(BaseStage):
@@ -52,6 +117,10 @@ class RunCommand(BaseStage):
         ))
     """
 
+    # Tells the runner to pass node_id/attempt so streamed output can be
+    # keyed to this stage's graph node (see BaseStage.emits_events).
+    emits_events = True
+
     def __init__(
         self,
         *,
@@ -63,7 +132,14 @@ class RunCommand(BaseStage):
         self.env = env
         self.timeout = timeout
 
-    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+    async def run(
+        self,
+        ctx: PipelineContext,
+        *,
+        node_id: str | None = None,
+        attempt: int = 1,
+        **kwargs: Any,
+    ) -> StageResult:
         # Build subprocess env: process env + pipeline env + stage env (with secret resolution)
         subprocess_env: dict[str, str] | None = None
         if self.env or ctx.env:
@@ -83,51 +159,178 @@ class RunCommand(BaseStage):
             stderr=asyncio.subprocess.PIPE,
             env=subprocess_env,
             start_new_session=True,
+            cwd=ctx.working_dir,
         )
+
+        # Read both pipes concurrently rather than via proc.communicate(), so
+        # output can be forwarded to the event seam while the command is still
+        # running. Reading both at once is what keeps communicate()'s deadlock
+        # guarantee: a command that fills one pipe while we block on the other
+        # would stall forever.
+        #
+        # Decoding is defensive: a command may emit non-UTF-8 bytes (e.g. an
+        # e2e script dumping a decrypted binary payload). Strict decode would
+        # raise UnicodeDecodeError and crash the pipeline before the command's
+        # pass/fail could be reported. errors="replace" preserves all valid
+        # text and substitutes U+FFFD for stray bytes.
+        out = _OutputStream("stdout")
+        err = _OutputStream("stderr")
+        emit = self._make_emitter(ctx, node_id=node_id, attempt=attempt)
+        flusher = asyncio.create_task(self._flush_loop(emit, out, err))
+        timed_out = False
 
         try:
             if self.timeout is not None:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=self.timeout
-                )
+                await asyncio.wait_for(self._pump(proc, out, err), timeout=self.timeout)
             else:
-                stdout, stderr = await proc.communicate()
+                await self._pump(proc, out, err)
         except asyncio.TimeoutError:
             # Command overran its backstop. Kill the whole group and report a
             # clean failure so the loop/fix machinery reacts instead of hanging.
+            timed_out = True
             self._terminate_group(proc)
             with contextlib.suppress(Exception):
                 await proc.wait()
-            cmd_preview = self.cmd if len(self.cmd) <= 500 else self.cmd[:500] + "…"
-            return StageResult(
-                name="",
-                success=False,
-                output={"stdout": "", "stderr": "", "returncode": None},
-                error=(
-                    f"command timed out after {self.timeout:g}s and was killed\n"
-                    f"$ {cmd_preview}"
-                ),
-            )
         except asyncio.CancelledError:
             # External cancellation (pipeline abort, or a Stage-level timeout in
             # the runner). Reap the tree before propagating so nothing is left
             # holding our pipes open.
             self._terminate_group(proc)
             raise
+        finally:
+            # Stop the periodic flush and push whatever is still queued —
+            # including a trailing line with no newline — so the transcript
+            # ends with everything the command actually printed. Runs on the
+            # timeout and cancellation paths too.
+            flusher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await flusher
+            self._emit_pending(emit, out, err, final=True)
 
-        # Decode defensively: a test_cmd may emit non-UTF-8 bytes on stdout/stderr
-        # (e.g. an e2e script that dumps a decrypted binary payload). Strict decode
-        # would raise UnicodeDecodeError here and crash the whole pipeline before the
-        # command's pass/fail can be reported. errors="replace" preserves all valid
-        # text and substitutes U+FFFD for stray bytes.
+        if timed_out:
+            cmd_preview = self.cmd if len(self.cmd) <= 500 else self.cmd[:500] + "…"
+            return StageResult(
+                name="",
+                success=False,
+                # Partial output, not empty: what the command managed to print
+                # before it wedged is usually the only clue as to where.
+                output={"stdout": out.text, "stderr": err.text, "returncode": None},
+                error=(
+                    f"command timed out after {self.timeout:g}s and was killed\n"
+                    f"$ {cmd_preview}"
+                ),
+            )
+
         output = {
-            "stdout": stdout.decode(errors="replace"),
-            "stderr": stderr.decode(errors="replace"),
+            "stdout": out.text,
+            "stderr": err.text,
             "returncode": proc.returncode,
         }
         success = proc.returncode == 0
         error = self._format_error(output) if not success else None
         return StageResult(name="", success=success, output=output, error=error)
+
+    # ------------------------------------------------------------------
+    # Live output streaming
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_emitter(
+        ctx: PipelineContext,
+        *,
+        node_id: str | None,
+        attempt: int,
+    ) -> Callable[[str, str], None]:
+        """Return a function that emits one ``CommandOutput`` per call.
+
+        *node_id* is the fully-qualified graph node id the runner computed for
+        this stage, so streamed output lands in the same transcript spool as
+        the stage's other events.
+
+        It is ``None`` when ``RunCommand`` is driven directly rather than
+        through the runner — then output is not streamed at all. There is no
+        node to attribute it to, so every consumer would drop it while the
+        sink kept spooling it under a key nothing reads.
+        """
+        if node_id is None:
+            return lambda stream, text: None
+
+        sink = ctx.event_sink
+        run_id = ctx.run_id
+        unit_id = ctx.unit_id
+        counter = itertools.count(1)
+
+        def emit(stream: str, text: str) -> None:
+            sink.emit(CommandOutput(
+                key=EventKey(
+                    run_id=run_id,
+                    unit_id=unit_id,
+                    stage_id=node_id,
+                    attempt=attempt,
+                    seq=next(counter),
+                ),
+                text=text,
+                stream=stream,
+            ))
+
+        return emit
+
+    @staticmethod
+    async def _read_stream(stream: asyncio.StreamReader, sink: _OutputStream) -> None:
+        """Drain *stream* into *sink* until EOF."""
+        while True:
+            data = await stream.read(READ_CHUNK_BYTES)
+            if not data:
+                return
+            sink.feed(data)
+
+    async def _pump(
+        self,
+        proc: asyncio.subprocess.Process,
+        out: _OutputStream,
+        err: _OutputStream,
+    ) -> None:
+        """Drain both pipes to EOF, then reap the process.
+
+        ``proc.stdout``/``proc.stderr`` are always set because both were
+        opened with ``PIPE`` at spawn time.
+        """
+        assert proc.stdout is not None and proc.stderr is not None
+        await asyncio.gather(
+            self._read_stream(proc.stdout, out),
+            self._read_stream(proc.stderr, err),
+        )
+        await proc.wait()
+
+    @staticmethod
+    def _emit_pending(
+        emit: Callable[[str, str], None],
+        out: _OutputStream,
+        err: _OutputStream,
+        *,
+        final: bool = False,
+    ) -> None:
+        """Emit whatever display text each stream has queued."""
+        for stream in (out, err):
+            text = stream.take_lines(final=final)
+            if text:
+                # Each event renders as its own transcript entry, which already
+                # implies a line break; a trailing newline would render as an
+                # extra blank line. The non-final path is already stripped (the
+                # newline is the separator rpartition drops), so this only bites
+                # on the final flush.
+                emit(stream.name, text.removesuffix("\n"))
+
+    async def _flush_loop(
+        self,
+        emit: Callable[[str, str], None],
+        out: _OutputStream,
+        err: _OutputStream,
+    ) -> None:
+        """Emit queued output every ``FLUSH_INTERVAL_SECONDS`` until cancelled."""
+        while True:
+            await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
+            self._emit_pending(emit, out, err)
 
     @staticmethod
     def _terminate_group(proc: asyncio.subprocess.Process) -> None:

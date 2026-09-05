@@ -15,19 +15,19 @@ uv sync
 
 ```bash
 # Run a pipeline
-bin/norn examples/hello.py
+bin/norn examples/derived.py
 
 # Same thing, explicit subcommand
-uv run python -m norn run examples/hello.py
+uv run python -m norn run examples/derived.py
 
 # Preview what will run without executing
-bin/norn examples/hello.py --dry-run
+bin/norn examples/derived.py --dry-run
 
 # Pass arguments
-bin/norn dogfooding/vanilla_change.py "add logging to the runner"
+uv run python -m norn run vanilla_change "add logging to the runner"
 
 # Resume from checkpoint after failure
-bin/norn examples/hello.py --resume
+bin/norn examples/derived.py --resume
 ```
 
 The `bin/norn` wrapper auto-prepends `run` when the first argument is a file.
@@ -47,6 +47,7 @@ norn run <config.py> [options] [positional args...]
 | `--resume` | Resume from the checkpoint saved by the previous run |
 | `--dry-run` | Show pipeline structure without executing |
 | `--step` | Interactive stepping mode — prompt before each stage |
+| `--non-interactive` | Abort on every prompt; for child processes |
 | `--arg KEY=VALUE` | Pass a named parameter (accessible as `{param.KEY}`) |
 | `--skip STAGE_NAME` | Skip a stage by name (repeatable) |
 | `-v` / `--verbose` | Enable debug logging |
@@ -69,14 +70,14 @@ the detailed step log for a single run.
 
 ```bash
 # List all runs
-bin/norn run examples/hello.py   # (use 'run' because 'history' is not a file)
-uv run python -m norn history examples/hello.py
+bin/norn run examples/derived.py   # (use 'run' because 'history' is not a file)
+uv run python -m norn history examples/derived.py
 
 # Compare runs #1 and #3
-uv run python -m norn history examples/hello.py --compare 1 3
+uv run python -m norn history examples/derived.py --compare 1 3
 
 # Inspect the full step-by-step log for run #3
-uv run python -m norn history examples/hello.py --run 3
+uv run python -m norn history examples/derived.py --run 3
 ```
 
 Output:
@@ -450,19 +451,19 @@ from where it left off:
 
 ```bash
 # First run — fails at stage 3
-bin/norn examples/hello.py
+bin/norn examples/derived.py
   ✓ read_spec         0.1s
   ✓ generate          $0.12  4.2s
   ✗ test              exit 1
 
 # Resume — skips completed stages
-bin/norn examples/hello.py --resume
+bin/norn examples/derived.py --resume
   ⊘ read_spec         (cached)
   ⊘ generate          (cached)
   ✓ test              0.8s
 ```
 
-Checkpoint file: `examples/hello.checkpoint` (JSON, using the same state-key
+Checkpoint file: `examples/derived.checkpoint` (JSON, using the same state-key
 location as history files).
 
 Contains: completed stage names, their outputs, session ID, timestamp.
@@ -571,11 +572,15 @@ Inject specialized instructions into Generate stages.
 ### Named Skills (files)
 
 Skill files are markdown files searched in order:
-1. `skills/<name>.md` (pipeline-local)
-2. `.claude/skills/<name>.md` (project)
-3. `~/.claude/skills/<name>.md` (user)
+1. `skills/<name>.md` or `skills/<name>/SKILL.md` (pipeline-local)
+2. `.claude/skills/<name>.md` or `.claude/skills/<name>/SKILL.md` (project)
+3. `~/.claude/skills/<name>.md` or `~/.claude/skills/<name>/SKILL.md` (user)
 
-Qualified names: `package:skill` searches `skills/package/skill.md` etc.
+Each base is tried in both layouts — the flat file first, then the Claude Code
+`<name>/SKILL.md` directory layout.
+
+Qualified names: `package:skill` searches `skills/package/skill.md`,
+`skills/package/skill/SKILL.md`, etc.
 
 ```python
 Stage("review", Generate(
@@ -640,7 +645,7 @@ Generate(
 Debug pipelines by stepping through stages one at a time.
 
 ```bash
-bin/norn examples/hello.py --step
+bin/norn examples/derived.py --step
 ```
 
 ```
@@ -692,7 +697,7 @@ Pipeline hello starting
    Totals       20,500     3,500    $0.2000    7.3s
 
   Session: abc123
-  To resume: norn run examples/hello.py --resume
+  To resume: norn run examples/derived.py --resume
 ```
 
 Stage indicators:
@@ -761,15 +766,17 @@ norn/
 ├── skills.py       # Skill resolution (local, project, user directories)
 ├── loader.py       # Dynamic pipeline loading via importlib
 ├── cli.py          # Entry point, arg parsing
+├── catalog.py      # AST discovery of bundled pipelines (name -> config)
 ├── stages/
 │   ├── base.py     # Abstract BaseStage (async def run(ctx) -> StageResult)
 │   ├── read_file.py
 │   ├── run_command.py
 │   └── generate.py # Claude agent SDK integration
+└── pipelines/      # Bundled pipelines, run by name (`norn run <name>`)
 bin/
-└── norn      # Wrapper script (auto-prepends 'run')
-examples/           # Sample pipeline configs
-dogfooding/         # Self-use pipeline configs
+├── norn            # Wrapper script (auto-prepends 'run')
+└── show_ci_data.py # Debug tool: dump what check_and_fix_ci feeds Claude
+examples/           # Sample external configs, run by path
 templates/          # Prompt template files
 skills/             # Skill markdown files
 tests/              # pytest tests

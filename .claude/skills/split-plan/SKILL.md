@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 # Split Plan into Pipeline Steps
 
-Take a plan file and split it into `index.md` + `step-NN-name.md` files that can be executed by `bin/norn dogfooding/implement_features.py <output-directory>`.
+Take a plan file and split it into `index.md` + `step-NN-name.md` files that can be executed by `norn run implement_features <output-directory>`.
 
 ## Arguments
 
@@ -37,7 +37,7 @@ Naming: `step-01-short-name.md`, `step-02-short-name.md`, etc.
 
 Each step file MUST start with YAML front-matter declaring a real
 `test_cmd:` — the exact shell command the pipeline runs to validate the
-step. The pipeline (`dogfooding/implement_features.py`) does NOT guess a
+step. The pipeline (`norn/pipelines/implement_features.py`) does NOT guess a
 default any more; a missing or empty `test_cmd` halts the run.
 
 ```markdown

@@ -72,4 +72,28 @@ def test_usage_tracker_multiple_sessions():
     assert t.total_input_tokens == 350
 
 
+def test_usage_tracker_totals_are_cumulative_across_stages():
+    """UsageUpdated is emitted with tracker.total_* — the cumulative run sum,
+    not the per-stage slice.  Pin this so the viewmodel's 'treat UsageUpdated
+    as authoritative run total' contract cannot be silently invalidated by a
+    change to the emitter.
+
+    After two stages (100 + 200 input tokens), tracker.total_input_tokens must
+    equal 300, not 200.  The viewmodel stores the last UsageUpdated value as the
+    run total; if the emitter ever changed to per-stage values the display would
+    only show the most recent stage.
+    """
+    t = UsageTracker()
+    t.add(UsageRecord(stage_name="stage-a", input_tokens=100, output_tokens=20, total_cost_usd=0.01))
+    # After stage-a the tracker carries cumulative = 100 input
+    assert t.total_input_tokens == 100
+
+    t.add(UsageRecord(stage_name="stage-b", input_tokens=200, output_tokens=40, total_cost_usd=0.02))
+    # After stage-b the tracker carries cumulative = 300 input (NOT just 200)
+    assert t.total_input_tokens == 300
+    assert t.total_output_tokens == 60
+    import pytest
+    assert pytest.approx(t.total_cost_usd, rel=1e-6) == 0.03
+
+
 import pytest

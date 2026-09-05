@@ -79,13 +79,48 @@ class AgentUsage:
     is_error: bool = False
 
 
+@dataclass(frozen=True)
+class TextBlock:
+    """A plain-text content block from an agent message."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class ToolUseBlock:
+    """Represents a tool invocation in an agent message."""
+
+    name: str
+    input_summary: str
+
+
+@dataclass(frozen=True)
+class ToolResultBlock:
+    """Represents the result of a tool call in an agent message."""
+
+    ok: bool
+    summary: str
+
+
+@dataclass(frozen=True)
+class ThinkingBlock:
+    """Extended thinking content block from an agent message."""
+
+    text: str
+
+
+# Provider-neutral union of all message block types.
+AgentMessageBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock
+
+
 @dataclass
 class AgentEvent:
     """A single event emitted by a provider during an agent call.
 
     Providers yield a stream of these. Text chunks arrive with ``text`` set;
     the final event carries ``usage`` (and optionally ``structured_output`` or
-    ``artifact``).
+    ``artifact``). ``block`` carries a typed representation of the message
+    content (tool use, tool result, thinking, or text) when available.
     """
 
     text: str | None = None
@@ -93,6 +128,7 @@ class AgentEvent:
     usage: AgentUsage | None = None
     structured_output: Any = None
     artifact: str | None = None
+    block: AgentMessageBlock | None = None
 
 
 @runtime_checkable

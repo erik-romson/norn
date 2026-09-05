@@ -36,23 +36,28 @@ def _skill_candidates(name: str) -> list[pathlib.Path]:
     """Return candidate paths for a skill in resolution order.
 
     Supports plain names (``review-pr``) and qualified names (``pkg:skill``).
+    Each base is tried in both layouts: the flat ``<name>.md`` file and the
+    Claude Code directory layout ``<name>/SKILL.md``.
     """
     if ":" in name:
         package, skill = name.split(":", 1)
-        filename = f"{skill}.md"
         bases: list[pathlib.Path] = [
             pathlib.Path("skills") / package,
             pathlib.Path(".claude") / "skills" / package,
             pathlib.Path.home() / ".claude" / "skills" / package,
         ]
     else:
-        filename = f"{name}.md"
+        skill = name
         bases = [
             pathlib.Path("skills"),
             pathlib.Path(".claude") / "skills",
             pathlib.Path.home() / ".claude" / "skills",
         ]
-    return [b / filename for b in bases]
+    candidates: list[pathlib.Path] = []
+    for base in bases:
+        candidates.append(base / f"{skill}.md")
+        candidates.append(base / skill / "SKILL.md")
+    return candidates
 
 
 def resolve_skill_content(skill: str | Skill) -> str:

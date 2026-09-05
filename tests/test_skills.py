@@ -55,6 +55,35 @@ def test_resolve_skill_project_level(tmp_path, monkeypatch):
     assert content == "Write good commit messages."
 
 
+def test_resolve_skill_from_claude_code_directory_layout(tmp_path, monkeypatch):
+    skill_dir = tmp_path / ".claude" / "skills" / "split-plan"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("Split the plan into steps.")
+    monkeypatch.chdir(tmp_path)
+
+    content = resolve_skill_content("split-plan")
+    assert content == "Split the plan into steps."
+
+
+def test_flat_skill_file_wins_over_directory_layout(tmp_path, monkeypatch):
+    skills_dir = tmp_path / "skills"
+    (skills_dir / "review-pr").mkdir(parents=True)
+    (skills_dir / "review-pr.md").write_text("Flat file.")
+    (skills_dir / "review-pr" / "SKILL.md").write_text("Directory file.")
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_skill_content("review-pr") == "Flat file."
+
+
+def test_resolve_qualified_skill_directory_layout(tmp_path, monkeypatch):
+    skill_dir = tmp_path / "skills" / "my-pkg" / "tool"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("Qualified directory skill.")
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_skill_content("my-pkg:tool") == "Qualified directory skill."
+
+
 # ---------------------------------------------------------------------------
 # Generate + skills
 # ---------------------------------------------------------------------------
@@ -84,6 +113,7 @@ def _make_fake_sdk(captured: dict[str, Any]) -> MagicMock:
     sdk.query = fake_query
     sdk.ClaudeAgentOptions = FakeOptions
     sdk.AssistantMessage = type("AssistantMessage", (), {})
+    sdk.UserMessage = type("UserMessage", (), {})
     sdk.ResultMessage = FakeResultMessage
     sdk.HookMatcher = MagicMock(return_value=MagicMock())
     return sdk

@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from norn.catalog import _extract_metadata
-from norn.dsl import ClearContext, Include, Loop, Parallel, Pipeline, Stage
+from norn.dsl import Pipeline
+from norn.graph import PipelineNode, build_graph
 
 
 def to_markdown(pipeline: Pipeline, config_path: str) -> str:
@@ -44,14 +45,15 @@ def to_markdown(pipeline: Pipeline, config_path: str) -> str:
 
 def to_mermaid(pipeline: Pipeline) -> str:
     """Convert a Pipeline to a Mermaid flowchart string."""
+    graph = build_graph(pipeline)
     lines: list[str] = []
     lines.append("flowchart TD")
 
-    node_ids: list[str] = []
     counter = _Counter()
+    node_ids: list[str] = []
 
-    for item in pipeline.items:
-        node_id = _emit_item(item, lines, counter)
+    for node in graph.root.children:
+        node_id = _emit_node(node, lines, counter)
         node_ids.append(node_id)
 
     # Connect top-level items sequentially
@@ -62,7 +64,7 @@ def to_mermaid(pipeline: Pipeline) -> str:
 
 
 class _Counter:
-    """Simple counter for generating unique node IDs."""
+    """Simple counter for generating unique Mermaid node IDs."""
 
     def __init__(self) -> None:
         self._n = 0
@@ -77,36 +79,36 @@ def _sanitize_label(text: str) -> str:
     return text.replace('"', "#quot;")
 
 
-def _emit_item(item: Stage | Loop | ClearContext | Parallel | Include,
-               lines: list[str], counter: _Counter) -> str:
-    """Emit Mermaid lines for a single pipeline item. Returns the node/subgraph ID."""
-    if isinstance(item, Stage):
-        return _emit_stage(item, lines, counter)
-    if isinstance(item, Loop):
-        return _emit_loop(item, lines, counter)
-    if isinstance(item, Parallel):
-        return _emit_parallel(item, lines, counter)
-    if isinstance(item, Include):
-        return _emit_include(item, lines, counter)
-    # ClearContext
-    return _emit_clear_context(lines, counter)
+def _emit_node(node: PipelineNode, lines: list[str], counter: _Counter) -> str:
+    """Emit Mermaid lines for a single pipeline node. Returns the Mermaid node/subgraph ID."""
+    if node.kind == "stage":
+        return _emit_stage_node(node, lines, counter)
+    if node.kind == "loop":
+        return _emit_loop_node(node, lines, counter)
+    if node.kind == "parallel":
+        return _emit_parallel_node(node, lines, counter)
+    if node.kind == "include":
+        return _emit_include_node(node, lines, counter)
+    # clear
+    return _emit_clear_node(node, lines, counter)
 
 
-def _emit_stage(stage: Stage, lines: list[str], counter: _Counter) -> str:
+def _emit_stage_node(node: PipelineNode, lines: list[str], counter: _Counter) -> str:
     nid = counter.next("s")
-    label = _sanitize_label(stage.name)
+    label = _sanitize_label(node.name)
     lines.append(f'    {nid}["{label}"]')
     return nid
 
 
-def _emit_loop(loop: Loop, lines: list[str], counter: _Counter) -> str:
+def _emit_loop_node(node: PipelineNode, lines: list[str], counter: _Counter) -> str:
     gid = counter.next("loop")
-    label = _sanitize_label(loop.name)
-    lines.append(f'    subgraph {gid} ["{label} (loop, max {loop.max_retries})"]')
+    label = _sanitize_label(node.name)
+    max_retries = node.metadata.get("max_retries", 0)
+    lines.append(f'    subgraph {gid} ["{label} (loop, max {max_retries})"]')
 
     stage_ids: list[str] = []
-    for stage in loop.stages:
-        sid = _emit_item(stage, lines, counter)
+    for child in node.children:
+        sid = _emit_node(child, lines, counter)
         stage_ids.append(sid)
 
     # Sequential edges inside the loop
@@ -121,9 +123,9 @@ def _emit_loop(loop: Loop, lines: list[str], counter: _Counter) -> str:
     return gid
 
 
-def _emit_parallel(par: Parallel, lines: list[str], counter: _Counter) -> str:
+def _emit_parallel_node(node: PipelineNode, lines: list[str], counter: _Counter) -> str:
     gid = counter.next("par")
-    label = _sanitize_label(par.name)
+    label = _sanitize_label(node.name)
     lines.append(f'    subgraph {gid} ["{label} (parallel)"]')
 
     fork_id = counter.next("fork")
@@ -131,8 +133,8 @@ def _emit_parallel(par: Parallel, lines: list[str], counter: _Counter) -> str:
     lines.append(f'        {fork_id}(("{label}"))')
 
     stage_ids: list[str] = []
-    for stage in par.stages:
-        sid = _emit_item(stage, lines, counter)
+    for child in node.children:
+        sid = _emit_node(child, lines, counter)
         stage_ids.append(sid)
 
     lines.append(f'        {join_id}(("{label} done"))')
@@ -144,14 +146,14 @@ def _emit_parallel(par: Parallel, lines: list[str], counter: _Counter) -> str:
     return gid
 
 
-def _emit_include(include: Include, lines: list[str], counter: _Counter) -> str:
+def _emit_include_node(node: PipelineNode, lines: list[str], counter: _Counter) -> str:
     nid = counter.next("inc")
-    label = _sanitize_label(include.path)
+    label = _sanitize_label(node.name)
     lines.append(f'    {nid}[["{label}"]]')
     return nid
 
 
-def _emit_clear_context(lines: list[str], counter: _Counter) -> str:
+def _emit_clear_node(node: PipelineNode, lines: list[str], counter: _Counter) -> str:
     nid = counter.next("cc")
     lines.append(f'    {nid}(["clear context"])')
     return nid

@@ -497,14 +497,6 @@ class CheckCI(BaseStage):
         self.smart_wait_factor = smart_wait_factor
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
-        try:
-            from githubkit import GitHub
-        except ImportError:
-            return StageResult(
-                name="", success=False,
-                error="githubkit is not installed. Install with: pip install 'norn[github]'",
-            )
-
         token = await _resolve_token()
         if not token:
             return StageResult(
@@ -522,7 +514,13 @@ class CheckCI(BaseStage):
             )
 
         owner, repo_name = repo_slug.split("/", 1)
-        gh = _create_client(token)
+        try:
+            gh = _create_client(token)
+        except ImportError:
+            return StageResult(
+                name="", success=False,
+                error="githubkit is not installed. Install with: pip install 'norn[github]'",
+            )
 
         deadline = asyncio.get_event_loop().time() + self.timeout_minutes * 60
 
@@ -756,12 +754,39 @@ async def _estimate_typical_duration(
 async def _get_latest_run(
     gh: Any, owner: str, repo: str, branch: str, workflow: str | None,
 ) -> dict | None:
-    """Fetch the most recent workflow run for a branch."""
+    """Fetch the most recent workflow run for a branch.
+
+    A workflow file can exist in the repo without being registered under its
+    own name — it only runs as a reusable ``workflow_call`` from a caller
+    workflow, or it has simply never been triggered. GitHub's per-workflow
+    runs endpoint then returns 404. Fall back to the branch's latest run
+    across all workflows: for a reusable workflow that is the caller run,
+    which contains the reusable workflow's jobs.
+    """
     if workflow:
-        resp = await gh.rest.actions.async_list_workflow_runs(
-            owner=owner, repo=repo, workflow_id=workflow,
-            branch=branch, per_page=1,
-        )
+        try:
+            from githubkit.exception import RequestFailed
+        except ImportError:
+            class RequestFailed(Exception):  # type: ignore[no-redef]
+                pass
+
+        try:
+            resp = await gh.rest.actions.async_list_workflow_runs(
+                owner=owner, repo=repo, workflow_id=workflow,
+                branch=branch, per_page=1,
+            )
+        except RequestFailed as exc:
+            if exc.response.status_code != 404:
+                raise
+            log.warning(
+                "Workflow %r is not registered in %s/%s (never triggered under "
+                "its own name — reusable workflows run under their caller). "
+                "Falling back to the latest run on branch %r across all workflows.",
+                workflow, owner, repo, branch,
+            )
+            resp = await gh.rest.actions.async_list_workflow_runs_for_repo(
+                owner=owner, repo=repo, branch=branch, per_page=1,
+            )
     else:
         resp = await gh.rest.actions.async_list_workflow_runs_for_repo(
             owner=owner, repo=repo, branch=branch, per_page=1,

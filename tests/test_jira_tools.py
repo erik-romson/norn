@@ -83,6 +83,7 @@ async def test_jira_get_attachments_downloads_files(tmp_path):
     env = {"JIRA_URL": "https://jira.example.com", "JIRA_EMAIL": "user@example.com", "JIRA_TOKEN": "tok"}
 
     mock_attachment = MagicMock()
+    mock_attachment.id = "10001"
     mock_attachment.filename = "spec.txt"
     mock_attachment.size = 12
     mock_attachment.get.return_value = b"hello world\n"
@@ -101,8 +102,10 @@ async def test_jira_get_attachments_downloads_files(tmp_path):
     assert "is_error" not in result
     saved = json.loads(result["content"][0]["text"])
     assert len(saved) == 1
+    # Original filename is preserved in metadata; the on-disk file is id-prefixed.
     assert saved[0]["filename"] == "spec.txt"
-    assert (tmp_path / "spec.txt").read_bytes() == b"hello world\n"
+    assert saved[0]["path"].endswith("10001_spec.txt")
+    assert (tmp_path / "10001_spec.txt").read_bytes() == b"hello world\n"
 
 
 # ---------------------------------------------------------------------------

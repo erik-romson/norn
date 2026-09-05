@@ -1,6 +1,6 @@
 """Tests for pipeline configs using mockito-based mock stages.
 
-Exercises dogfooding/vanilla_change.py pipeline logic without calling
+Exercises norn/pipelines/vanilla_change.py pipeline logic without calling
 the Claude SDK or running real subprocesses.
 """
 
@@ -40,7 +40,7 @@ async def test_vanilla_change_all_pass_first_try():
     test_bats = mock_run_command(stdout="3 tests, 0 failures")
 
     ctx = await run_test(
-        "dogfooding/vanilla_change.py",
+        "norn/pipelines/vanilla_change.py",
         patches={
             "implement": impl,
             "fix": fix,
@@ -67,7 +67,7 @@ async def test_vanilla_change_pytest_fails_then_fix():
     test_bats = mock_run_command(stdout="ok")
 
     await run_test(
-        "dogfooding/vanilla_change.py",
+        "norn/pipelines/vanilla_change.py",
         patches={
             "implement": impl,
             "fix": fix,
@@ -92,7 +92,7 @@ async def test_vanilla_change_bats_fails_then_fix():
     test_bats = mock_run_command(fail_count=1, stderr="not ok 1 test failed")
 
     await run_test(
-        "dogfooding/vanilla_change.py",
+        "norn/pipelines/vanilla_change.py",
         patches={
             "implement": impl,
             "fix": fix,
@@ -121,7 +121,7 @@ async def test_vanilla_change_retries_exhausted():
 
     with pytest.raises(RetriesExhaustedError):
         await run_test(
-            "dogfooding/vanilla_change.py",
+            "norn/pipelines/vanilla_change.py",
             patches={
                 "implement": impl,
                 "fix": fix,
@@ -150,7 +150,7 @@ async def test_vanilla_change_session_flows_from_implement_to_fix():
     test_bats = mock_run_command()
 
     await run_test(
-        "dogfooding/vanilla_change.py",
+        "norn/pipelines/vanilla_change.py",
         patches={
             "implement": impl,
             "fix": fix,
@@ -192,7 +192,7 @@ async def test_vanilla_change_fix_sees_failed_test_in_context():
     test_bats = mock_run_command(stdout="ok")
 
     await run_test(
-        "dogfooding/vanilla_change.py",
+        "norn/pipelines/vanilla_change.py",
         patches={
             "implement": impl,
             "fix": fix,
@@ -221,7 +221,7 @@ async def test_patch_stages_replaces_by_name():
     from norn.loader import load_pipeline
     from norn.stages.generate import Generate
 
-    pipeline = load_pipeline("dogfooding/vanilla_change.py")
+    pipeline = load_pipeline("norn/pipelines/vanilla_change.py")
 
     # Before patching, implement is a real Generate
     impl_stage = pipeline.items[0]

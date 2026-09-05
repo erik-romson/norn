@@ -3,7 +3,17 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator
 
-from norn.agents.base import AgentError, AgentEvent, AgentProvider, AgentRequest, AgentUsage
+from norn.agents.base import (
+    AgentError,
+    AgentEvent,
+    AgentProvider,
+    AgentRequest,
+    AgentUsage,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+from norn.agents.capabilities import AgentCapabilities, CostMode
 from norn.agents.models import resolve_model
 
 log = logging.getLogger(__name__)
@@ -12,6 +22,38 @@ log = logging.getLogger(__name__)
 # every transport spawn.  Pin the SDK logger to WARNING to keep real errors but
 # drop the spawn chatter.
 logging.getLogger("claude_agent_sdk").setLevel(logging.WARNING)
+
+_INPUT_SUMMARY_MAX = 200
+_RESULT_SUMMARY_MAX = 200
+
+# Ordered list of input-dict keys to try when building a short summary for a
+# tool-use block.  Earlier entries are preferred over later ones.
+_PREFERRED_INPUT_KEYS = ("file_path", "path", "command", "query")
+
+
+def _build_input_summary(name: str, input_data: dict) -> str:
+    """Return a short, redaction-friendly summary of a tool's input dict."""
+    for key in _PREFERRED_INPUT_KEYS:
+        if key in input_data:
+            return str(input_data[key])[:_INPUT_SUMMARY_MAX]
+    return str(input_data)[:_INPUT_SUMMARY_MAX]
+
+
+def _build_result_summary(content: Any) -> str:
+    """Extract a short text summary from tool-result content."""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(item.get("text", ""))
+            elif hasattr(item, "text"):
+                parts.append(item.text)
+        text = " ".join(p for p in parts if p)
+    elif isinstance(content, str):
+        text = content
+    else:
+        text = str(content) if content is not None else ""
+    return text[:_RESULT_SUMMARY_MAX]
 
 
 class ClaudeCodeError(AgentError):
@@ -32,6 +74,24 @@ class ClaudeCodeProvider:
 
     name: str = "claude-code"
 
+    capabilities: AgentCapabilities = AgentCapabilities(
+        block_kinds=frozenset({"text", "tool_use", "tool_result", "thinking"}),
+        cost_mode=CostMode.TRACKED,
+        supports_structured_output=True,
+        supports_fork=True,
+        supports_hooks=True,
+        supports_mcp=True,
+        supports_thinking=True,
+        file_edit_without_terminal=True,
+        session_resumable=True,
+        session_forkable=True,
+        session_attachable=False,
+        live_model_switch=False,
+        model_alias_table="claude-code",
+        can_list_models=False,
+        supports_setting_sources=True,
+    )
+
     async def run(self, request: AgentRequest) -> AsyncIterator[AgentEvent]:
         """Execute a Claude Agent SDK query, yielding provider-neutral events."""
         try:
@@ -39,7 +99,14 @@ class ClaudeCodeProvider:
                 AssistantMessage,
                 ClaudeAgentOptions,
                 ResultMessage,
+                UserMessage,
                 query,
+            )
+            from claude_agent_sdk.types import (
+                TextBlock as SdkTextBlock,
+                ThinkingBlock as SdkThinkingBlock,
+                ToolResultBlock as SdkToolResultBlock,
+                ToolUseBlock as SdkToolUseBlock,
             )
         except ImportError as exc:
             raise ImportError(
@@ -120,8 +187,39 @@ class ClaudeCodeProvider:
             async for message in query(prompt=request.prompt, options=options):
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
-                        if hasattr(block, "text"):
+                        if isinstance(block, SdkToolUseBlock):
+                            yield AgentEvent(block=ToolUseBlock(
+                                name=block.name,
+                                input_summary=_build_input_summary(block.name, block.input or {}),
+                            ))
+                        elif isinstance(block, SdkThinkingBlock):
+                            # SDK field is 'thinking'; norn's ThinkingBlock field is 'text'
+                            yield AgentEvent(block=ThinkingBlock(text=block.thinking))
+                        elif isinstance(block, SdkTextBlock):
                             yield AgentEvent(text=block.text)
+                        else:
+                            # Log unrecognised blocks so SDK shape changes are visible
+                            log.debug(
+                                "[claude-code] Unrecognised AssistantMessage block type %s; skipping",
+                                type(block).__name__,
+                            )
+
+                elif isinstance(message, UserMessage):
+                    # Tool results arrive on UserMessage.content, not AssistantMessage
+                    content = message.content
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, SdkToolResultBlock):
+                                yield AgentEvent(block=ToolResultBlock(
+                                    ok=not block.is_error,
+                                    summary=_build_result_summary(block.content),
+                                ))
+                            else:
+                                log.debug(
+                                    "[claude-code] Unrecognised UserMessage block type %s; skipping",
+                                    type(block).__name__,
+                                )
+                    # Plain-string UserMessage.content carries no structured blocks
 
                 elif isinstance(message, ResultMessage):
                     session_id = message.session_id

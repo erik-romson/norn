@@ -251,6 +251,81 @@ async def test_no_history_written_without_config_path():
     # No assertion on filesystem — just verifying no exception is raised
 
 
+def test_stage_log_error_is_masked_on_write(tmp_path):
+    """Secrets in stage error messages must not reach the JSONL file on disk."""
+    from norn.ui import _masked_secrets, register_secrets
+
+    register_secrets(["MY_DB_PASS"])
+    try:
+        config = str(tmp_path / "pipeline.py")
+        record = RunRecord(
+            run_id=1,
+            timestamp="2026-03-25T09:00:00+00:00",
+            success=False,
+            total_cost_usd=0.0,
+            total_tokens=0,
+            duration_ms=100,
+            stages=[],
+            retries=0,
+            stage_log=[
+                StageLogEntry(
+                    name="migrate",
+                    status="failed",
+                    success=False,
+                    attempt=1,
+                    error="connection refused: MY_DB_PASS is wrong",
+                ),
+            ],
+        )
+        append_run(config, record)
+
+        # Assert against the raw file bytes — the secret must never land on disk.
+        raw = history_file(config).read_text()
+        assert "MY_DB_PASS" not in raw, "secret reached the JSONL file unmasked"
+        assert "***" in raw, "masked marker absent from JSONL file"
+    finally:
+        _masked_secrets.discard("MY_DB_PASS")
+
+
+def test_stage_log_error_round_trips(tmp_path):
+    """StageLogEntry.error must survive append_run → load_history."""
+    config = str(tmp_path / "pipeline.py")
+    record = RunRecord(
+        run_id=1,
+        timestamp="2026-03-25T09:00:00+00:00",
+        success=False,
+        total_cost_usd=0.0,
+        total_tokens=0,
+        duration_ms=100,
+        stages=[],
+        retries=0,
+        stage_log=[
+            StageLogEntry(
+                name="failing_stage",
+                status="failed",
+                success=False,
+                attempt=1,
+                error="something went wrong",
+            ),
+            StageLogEntry(
+                name="ok_stage",
+                status="passed",
+                success=True,
+                attempt=1,
+                error=None,
+            ),
+        ],
+    )
+    append_run(config, record)
+
+    records = load_history(config)
+    assert len(records) == 1
+    log = records[0].stage_log
+    assert len(log) == 2
+    assert log[0].error == "something went wrong"
+    assert log[1].error is None
+
+
 async def test_retries_counted_in_history(tmp_path):
     from norn.dsl import Loop
 

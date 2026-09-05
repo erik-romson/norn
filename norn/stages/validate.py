@@ -1,20 +1,33 @@
 from __future__ import annotations
 
 import json
-import pathlib
 from abc import ABC, abstractmethod
 from typing import Any
 
 from norn.models import PipelineContext, StageResult
+from norn.runner import resolve_run_path
 from norn.stages.base import BaseStage
 
 
 class Check(ABC):
-    """Abstract base for a single validation check."""
+    """Abstract base for a single validation check.
+
+    Implementations must resolve paths through ``resolve_run_path(ctx, self.path)``
+    and must not touch ``pathlib.Path`` directly.  This is the worktree-isolation
+    contract: relative paths resolve under ``ctx.working_dir`` when set, falling
+    back to process cwd otherwise; absolute paths pass through unchanged.
+    """
 
     @abstractmethod
-    def run(self) -> list[str]:
-        """Return a list of error strings. Empty list means the check passed."""
+    def run(self, ctx: PipelineContext) -> list[str]:
+        """Return a list of error strings. Empty list means the check passed.
+
+        Args:
+            ctx: Pipeline context providing the working directory for path resolution.
+
+        Returns:
+            A list of human-readable error strings; empty means the check passed.
+        """
         ...
 
 
@@ -24,8 +37,8 @@ class FileExists(Check):
     def __init__(self, path: str) -> None:
         self.path = path
 
-    def run(self) -> list[str]:
-        if not pathlib.Path(self.path).exists():
+    def run(self, ctx: PipelineContext) -> list[str]:
+        if not resolve_run_path(ctx, self.path).exists():
             return [f"File not found: {self.path}"]
         return []
 
@@ -37,9 +50,10 @@ class Contains(Check):
         self.path = path
         self.patterns = patterns
 
-    def run(self) -> list[str]:
+    def run(self, ctx: PipelineContext) -> list[str]:
+        resolved = resolve_run_path(ctx, self.path)
         try:
-            content = pathlib.Path(self.path).read_text()
+            content = resolved.read_text()
         except OSError as e:
             return [f"Cannot read {self.path}: {e}"]
         return [
@@ -60,9 +74,10 @@ class JsonSchema(Check):
         self.path = path
         self.schema = schema
 
-    def run(self) -> list[str]:
+    def run(self, ctx: PipelineContext) -> list[str]:
+        resolved = resolve_run_path(ctx, self.path)
         try:
-            content = pathlib.Path(self.path).read_text()
+            content = resolved.read_text()
         except OSError as e:
             return [f"Cannot read {self.path}: {e}"]
         try:
@@ -120,7 +135,7 @@ class Validate(BaseStage):
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         errors: list[str] = []
         for check in self.checks:
-            errors.extend(check.run())
+            errors.extend(check.run(ctx))
         if errors:
             return StageResult(name="", success=False, output=errors, error="\n".join(errors))
         return StageResult(name="", success=True, output=[])

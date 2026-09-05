@@ -556,7 +556,7 @@ async def test_mock_stage_original_impl_via_patch():
     from norn.loader import load_pipeline
     from norn.testing import patch_stages
 
-    pipeline = load_pipeline("examples/hello.py")
+    pipeline = load_pipeline("norn/pipelines/hello.py")
     gen_mock = MockStage().returns("code").as_agent()
     patch_stages(pipeline, {"generate": gen_mock})
 
@@ -593,7 +593,7 @@ async def test_pipeline_test_runner_inline():
 @pytest.mark.asyncio
 async def test_pipeline_test_runner_with_config():
     result = await (
-        PipelineTestRunner("examples/hello.py")
+        PipelineTestRunner("norn/pipelines/hello.py")
         .patch("read_spec", MockStage().returns("spec text"))
         .patch("generate", MockStage().returns("code").as_agent())
         .patch("generate_test", MockStage().returns("test code").as_agent())

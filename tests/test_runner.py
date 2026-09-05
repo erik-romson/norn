@@ -253,6 +253,53 @@ async def test_on_failure_hook_fires_when_stage_fails():
 
 
 @pytest.mark.asyncio
+async def test_ask_user_retry_reruns_failed_stage():
+    """on_failure=ASK_USER with choice 'r' re-runs the stage; once it passes
+    the pipeline proceeds normally."""
+    flaky = FailThenSucceedStage(fail_count=1)
+    p = Pipeline("test").stage("s1", flaky, on_failure=OnFailure.ASK_USER)
+
+    # First failure → 'r' (retry). The retry succeeds, so no second prompt.
+    with mock.patch("norn.ui.ask_user_continue", return_value="r") as ask:
+        ctx = await run_pipeline(p)
+
+    assert flaky._calls == 2  # ran twice: initial fail + retry
+    assert ask.call_count == 1
+    assert ctx.results["s1"].success is True
+
+
+@pytest.mark.asyncio
+async def test_ask_user_retry_then_continue_stops_retrying():
+    """A persistently failing stage: 'r' retries, then 'c' continues past it
+    without aborting the run."""
+    p = Pipeline("test").stage("s1", FailStage(), on_failure=OnFailure.ASK_USER)
+
+    # Retry once, then give up and continue.
+    with mock.patch("norn.ui.ask_user_continue", side_effect=["r", "c"]) as ask:
+        await run_pipeline(p)  # must not raise
+
+    assert ask.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_loop_exhaust_ask_user_retry_reruns_loop():
+    """on_exhaust=ASK_USER with 'r' runs the whole loop again; the second
+    round succeeds so the run completes."""
+    # Fails the first 2 attempts (round 1 exhausts at max_retries=2), then
+    # succeeds on the 3rd call (round 2, first attempt).
+    flaky = FailThenSucceedStage(fail_count=2)
+    p = Pipeline("test").loop(
+        "lp", max_retries=2, on_exhaust=OnFailure.ASK_USER, stages=[Stage("s1", flaky)]
+    )
+
+    with mock.patch("norn.ui.ask_user_continue", return_value="r") as ask:
+        await run_pipeline(p)  # must not raise
+
+    assert ask.call_count == 1  # one exhaustion prompt, then the rerun passes
+    assert flaky._calls == 3
+
+
+@pytest.mark.asyncio
 async def test_post_stage_hook_does_not_fire_on_failure():
     """post_stage must NOT fire when a stage fails."""
     post_called: list[bool] = []

@@ -1,0 +1,181 @@
+{
+  "key": "CBS-2249",
+  "fields": {
+    "summary": "Fix login bug",
+    "status": {"name": "In Progress"},
+    "issuetype": {"name": "Bug"},
+    "priority": {"name": "High"},
+    "assignee": {"displayName": "John Doe"},
+    "reporter": {"displayName": "Jane Smith"},
+    "created": "2024-01-01T00:00:00.000+0000",
+    "updated": "2024-01-02T00:00:00.000+0000",
+    "resolution": null,
+    "labels": ["backend", "auth"],
+    "components": [{"name": "Auth"}, {"name": "API"}],
+    "parent": {
+      "key": "CBS-2000",
+      "fields": {"summary": "Authentication epic"}
+    },
+    "description": {
+      "type": "doc",
+      "version": 1,
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [{"type": "text", "text": "A paragraph."}]
+        },
+        {
+          "type": "heading",
+          "attrs": {"level": 2},
+          "content": [{"type": "text", "text": "A Heading"}]
+        },
+        {
+          "type": "bulletList",
+          "content": [
+            {
+              "type": "listItem",
+              "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Item 1"}]}
+              ]
+            },
+            {
+              "type": "listItem",
+              "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Item 2"}]}
+              ]
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "content": [
+            {
+              "type": "tableRow",
+              "content": [
+                {
+                  "type": "tableHeader",
+                  "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Col1"}]}]
+                },
+                {
+                  "type": "tableHeader",
+                  "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Col2"}]}]
+                }
+              ]
+            },
+            {
+              "type": "tableRow",
+              "content": [
+                {
+                  "type": "tableCell",
+                  "content": [{"type": "paragraph", "content": [{"type": "text", "text": "A"}]}]
+                },
+                {
+                  "type": "tableCell",
+                  "content": [{"type": "paragraph", "content": [{"type": "text", "text": "B"}]}]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "codeBlock",
+          "attrs": {"language": "python"},
+          "content": [{"type": "text", "text": "print('hello')"}]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {"type": "mention", "attrs": {"id": "user1", "displayName": "Alice"}},
+            {"type": "text", "text": " said hi"}
+          ]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {"type": "media", "attrs": {"id": "img001", "type": "file", "alt": "screenshot"}}
+          ]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {"type": "text", "text": "Before"},
+            {"type": "hardBreak"},
+            {"type": "text", "text": "After"}
+          ]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {"type": "inlineCard", "attrs": {"url": "https://example.com/issue"}}
+          ]
+        }
+      ]
+    },
+    "comment": {
+      "comments": [
+        {
+          "id": "com001",
+          "author": {"displayName": "Bob"},
+          "created": "2024-01-01T10:00:00.000+0000",
+          "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+              {"type": "paragraph", "content": [{"type": "text", "text": "First comment."}]}
+            ]
+          }
+        },
+        {
+          "id": "com002",
+          "author": {"displayName": "Carol"},
+          "created": "2024-01-01T11:00:00.000+0000",
+          "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+              {"type": "paragraph", "content": [{"type": "text", "text": "Second comment."}]}
+            ]
+          }
+        }
+      ],
+      "total": 2
+    },
+    "attachment": [
+      {
+        "id": "att001",
+        "filename": "screenshot.png",
+        "mimeType": "image/png",
+        "size": 12345,
+        "content": "https://example.invalid/attachments/att001/screenshot.png"
+      },
+      {
+        "id": "att002",
+        "filename": "debug.log",
+        "mimeType": "text/plain",
+        "size": 678,
+        "content": "https://example.invalid/attachments/att002/debug.log"
+      }
+    ],
+    "issuelinks": [
+      {
+        "id": "link001",
+        "type": {
+          "name": "Blocks",
+          "inward": "is blocked by",
+          "outward": "blocks"
+        },
+        "outwardIssue": {
+          "key": "CBS-2300",
+          "fields": {"summary": "Downstream issue", "status": {"name": "Open"}}
+        }
+      }
+    ],
+    "subtasks": [
+      {
+        "id": "sub001",
+        "key": "CBS-2249-1",
+        "fields": {"summary": "Write tests", "status": {"name": "To Do"}}
+      }
+    ]
+  }
+}

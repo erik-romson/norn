@@ -20,6 +20,12 @@ class BaseStage(ABC):
         needs_agent: When ``True`` the runner passes extra kwargs
             (``session_id``, ``attempt``, ``fork_session``, ``mcp_servers``)
             so the stage can manage Claude SDK sessions.
+        emits_events: When ``True`` the runner passes ``node_id`` and
+            ``attempt`` so the stage can emit its own run-events (e.g.
+            ``CommandOutput``) keyed to the same graph node as the
+            ``StageStarted``/``StageFinished`` events the runner emits around
+            it.  Agent stages get ``node_id`` via the agent kwargs instead, so
+            this flag is only for non-agent stages.
         mcp_tools: List of ``SdkMcpTool`` instances (created with the
             ``@tool`` decorator) that should be available to the agent
             during this stage. The runner creates an MCP server from these
@@ -27,6 +33,7 @@ class BaseStage(ABC):
     """
 
     needs_agent: bool = False
+    emits_events: bool = False
     mcp_tools: list[Any] = []
 
     @abstractmethod

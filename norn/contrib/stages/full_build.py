@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 class FullBuild(BaseStage):
     needs_agent = False
+    # Delegates to RunCommand and forwards **kwargs, so opting in here is
+    # what makes the build/test output stream to the transcript.
+    emits_events = True
 
     def __init__(
         self,

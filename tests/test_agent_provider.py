@@ -72,8 +72,8 @@ def test_cli_parses_agent_provider_flag(tmp_path, monkeypatch):
     run_parser.add_argument("--arg", action="append", default=[])
     run_parser.add_argument("--dry-run", action="store_true")
 
-    args = parser.parse_args(["run", "examples/hello.py", "--agent-provider", "opencode"])
-    assert args.config == "examples/hello.py"
+    args = parser.parse_args(["run", "examples/derived.py", "--agent-provider", "opencode"])
+    assert args.config == "examples/derived.py"
     assert args.agent_provider == "opencode"
 
 
@@ -87,7 +87,7 @@ def test_cli_agent_provider_defaults_to_none(tmp_path):
     run_parser.add_argument("config")
     run_parser.add_argument("--agent-provider", default=None)
 
-    args = parser.parse_args(["run", "examples/hello.py"])
+    args = parser.parse_args(["run", "examples/derived.py"])
     assert args.agent_provider is None
 
 

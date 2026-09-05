@@ -94,6 +94,9 @@ async def resolve_credential(spec: CredentialSpec) -> str | None:
 
 async def _keychain_get(service: str) -> str | None:
     """Look up a password in the macOS Keychain by service name."""
+    import sys
+    if sys.platform != "darwin":
+        return None
     proc = await asyncio.create_subprocess_exec(
         "security",
         "find-generic-password",

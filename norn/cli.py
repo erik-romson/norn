@@ -19,42 +19,18 @@ from norn.loader import (
     load_org_config,
     load_pipeline as _load_pipeline_from_file,
 )
+from norn.responder import NonInteractiveResponder
 from norn.runner import PipelineError, run_pipeline
+from norn.state import (
+    _load_checkpoint_for_config,
+    _load_history_for_config,
+    _primary_state_key,
+    _state_key_candidates,
+)
 
 log = logging.getLogger(__name__)
 
 _ISSUE_KEY_RE = re.compile(r"^[A-Z]+-\d+$")
-
-
-def _state_key_candidates(config_arg: str, *, cwd: Path | None = None) -> list[str]:
-    """Return preferred state-key paths for history/checkpoint files.
-
-    External pipeline files that live outside the current working directory use
-    a cwd-local state key first, with the legacy config-adjacent location as a
-    fallback for reads.
-    """
-    cwd_path = (cwd or Path.cwd()).resolve()
-    raw = Path(config_arg)
-    if raw.suffix == ".py" and raw.exists():
-        resolved = raw.resolve()
-        if resolved.is_relative_to(cwd_path):
-            return [str(resolved)]
-        return [str((cwd_path / resolved.name).resolve()), str(resolved)]
-    return [config_arg]
-
-
-def _primary_state_key(config_arg: str, *, cwd: Path | None = None) -> str:
-    """Return the preferred state key for new checkpoint/history writes."""
-    return _state_key_candidates(config_arg, cwd=cwd)[0]
-
-
-def _load_checkpoint_for_config(config_arg: str, *, cwd: Path | None = None) -> Checkpoint | None:
-    """Load a checkpoint using primary state resolution with legacy fallback."""
-    for candidate in _state_key_candidates(config_arg, cwd=cwd):
-        checkpoint = load_checkpoint(candidate)
-        if checkpoint is not None:
-            return checkpoint
-    return None
 
 
 def _assert_provider_compatible(
@@ -78,15 +54,6 @@ def _assert_provider_compatible(
             file=sys.stderr,
         )
         sys.exit(1)
-
-
-def _load_history_for_config(config_arg: str, *, cwd: Path | None = None) -> list:
-    """Load history using primary state resolution with legacy fallback."""
-    for candidate in _state_key_candidates(config_arg, cwd=cwd):
-        records = load_history(candidate)
-        if records:
-            return records
-    return load_history(_primary_state_key(config_arg, cwd=cwd))
 
 
 
@@ -126,6 +93,35 @@ def _load_pipeline(config_path: str) -> Pipeline:
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# `norn ui` — single unified launcher app (Launcher → Args → Run screens)
+# ---------------------------------------------------------------------------
+
+
+def _run_ui(pipeline_arg: str | None) -> None:
+    """Entry point for the ``ui`` subcommand.
+
+    Runs one :class:`~norn.tui.app.NornUIApp` that manages the launcher, the
+    args prompt, and the live run as a stack of screens — so transitions are
+    seamless and Back returns to the launcher without tearing down the
+    terminal. With a pipeline argument it runs that pipeline directly.
+
+    Textual is a required dependency; imported lazily here so that other
+    subcommands don't load it, but never guarded — a missing install fails
+    hard with the raw ImportError rather than a degraded path.
+    """
+    from norn.tui.app import NornUIApp
+
+    from norn.catalog import list_discovered_pipelines
+
+    app = NornUIApp(
+        bundled=list_pipelines(),
+        discovered=list_discovered_pipelines(),
+        initial_pipeline=pipeline_arg,
+    )
+    app.run()
 
 
 def main() -> None:
@@ -184,6 +180,11 @@ def main() -> None:
         metavar="PROVIDER",
         help="Agent provider to use (e.g. claude-code, opencode). Overrides NORN_AGENT_PROVIDER and pipeline setting.",
     )
+    run_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="abort on every prompt; for child processes",
+    )
 
     history_parser = sub.add_parser("history", help="Show run history for a pipeline config")
     history_parser.add_argument("config", help="Path to the pipeline config .py file")
@@ -216,6 +217,14 @@ def main() -> None:
         "--mermaid",
         action="store_true",
         help="Output raw Mermaid syntax instead of Markdown",
+    )
+
+    ui_parser = sub.add_parser("ui", help="Launch the Textual TUI for a pipeline run")
+    ui_parser.add_argument(
+        "pipeline",
+        nargs="?",
+        default=None,
+        help="Path to pipeline config .py file or bundled pipeline name (optional)",
     )
 
     args, remaining = parser.parse_known_args()
@@ -322,9 +331,16 @@ def main() -> None:
             print(to_markdown(pipeline, config_path))
         return
 
+    if args.command == "ui":
+        _run_ui(args.pipeline)
+        return
+
     if args.command != "run":
         parser.print_help()
         sys.exit(1)
+
+    if args.step and args.non_interactive:
+        parser.error("--step and --non-interactive are mutually exclusive")
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(message)s")
@@ -392,6 +408,8 @@ def main() -> None:
 
     alert_manager = AlertManager(channels=pipeline.alert_channels) if pipeline.alert_channels else None
 
+    input_responder = NonInteractiveResponder() if args.non_interactive else None
+
     try:
         asyncio.run(run_pipeline(
             pipeline,
@@ -402,6 +420,7 @@ def main() -> None:
             alert_manager=alert_manager,
             step_mode=args.step,
             agent_provider=resolved_provider,
+            input_responder=input_responder,
         ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
     except PipelineError as e:

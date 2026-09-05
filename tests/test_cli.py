@@ -1,8 +1,9 @@
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from norn.cli import _assert_provider_compatible, _expand_file_refs, _primary_state_key, _state_key_candidates, main
+from norn.responder import NonInteractiveResponder
 from norn.checkpoint import Checkpoint, save_checkpoint
 from norn.history import RunRecord, StageHistoryEntry, append_run
 from norn.models import StageLogEntry
@@ -241,6 +242,30 @@ def test_assert_provider_compatible_passes_on_match():
     )
     # Must not raise
     _assert_provider_compatible("claude-code", cp, "resume")
+
+
+# --- --non-interactive flag ---
+
+
+def test_non_interactive_passes_responder_to_run_pipeline():
+    """--non-interactive wires a NonInteractiveResponder into run_pipeline."""
+    mock_run = AsyncMock(return_value=None)
+    with patch("norn.cli.run_pipeline", mock_run):
+        with patch("sys.argv", ["norn", "run", "hello", "--non-interactive"]):
+            main()
+
+    assert mock_run.called
+    call_kwargs = mock_run.call_args.kwargs
+    assert "input_responder" in call_kwargs
+    assert isinstance(call_kwargs["input_responder"], NonInteractiveResponder)
+
+
+def test_step_and_non_interactive_are_mutually_exclusive():
+    """--step --non-interactive must exit non-zero."""
+    with patch("sys.argv", ["norn", "run", "hello", "--step", "--non-interactive"]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code != 0
 
 
 def test_resume_fails_with_mismatched_provider(tmp_path):

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-import pathlib
 import re
 import time
 from typing import TYPE_CHECKING, Any
 
 from norn import ui
 from norn.models import PipelineContext, StageResult, UsageRecord
+from norn.runner import resolve_run_path
 from norn.secrets import resolve_env
 from norn.stages.base import BaseStage
 from norn.templates import PromptTemplate, load_template
@@ -216,11 +216,20 @@ class Generate(BaseStage):
         mcp_servers: dict | None = kwargs.get("mcp_servers")
         mcp_tools: list | None = kwargs.get("mcp_tools")
         stage_name: str = kwargs.get("stage_name", "claude")
+        # node_id is the fully-qualified graph node id produced by _run_stage
+        # and passed via agent_kwargs. It matches the id used for StageStarted/
+        # StageFinished so the TUI can attribute CallingAgent/TurnEvent/GotReply
+        # to the correct node.  The f"stage:{stage_name}" fallback is a
+        # test-only path for Generate.run() called directly without a runner.
+        node_id: str = kwargs.get("node_id", f"stage:{stage_name}")
+
+        # One effective working dir: explicit stage cwd wins, falls back to run working_dir.
+        effective_cwd = self.cwd or ctx.working_dir
 
         # Resolve prompt: either from a named template or directly from self.prompt
         tmpl: PromptTemplate | None = None
         if self.template:
-            tmpl = load_template(self.template)
+            tmpl = load_template(self.template, base_dir=effective_cwd)
             resolved_input = self._resolve(self.input, ctx) if self.input else ""
             resolved_prompt = tmpl.template.format(input=resolved_input)
         else:
@@ -265,7 +274,7 @@ class Generate(BaseStage):
         if resolved_setting_sources and "project" in resolved_setting_sources:
             from norn.agents.guidance import resolve_project_guidance
 
-            guidance_text = resolve_project_guidance(cwd=self.cwd)
+            guidance_text = resolve_project_guidance(cwd=effective_cwd)
             if guidance_text:
                 system_prompt_parts.append(guidance_text)
                 log.debug("[generate] Injected portable project guidance into system_prompt")
@@ -274,14 +283,20 @@ class Generate(BaseStage):
             if not resolved_setting_sources:
                 resolved_setting_sources = None
 
-        # Fail fast: non-portable features are not allowed for non-claude-code providers.
-        # SDK hooks (including those compiled from blocked_patterns via profile) are
-        # Claude Code-only.  MCP tools and non-project setting_sources are also
-        # provider-specific.  Return a clear StageResult so callers don't receive a
-        # raw exception and the error message includes the provider, feature, stage
-        # name, and a hint.
-        if ctx.agent_provider != "claude-code":
-            if effective_hooks:
+        # Fetch the provider early so we can inspect its capability descriptor.
+        # This call is intentionally outside the try/except below: an unknown
+        # provider name is a configuration error that should fail loudly.
+        from norn.agents.registry import get_provider
+
+        provider = get_provider(ctx.agent_provider)
+
+        # Fail fast: gate non-portable features against the provider's declared
+        # capabilities rather than hard-coding provider names.  Providers that
+        # have no capabilities attribute (e.g. lightweight test stubs) skip the
+        # check so that unit tests are not forced to declare full descriptors.
+        _caps = getattr(provider, "capabilities", None)
+        if _caps is not None:
+            if effective_hooks and not _caps.supports_hooks:
                 return StageResult(
                     name="",
                     success=False,
@@ -292,7 +307,7 @@ class Generate(BaseStage):
                         f"from this stage."
                     ),
                 )
-            if mcp_tools:
+            if mcp_tools and not _caps.supports_mcp:
                 return StageResult(
                     name="",
                     success=False,
@@ -302,7 +317,7 @@ class Generate(BaseStage):
                         f"feature. Use provider 'claude-code' for MCP tool features."
                     ),
                 )
-            if resolved_setting_sources:
+            if resolved_setting_sources and not _caps.supports_setting_sources:
                 unsupported = ", ".join(repr(s) for s in resolved_setting_sources)
                 return StageResult(
                     name="",
@@ -359,7 +374,7 @@ class Generate(BaseStage):
             allowed_tools=effective_allowed_tools,
             permission_mode=effective_permission_mode,
             max_turns=effective_max_turns,
-            cwd=self.cwd,
+            cwd=effective_cwd,
             env=merged_env,
             system_prompt=system_prompt,
             output_format=output_format,
@@ -373,24 +388,46 @@ class Generate(BaseStage):
             permissions=permissions,
         )
 
-        # Run via the registered provider for this pipeline run
-        from norn.agents.registry import get_provider
-
-        provider = get_provider(ctx.agent_provider)
-
+        # Run via the registered provider (already fetched above for capability gating)
         chunks: list[str] = []
         artifacts: list[str] = []
         structured_output: Any = None
         usage_record = UsageRecord(stage_name="", attempt=attempt, model=resolved_model)
 
         try:
-            ui.print_calling_agent(stage_name, ctx.agent_provider, resolved_model)
             _query_start = time.monotonic()
+            _turn_seq = 0
+            _stage_id = node_id
+
+            from norn.events import CallingAgent, EventKey, GotReply, TurnEvent
+
+            ctx.event_sink.emit(CallingAgent(
+                key=EventKey(
+                    run_id=ctx.run_id,
+                    unit_id=ctx.unit_id,
+                    stage_id=_stage_id,
+                    attempt=attempt,
+                ),
+                stage_name=stage_name,
+                provider=ctx.agent_provider,
+                model=resolved_model,
+            ))
 
             async for event in provider.run(request):
+                _turn_seq += 1
+                ctx.event_sink.emit(TurnEvent(
+                    key=EventKey(
+                        run_id=ctx.run_id,
+                        unit_id=ctx.unit_id,
+                        stage_id=_stage_id,
+                        attempt=attempt,
+                        seq=_turn_seq,
+                    ),
+                    event=event,
+                ))
+
                 if event.text is not None:
                     chunks.append(event.text)
-                    print(ui.mask(event.text), end="", flush=True)
 
                 if event.session_id is not None:
                     if not usage_record.session_id:
@@ -427,10 +464,16 @@ class Generate(BaseStage):
                     if event.artifact not in artifacts:
                         artifacts.append(event.artifact)
 
-            if chunks:
-                print()  # end the streamed output line
-
-            ui.print_got_reply(stage_name, time.monotonic() - _query_start)
+            ctx.event_sink.emit(GotReply(
+                key=EventKey(
+                    run_id=ctx.run_id,
+                    unit_id=ctx.unit_id,
+                    stage_id=_stage_id,
+                    attempt=attempt,
+                ),
+                stage_name=stage_name,
+                elapsed_s=time.monotonic() - _query_start,
+            ))
 
             raw_output = "".join(chunks)
 
@@ -452,7 +495,7 @@ class Generate(BaseStage):
             )
             if self.output_file and not agent_has_file_tools:
                 code = self._extract_code(raw_output)
-                out_path = pathlib.Path(self.output_file)
+                out_path = resolve_run_path(ctx, self.output_file)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(code)
                 return StageResult(name="", success=True, output=code, usage=usage_record, artifacts=artifacts)

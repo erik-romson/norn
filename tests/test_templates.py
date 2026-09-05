@@ -139,6 +139,7 @@ async def test_template_system_prompt_passed_to_options(tmp_path, monkeypatch):
 
         sdk_mod.query = fake_query
         sdk_mod.AssistantMessage = type("AssistantMessage", (), {})
+        sdk_mod.UserMessage = type("UserMessage", (), {})
         sdk_mod.ResultMessage = type("ResultMessage", (), {})
         sdk_mod.ClaudeAgentOptions = fake_options_cls
         sdk_mod.HookMatcher = lambda *, hooks: object()
@@ -182,6 +183,7 @@ async def test_template_output_format_passed_to_options(tmp_path, monkeypatch):
 
         sdk_mod.query = fake_query
         sdk_mod.AssistantMessage = type("AssistantMessage", (), {})
+        sdk_mod.UserMessage = type("UserMessage", (), {})
         sdk_mod.ResultMessage = type("ResultMessage", (), {})
         sdk_mod.ClaudeAgentOptions = fake_options_cls
         sdk_mod.HookMatcher = lambda *, hooks: object()
@@ -220,6 +222,7 @@ async def test_template_prompt_built_from_input(tmp_path, monkeypatch):
 
         sdk_mod.query = fake_query
         sdk_mod.AssistantMessage = type("AssistantMessage", (), {})
+        sdk_mod.UserMessage = type("UserMessage", (), {})
         sdk_mod.ResultMessage = type("ResultMessage", (), {})
         sdk_mod.ClaudeAgentOptions = fake_options_cls
         sdk_mod.HookMatcher = lambda *, hooks: object()
@@ -284,6 +287,7 @@ async def test_template_structured_output_used_as_stage_output(tmp_path, monkeyp
 
         sdk_mod.query = fake_query2
         sdk_mod.AssistantMessage = type("AssistantMessage", (), {})
+        sdk_mod.UserMessage = type("UserMessage", (), {})
         sdk_mod.ResultMessage = ResultMessage
         sdk_mod.ClaudeAgentOptions = lambda **kw: kw
         sdk_mod.HookMatcher = lambda *, hooks: object()

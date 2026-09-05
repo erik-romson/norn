@@ -121,8 +121,9 @@ def _make_jira_mock(
         comment_mocks.append(m)
 
     att_mocks = []
-    for fname in (attachment_filenames or []):
+    for i, fname in enumerate(attachment_filenames or []):
         m = MagicMock()
+        m.id = str(10000 + i)
         m.filename = fname
         m.get.return_value = b"binary content"
         att_mocks.append(m)
@@ -250,7 +251,8 @@ async def test_jira_source_downloads_attachments(tmp_path):
         result = await source.fetch("PROJ-1")
 
     assert len(result.attachments) == 1
-    assert result.attachments[0].name == "report.txt"
+    # On-disk filename is prefixed with the attachment id to avoid collisions.
+    assert result.attachments[0].name == "10000_report.txt"
     assert result.attachments[0].read_bytes() == b"binary content"
 
 
