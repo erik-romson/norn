@@ -3,23 +3,23 @@ given GitHub Actions run URL.
 
 Reuses the production extractor (``_summarize_log``) and log-fetch helper
 (``_get_failed_logs``) from ``norn.stages.check_ci``, so what you see here
-is byte-identical to what ``check_and_fix_ci.py`` would hand to Claude.
+is byte-identical to what the ``check_and_fix_ci`` pipeline would hand to Claude.
 
 Usage::
 
-    # Exact text the fix step sees in check_and_fix_ci.py (recommended):
-    uv run python dogfooding/show_ci_data.py <run-url> --pipeline
+    # Exact text the fix step sees in check_and_fix_ci (recommended):
+    uv run python bin/show_ci_data.py <run-url> --pipeline
 
     # Building blocks of that pipeline, individually:
-    uv run python dogfooding/show_ci_data.py <run-url> --extract-step
-    uv run python dogfooding/show_ci_data.py <run-url> --extract-step --no-haiku
+    uv run python bin/show_ci_data.py <run-url> --extract-step
+    uv run python bin/show_ci_data.py <run-url> --extract-step --no-haiku
 
     # Other modes:
-    uv run python dogfooding/show_ci_data.py <run-url>                # generic anchor extractor
-    uv run python dogfooding/show_ci_data.py <run-url> --raw          # untouched concatenated logs
-    uv run python dogfooding/show_ci_data.py <run-url> --json         # CheckCI dict as JSON
-    uv run python dogfooding/show_ci_data.py <run-url> --surefire     # Maven/Surefire extractor
-    uv run python dogfooding/show_ci_data.py <run-url> --surefire --no-haiku
+    uv run python bin/show_ci_data.py <run-url>                # generic anchor extractor
+    uv run python bin/show_ci_data.py <run-url> --raw          # untouched concatenated logs
+    uv run python bin/show_ci_data.py <run-url> --json         # CheckCI dict as JSON
+    uv run python bin/show_ci_data.py <run-url> --surefire     # Maven/Surefire extractor
+    uv run python bin/show_ci_data.py <run-url> --surefire --no-haiku
 
 Accepted URL forms (anything containing ``/actions/runs/<id>``):
   - https://github.com/owner/repo/actions/runs/123456789
@@ -159,7 +159,7 @@ async def _amain(argv: list[str]) -> int:
     parser.add_argument(
         "--pipeline", action="store_true",
         help=(
-            "reproduce the check_and_fix_ci.py chain: ExtractFailingStep "
+            "reproduce the check_and_fix_ci chain: ExtractFailingStep "
             "(python slice → Haiku). This is exactly what the fix prompt "
             "sees as {isolate failing step.output}."
         ),

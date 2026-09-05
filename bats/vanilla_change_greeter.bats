@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 
-# End-to-end test for the vanilla_change dogfooding pipeline.
+# End-to-end test for the bundled vanilla_change pipeline.
 # Uses the pipeline to generate a Greeter class from the spec, same goal as hello.py
 # but driven via the vanilla_change pipeline with a positional argument.
 #
@@ -39,7 +39,7 @@ teardown() {
 }
 
 @test "vanilla_change pipeline generates greeter from spec" {
-    run uv run python -m norn run dogfooding/vanilla_change.py -v \
+    run uv run python -m norn run vanilla_change -v \
         --skip "test bats" \
         "Create a Python class based on this spec: @examples/spec.txt Place it in tmp/hello/src/greeter.py, then create a pytest test for it in tmp/hello/tests/test_greeter.py. The test should verify the greet() method returns the expected string."
     assert_success

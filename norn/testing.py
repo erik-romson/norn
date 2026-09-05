@@ -12,7 +12,7 @@ Usage::
     cmd = mock_run_command(fail_count=2, stderr="test failed")
 
     ctx = await run_test(
-        "dogfooding/vanilla_change.py",
+        "norn/pipelines/vanilla_change.py",
         patches={"implement": gen, "test python": cmd},
         params={"args": "add feature X"},
     )
@@ -674,7 +674,7 @@ def patch_stages(pipeline: Pipeline, patches: dict[str, BaseStage]) -> Pipeline:
 
         from norn.testing import mock_generate, mock_run_command, patch_stages
 
-        pipeline = load_pipeline("dogfooding/vanilla_change.py")
+        pipeline = load_pipeline("norn/pipelines/vanilla_change.py")
         patch_stages(pipeline, {
             "implement": mock_generate(output="code"),
             "test python": mock_run_command(),
@@ -708,7 +708,7 @@ async def run_test(
     Example::
 
         ctx = await run_test(
-            "dogfooding/vanilla_change.py",
+            "norn/pipelines/vanilla_change.py",
             patches={
                 "implement": mock_generate(output="code"),
                 "fix": mock_generate(output="fixed"),

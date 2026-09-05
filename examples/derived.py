@@ -1,6 +1,6 @@
 """Example: config composition via Pipeline.derive().
 
-Derives a leaner pipeline from the hello example by:
+Derives a leaner pipeline from the bundled `hello` pipeline by:
 - skipping the slow pytest stage inside the loop
 - inserting a fast syntax-only check after the compile step
 - replacing the top-level read_spec stage with a different file path
@@ -9,7 +9,7 @@ from norn.dsl import Pipeline, Stage, fail
 from norn.stages.read_file import ReadFile
 from norn.stages.run_command import RunCommand
 
-from examples.hello import config as base
+from norn.pipelines.hello import config as base
 
 config = (
     base.derive("hello-fast")

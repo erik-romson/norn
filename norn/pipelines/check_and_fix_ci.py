@@ -1,11 +1,11 @@
-"""Dogfooding pipeline: push the current branch, wait for CI, and auto-fix
+"""Push the current branch, wait for CI, and auto-fix
 failures by feeding GitHub Actions logs back to Claude.
 
 Adapted from ``egnedata/egnedata-kmp/tmp/check.py`` and trimmed for the
 norn repo:
 
   * No plan-step loop — operates on whatever is already committed on the
-    current branch. Use ``dogfooding/implement_features.py`` if you need
+    current branch. Use the ``implement_features`` pipeline if you need
     plan-driven step implementation; this pipeline is for the
     "I have commits, make CI green" use case.
   * Single workflow gate (``ci.yml``) — override with ``--arg workflow=...``.
@@ -16,10 +16,10 @@ norn repo:
 
 Run with::
 
-    bin/norn dogfooding/check_and_fix_ci.py
-    bin/norn dogfooding/check_and_fix_ci.py --arg workflow=ci.yml
-    bin/norn dogfooding/check_and_fix_ci.py --arg test_cmd="uv run python -m pytest tests/test_runner.py -v"
-    bin/norn dogfooding/check_and_fix_ci.py --arg skip_local=true
+    norn run check_and_fix_ci
+    norn run check_and_fix_ci --arg workflow=ci.yml
+    norn run check_and_fix_ci --arg test_cmd="uv run python -m pytest tests/test_runner.py -v"
+    norn run check_and_fix_ci --arg skip_local=true
 
 Set ``FIX_CI_LOOP_VERBOSE=1`` to dump full extracted CI logs to stderr.
 """
@@ -68,6 +68,11 @@ from norn.stages.generate import Generate
 from norn.stages.run_command import RunCommand
 
 
+# Pinned to the launch directory at import time. This pipeline operates on the
+# repo it was launched from: its RunCommand stages `cd {PROJECT_DIR}` explicitly
+# and its git helpers run against that tree. It is therefore NOT
+# worktree-isolated — running it with the TUI worktree toggle will still
+# execute against the launch directory.
 PROJECT_DIR = os.getcwd()
 
 # Tail bound for local test stdout/stderr handed to the fix prompt — keeps
@@ -494,7 +499,6 @@ if not SKIP_LOCAL:
                     ),
                     allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
                     permission_mode="acceptEdits",
-                    cwd=PROJECT_DIR,
                     setting_sources=["project"],
                 ),
                 when=stage_failed("run local tests"),
@@ -604,7 +608,6 @@ pipeline.loop(
                 ),
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
                 permission_mode="acceptEdits",
-                cwd=PROJECT_DIR,
                 setting_sources=["project"],
             ),
             when=stage_failed("check ci"),

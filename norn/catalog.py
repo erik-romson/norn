@@ -53,10 +53,15 @@ def _extract_metadata(source: str) -> tuple[str, str, list[str], dict[str, str]]
 
 
 def list_pipelines() -> list[PipelineInfo]:
-    """Discover all bundled pipelines via AST parsing (no imports)."""
+    """Discover all bundled pipelines via AST parsing (no imports).
+
+    Modules whose name starts with ``_`` are skipped: ``__init__.py`` and
+    private helpers such as ``_snapshot_diff.py`` are not pipelines and must
+    not show up in ``norn list`` or the TUI launcher.
+    """
     results: list[PipelineInfo] = []
     for path in sorted(_PIPELINES_DIR.glob("*.py")):
-        if path.name == "__init__.py":
+        if path.name.startswith("_"):
             continue
         source = path.read_text()
         short, long, env_vars, args = _extract_metadata(source)

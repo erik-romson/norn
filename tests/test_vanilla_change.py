@@ -1,4 +1,4 @@
-"""Tests for dogfooding/vanilla_change.py pipeline."""
+"""Tests for norn/pipelines/vanilla_change.py pipeline."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ async def test_happy_path_all_tests_pass_first_try():
     test_bats = MockStage().returns({"stdout": "5 tests", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner("dogfooding/vanilla_change.py")
+        PipelineTestRunner("norn/pipelines/vanilla_change.py")
         .patch("implement", implement)
         .patch("fix", fix)
         .patch("test python", test_py)
@@ -57,7 +57,7 @@ async def test_pytest_fails_then_fix_retries():
     test_bats = MockStage().returns({"stdout": "ok", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner("dogfooding/vanilla_change.py")
+        PipelineTestRunner("norn/pipelines/vanilla_change.py")
         .patch("implement", implement)
         .patch("fix", fix)
         .patch("test python", test_py)
@@ -88,7 +88,7 @@ async def test_bats_fails_then_fix_retries():
     )
 
     result = await (
-        PipelineTestRunner("dogfooding/vanilla_change.py")
+        PipelineTestRunner("norn/pipelines/vanilla_change.py")
         .patch("implement", implement)
         .patch("fix", fix)
         .patch("test python", test_py)
@@ -115,7 +115,7 @@ async def test_exhausts_retries_raises():
 
     with pytest.raises(Exception):
         await (
-            PipelineTestRunner("dogfooding/vanilla_change.py")
+            PipelineTestRunner("norn/pipelines/vanilla_change.py")
             .patch("implement", implement)
             .patch("fix", fix)
             .patch("test python", test_py)
@@ -138,7 +138,7 @@ async def test_original_impl_preserved_via_patch():
     test_bats = MockStage().returns({"stdout": "ok", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner("dogfooding/vanilla_change.py")
+        PipelineTestRunner("norn/pipelines/vanilla_change.py")
         .patch("implement", implement)
         .patch("fix", fix)
         .patch("test python", test_py)
@@ -162,7 +162,7 @@ async def test_implement_prompt_contains_param_args():
     test_bats = MockStage().returns({"stdout": "ok", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner("dogfooding/vanilla_change.py")
+        PipelineTestRunner("norn/pipelines/vanilla_change.py")
         .patch("implement", implement)
         .patch("fix", MockStage().returns("fixed").as_agent())
         .patch("test python", test_py)
@@ -187,7 +187,7 @@ async def test_fix_prompt_references_test_outputs():
     test_bats = MockStage().returns({"stdout": "ok", "stderr": "", "returncode": 0})
 
     result = await (
-        PipelineTestRunner("dogfooding/vanilla_change.py")
+        PipelineTestRunner("norn/pipelines/vanilla_change.py")
         .patch("implement", implement)
         .patch("fix", fix)
         .patch("test python", test_py)

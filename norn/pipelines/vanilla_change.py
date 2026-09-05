@@ -1,8 +1,8 @@
-"""Dogfooding pipeline: apply a change to the norn project itself.
+"""Apply a free-text change to the repo you launched from.
 
 Usage:
-    bin/norn dogfooding/vanilla_change.py "Add a --dry-run flag to the CLI"
-    bin/norn dogfooding/vanilla_change.py -v "Rename StageResult.error to message"
+    norn run vanilla_change "Add a --dry-run flag to the CLI"
+    norn run vanilla_change -v "Rename StageResult.error to message"
 
 The pipeline:
 1. Claude implements the change (CLAUDE.md loaded automatically via setting_sources)
