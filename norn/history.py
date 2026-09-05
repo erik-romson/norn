@@ -68,6 +68,21 @@ def history_file(config_path: str) -> Path:
     return Path(config_path).resolve().with_suffix(".history")
 
 
+def _mask_error(error: str | None) -> str | None:
+    """Return *error* with registered secrets replaced, or ``None`` unchanged.
+
+    Imported lazily to avoid a module-level Rich import (same pattern as
+    ``norn/responder.py``).  The mask is applied on **write** so secrets never
+    land on disk and cannot be exposed via ``norn history`` or the TUI detail
+    view.
+    """
+    if error is None:
+        return None
+    from norn import ui  # noqa: PLC0415
+
+    return ui.mask(error)
+
+
 def append_run(config_path: str, record: RunRecord) -> None:
     """Append a RunRecord as a JSON line to the history file beside the config."""
     path = history_file(config_path)
@@ -103,6 +118,9 @@ def append_run(config_path: str, record: RunRecord) -> None:
                 "model": entry.model,
                 "session_id": entry.session_id,
                 "provider": entry.provider,
+                # Mask on write so secrets never land on disk.
+                # load_history reads the masked form back as-is.
+                "error": _mask_error(entry.error),
             }
             for entry in record.stage_log
         ],

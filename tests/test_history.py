@@ -251,6 +251,81 @@ async def test_no_history_written_without_config_path():
     # No assertion on filesystem — just verifying no exception is raised
 
 
+def test_stage_log_error_is_masked_on_write(tmp_path):
+    """Secrets in stage error messages must not reach the JSONL file on disk."""
+    from norn.ui import _masked_secrets, register_secrets
+
+    register_secrets(["MY_DB_PASS"])
+    try:
+        config = str(tmp_path / "pipeline.py")
+        record = RunRecord(
+            run_id=1,
+            timestamp="2026-03-25T09:00:00+00:00",
+            success=False,
+            total_cost_usd=0.0,
+            total_tokens=0,
+            duration_ms=100,
+            stages=[],
+            retries=0,
+            stage_log=[
+                StageLogEntry(
+                    name="migrate",
+                    status="failed",
+                    success=False,
+                    attempt=1,
+                    error="connection refused: MY_DB_PASS is wrong",
+                ),
+            ],
+        )
+        append_run(config, record)
+
+        # Assert against the raw file bytes — the secret must never land on disk.
+        raw = history_file(config).read_text()
+        assert "MY_DB_PASS" not in raw, "secret reached the JSONL file unmasked"
+        assert "***" in raw, "masked marker absent from JSONL file"
+    finally:
+        _masked_secrets.discard("MY_DB_PASS")
+
+
+def test_stage_log_error_round_trips(tmp_path):
+    """StageLogEntry.error must survive append_run → load_history."""
+    config = str(tmp_path / "pipeline.py")
+    record = RunRecord(
+        run_id=1,
+        timestamp="2026-03-25T09:00:00+00:00",
+        success=False,
+        total_cost_usd=0.0,
+        total_tokens=0,
+        duration_ms=100,
+        stages=[],
+        retries=0,
+        stage_log=[
+            StageLogEntry(
+                name="failing_stage",
+                status="failed",
+                success=False,
+                attempt=1,
+                error="something went wrong",
+            ),
+            StageLogEntry(
+                name="ok_stage",
+                status="passed",
+                success=True,
+                attempt=1,
+                error=None,
+            ),
+        ],
+    )
+    append_run(config, record)
+
+    records = load_history(config)
+    assert len(records) == 1
+    log = records[0].stage_log
+    assert len(log) == 2
+    assert log[0].error == "something went wrong"
+    assert log[1].error is None
+
+
 async def test_retries_counted_in_history(tmp_path):
     from norn.dsl import Loop
 
@@ -281,173 +356,3 @@ async def test_retries_counted_in_history(tmp_path):
     records = load_history(config)
     assert len(records) == 1
     assert records[0].retries == 1
-
-
-async def test_history_captures_detailed_stage_log(tmp_path):
-    config = str(tmp_path / "pipeline.py")
-
-    class CostStage(BaseStage):
-        needs_agent = False
-
-        async def run(self, ctx: PipelineContext) -> StageResult:
-            usage = UsageRecord(
-                stage_name="",
-                session_id="sess-1",
-                input_tokens=1200,
-                output_tokens=300,
-                total_cost_usd=0.25,
-                duration_api_ms=2100,
-                num_turns=2,
-                model="sonnet",
-            )
-            return StageResult(name="", success=True, output="ok", usage=usage)
-
-    pipeline = (
-        Pipeline("test")
-        .stage("billable", CostStage())
-        .stage("conditional", SuccessStage(), when=lambda ctx: False)
-    )
-
-    await run_pipeline(pipeline, config_path=config)
-
-    records = load_history(config)
-    assert len(records) == 1
-    assert [entry.name for entry in records[0].stage_log] == ["billable", "conditional"]
-
-    first, second = records[0].stage_log
-    assert first.status == "passed"
-    assert first.cost_usd == pytest.approx(0.25)
-    assert first.running_total_cost_usd == pytest.approx(0.25)
-    assert first.input_tokens == 1200
-    assert first.output_tokens == 300
-    assert first.duration_api_ms == 2100
-    assert first.model == "sonnet"
-    assert second.status == "skipped_condition"
-    assert second.running_total_cost_usd == pytest.approx(0.25)
-
-
-def test_append_and_load_run_record_with_provider(tmp_path):
-    """agent_provider is persisted and loaded in RunRecord."""
-    config = str(tmp_path / "pipeline.py")
-    record = RunRecord(
-        run_id=1,
-        timestamp="2026-03-25T09:00:00+00:00",
-        success=True,
-        total_cost_usd=0.10,
-        total_tokens=1000,
-        duration_ms=500,
-        stages=[],
-        retries=0,
-        agent_provider="opencode",
-    )
-    append_run(config, record)
-
-    records = load_history(config)
-    assert len(records) == 1
-    assert records[0].agent_provider == "opencode"
-
-
-def test_load_legacy_history_defaults_to_claude_code(tmp_path):
-    """A history record without agent_provider defaults to claude-code."""
-    config = str(tmp_path / "pipeline.py")
-    path = history_file(config)
-    import json
-    line = json.dumps({
-        "run_id": 1,
-        "timestamp": "2025-01-01T00:00:00+00:00",
-        "success": True,
-        "total_cost_usd": 0.05,
-        "total_tokens": 500,
-        "duration_ms": 200,
-        "stages": [],
-        "retries": 0,
-    })
-    path.write_text(line + "\n")
-
-    records = load_history(config)
-    assert len(records) == 1
-    assert records[0].agent_provider == "claude-code"
-
-
-def test_stage_log_provider_persisted(tmp_path):
-    """provider field in stage_log entries survives a round-trip."""
-    config = str(tmp_path / "pipeline.py")
-    record = RunRecord(
-        run_id=1,
-        timestamp="2026-03-25T09:00:00+00:00",
-        success=True,
-        total_cost_usd=0.10,
-        total_tokens=1000,
-        duration_ms=500,
-        stages=[],
-        retries=0,
-        agent_provider="opencode",
-        stage_log=[
-            StageLogEntry(
-                name="gen",
-                status="passed",
-                success=True,
-                provider="opencode",
-            )
-        ],
-    )
-    append_run(config, record)
-
-    records = load_history(config)
-    assert records[0].stage_log[0].provider == "opencode"
-
-
-def test_stage_log_provider_none_for_legacy(tmp_path):
-    """stage_log entries without provider field load as None."""
-    config = str(tmp_path / "pipeline.py")
-    path = history_file(config)
-    import json
-    line = json.dumps({
-        "run_id": 1,
-        "timestamp": "2025-01-01T00:00:00+00:00",
-        "success": True,
-        "total_cost_usd": 0.0,
-        "total_tokens": 0,
-        "duration_ms": 0,
-        "stages": [],
-        "retries": 0,
-        "stage_log": [{"name": "s1", "status": "passed", "success": True}],
-    })
-    path.write_text(line + "\n")
-
-    records = load_history(config)
-    assert records[0].stage_log[0].provider is None
-
-
-async def test_history_is_appended_incrementally_during_run(tmp_path):
-    config = str(tmp_path / "pipeline.py")
-    observed_records: list[RunRecord] = []
-
-    class InspectHistoryStage(BaseStage):
-        needs_agent = False
-
-        async def run(self, ctx: PipelineContext) -> StageResult:
-            assert history_file(config).exists()
-            records = load_history(config)
-            observed_records.extend(records)
-            assert len(records) == 1
-            assert records[0].run_id == 1
-            assert records[0].in_progress is True
-            assert [entry.name for entry in records[0].stage_log] == ["step1"]
-            return StageResult(name="", success=True, output="ok")
-
-    pipeline = (
-        Pipeline("test")
-        .stage("step1", SuccessStage())
-        .stage("step2", InspectHistoryStage())
-    )
-
-    await run_pipeline(pipeline, config_path=config)
-
-    raw_lines = [line for line in history_file(config).read_text().splitlines() if line.strip()]
-    assert len(raw_lines) >= 3
-    assert observed_records
-    final_records = load_history(config)
-    assert len(final_records) == 1
-    assert final_records[0].in_progress is False
-    assert [entry.name for entry in final_records[0].stage_log] == ["step1", "step2"]

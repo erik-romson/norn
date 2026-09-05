@@ -7,6 +7,20 @@ if TYPE_CHECKING:
     from norn.profiles import SessionProfile
 
 
+def _default_event_sink() -> Any:
+    """Lazy factory so models.py has no hard dep on event_sink at import time."""
+    from norn.event_sink import NullSink  # noqa: PLC0415
+
+    return NullSink()
+
+
+def _default_input_responder() -> Any:
+    """Lazy factory so models.py has no hard dep on responder at import time."""
+    from norn.responder import CLIResponder  # noqa: PLC0415
+
+    return CLIResponder()
+
+
 @dataclass
 class UsageRecord:
     """Token and cost usage for a single Generate stage invocation.
@@ -205,6 +219,13 @@ class PipelineContext:
     pipeline_skills: list[Any] = field(default_factory=list)
     pipeline_profile: SessionProfile | None = None
     agent_provider: str = "claude-code"
+    event_sink: Any = field(default_factory=_default_event_sink)
+    input_responder: Any = field(default_factory=_default_input_responder)
+    run_id: str = ""
+    unit_id: str = "unit-0"
+    run_controller: Any = None
+    working_dir: str | None = None
+    """Run working directory; relative stage paths resolve under it when set, else process cwd."""
 
     def get(self, stage_name: str) -> Any:
         """Get output from a previous stage."""

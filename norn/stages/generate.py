@@ -216,6 +216,15 @@ class Generate(BaseStage):
         mcp_servers: dict | None = kwargs.get("mcp_servers")
         mcp_tools: list | None = kwargs.get("mcp_tools")
         stage_name: str = kwargs.get("stage_name", "claude")
+        # node_id is the fully-qualified graph node id produced by _run_stage
+        # and passed via agent_kwargs. It matches the id used for StageStarted/
+        # StageFinished so the TUI can attribute CallingAgent/TurnEvent/GotReply
+        # to the correct node.  The f"stage:{stage_name}" fallback is a
+        # test-only path for Generate.run() called directly without a runner.
+        node_id: str = kwargs.get("node_id", f"stage:{stage_name}")
+
+        # One effective working dir: explicit stage cwd wins, falls back to run working_dir.
+        effective_cwd = self.cwd or ctx.working_dir
 
         # Resolve prompt: either from a named template or directly from self.prompt
         tmpl: PromptTemplate | None = None
@@ -386,13 +395,39 @@ class Generate(BaseStage):
         usage_record = UsageRecord(stage_name="", attempt=attempt, model=resolved_model)
 
         try:
-            ui.print_calling_agent(stage_name, ctx.agent_provider, resolved_model)
             _query_start = time.monotonic()
+            _turn_seq = 0
+            _stage_id = node_id
+
+            from norn.events import CallingAgent, EventKey, GotReply, TurnEvent
+
+            ctx.event_sink.emit(CallingAgent(
+                key=EventKey(
+                    run_id=ctx.run_id,
+                    unit_id=ctx.unit_id,
+                    stage_id=_stage_id,
+                    attempt=attempt,
+                ),
+                stage_name=stage_name,
+                provider=ctx.agent_provider,
+                model=resolved_model,
+            ))
 
             async for event in provider.run(request):
+                _turn_seq += 1
+                ctx.event_sink.emit(TurnEvent(
+                    key=EventKey(
+                        run_id=ctx.run_id,
+                        unit_id=ctx.unit_id,
+                        stage_id=_stage_id,
+                        attempt=attempt,
+                        seq=_turn_seq,
+                    ),
+                    event=event,
+                ))
+
                 if event.text is not None:
                     chunks.append(event.text)
-                    print(ui.mask(event.text), end="", flush=True)
 
                 if event.session_id is not None:
                     if not usage_record.session_id:
@@ -429,10 +464,16 @@ class Generate(BaseStage):
                     if event.artifact not in artifacts:
                         artifacts.append(event.artifact)
 
-            if chunks:
-                print()  # end the streamed output line
-
-            ui.print_got_reply(stage_name, time.monotonic() - _query_start)
+            ctx.event_sink.emit(GotReply(
+                key=EventKey(
+                    run_id=ctx.run_id,
+                    unit_id=ctx.unit_id,
+                    stage_id=_stage_id,
+                    attempt=attempt,
+                ),
+                stage_name=stage_name,
+                elapsed_s=time.monotonic() - _query_start,
+            ))
 
             raw_output = "".join(chunks)
 

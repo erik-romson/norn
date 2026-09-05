@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.table import Table
 
 from norn.dsl import Budget, ClearContext, Include, Loop, Parallel, Pipeline, Stage
-from norn.models import PipelineContext, StageResult, UsageTracker
+from norn.models import PipelineContext, UsageTracker
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -73,118 +72,6 @@ def print_dry_run(pipeline: Pipeline) -> None:
     console.print()
 
 
-def print_pipeline_start(name: str, resume_session: str | None = None) -> None:
-    console.print(f"\n[bold]Pipeline [cyan]{name}[/cyan] starting[/bold]")
-    if resume_session:
-        console.print(f"  [dim]Resuming session {resume_session}[/dim]")
-
-
-def print_stage_running(name: str) -> float:
-    """Print stage-running indicator. Returns start time."""
-    console.print(f"  [bold]⏳ {name}[/bold]", end="", highlight=False)
-    return time.monotonic()
-
-
-def print_calling_agent(stage_name: str, provider: str, model: str | None) -> None:
-    """Announce that a Generate stage is about to invoke the agent provider.
-
-    Prints on its own line (with newline) so it survives past the
-    agent's streamed token output, which writes directly to stdout.
-    Pairs with ``print_got_reply`` for symmetric bracketing of the
-    long-running query call.
-    """
-    model_label = f" ({model})" if model else ""
-    # Newline first so we don't land on the runner's open ⏳ spinner line.
-    console.print(
-        f"\n    [yellow]→ calling agent ({provider}){model_label}…[/yellow] [dim]({stage_name})[/dim]",
-        highlight=False,
-    )
-
-
-def print_got_reply(stage_name: str, elapsed: float) -> None:
-    """Announce that the agent query finished, before the runner emits
-    its final ✓/✗ result line.
-
-    Pairs with ``print_calling_agent``.
-    """
-    console.print(
-        f"    [cyan]← got reply[/cyan] [dim]({stage_name}, {elapsed:.1f}s)[/dim]",
-        highlight=False,
-    )
-
-
-def print_stage_success(name: str, elapsed: float, result: StageResult) -> None:
-    parts = [f"\r  [bold green]✓[/bold green] [green]{name:<20}[/green]"]
-    if result.usage:
-        cost = f"${result.usage.total_cost_usd:.2f}"
-        tokens_in = f"{result.usage.input_tokens / 1000:.1f}k"
-        tokens_out = f"{result.usage.output_tokens / 1000:.1f}k"
-        parts.append(f"[dim]{cost}  ({tokens_in} in / {tokens_out} out)[/dim]")
-    parts.append(f"[dim]{elapsed:.1f}s[/dim]")
-    console.print("  ".join(parts))
-    for artifact in result.artifacts:
-        console.print(f"    [dim green]+ {artifact}[/dim green]")
-
-
-def print_stage_failure(name: str, elapsed: float, result: StageResult) -> None:
-    console.print(f"\r  [bold red]✗[/bold red] [red]{name:<20}[/red]  [dim]{elapsed:.1f}s[/dim]")
-    if result.error:
-        # Show last few lines of error for context (with secrets redacted)
-        lines = mask(result.error).strip().splitlines()
-        tail = lines[-5:] if len(lines) > 5 else lines
-        for line in tail:
-            console.print(f"    [dim red]{line}[/dim red]")
-
-
-def print_stage_skipped(name: str) -> None:
-    console.print(f"  [dim]⊘ {name:<20}  skipped[/dim]")
-
-
-def print_stage_skipped_condition(name: str) -> None:
-    console.print(f"  [dim]⊘ {name:<20}  skipped (condition not met)[/dim]")
-
-
-def print_stage_cached(name: str) -> None:
-    console.print(f"  [dim]⊘ {name:<20}  (cached)[/dim]")
-
-
-def print_loop_attempt(loop_name: str, attempt: int, max_retries: int) -> None:
-    console.print(f"\n  [bold yellow]↻[/bold yellow] [yellow]{loop_name}[/yellow] [dim](attempt {attempt}/{max_retries})[/dim]")
-
-
-def print_loop_success(loop_name: str) -> None:
-    console.print(f"  [bold green]✓[/bold green] [green]{loop_name} — all stages passed[/green]")
-
-
-def print_loop_exhausted(loop_name: str, max_retries: int) -> None:
-    console.print(f"\n  [bold red]✗[/bold red] [red]{loop_name} — retries exhausted ({max_retries}/{max_retries})[/red]")
-
-
-def print_loop_draft_pr(loop_name: str) -> None:
-    console.print(f"  [bold yellow]⚑[/bold yellow] [yellow]{loop_name} — retries exhausted, continuing as draft PR[/yellow]")
-
-
-def print_parallel_start(name: str, stage_count: int) -> None:
-    console.print(f"\n  [bold blue]⇶[/bold blue] [blue]{name}[/blue] [dim](running {stage_count} stages in parallel)[/dim]")
-
-
-def print_parallel_done(name: str) -> None:
-    console.print(f"  [bold green]✓[/bold green] [green]{name} — all parallel stages passed[/green]")
-
-
-def print_include_start(path: str, *, isolated: bool) -> None:
-    mode = "isolated" if isolated else "inline"
-    console.print(f"\n  [bold magenta]⤵[/bold magenta] [magenta]include {path}[/magenta] [dim]({mode})[/dim]")
-
-
-def print_include_done(path: str) -> None:
-    console.print(f"  [bold green]✓[/bold green] [green]include {path} — done[/green]")
-
-
-def print_clear_context() -> None:
-    console.print("  [dim]── clear_context ──[/dim]")
-
-
 def print_running_total(tracker: UsageTracker, budgets: list[Budget] | None = None) -> None:
     if tracker.total_cost_usd > 0:
         cost_str = f"${tracker.total_cost_usd:.2f}"
@@ -215,7 +102,11 @@ def ask_budget_exceeded(tracker: UsageTracker, budget: Budget) -> str:
 
 
 def ask_user_continue(name: str, error: str | None) -> str:
-    """Interactive failure recovery. Returns 'r', 's', 'a', or 'v'."""
+    """Interactive failure recovery.
+
+    Returns 'r' (retry the failed stage/loop), 'c' (continue past the
+    failure) or 'a' (abort the run).
+    """
     console.print(f"\n  [bold red]✗[/bold red] [red]{name} failed[/red]")
     if error:
         lines = mask(error).strip().splitlines()
@@ -223,12 +114,12 @@ def ask_user_continue(name: str, error: str | None) -> str:
         for line in tail:
             console.print(f"    [dim]{line}[/dim]")
     console.print()
-    console.print("  [bold]\\[c]ontinue  \\[a]bort[/bold]")
+    console.print("  [bold]\\[r]etry  \\[c]ontinue  \\[a]bort[/bold]")
     while True:
         choice = console.input("  > ").strip().lower()
-        if choice in ("c", "a"):
+        if choice in ("r", "c", "a"):
             return choice
-        console.print("  [dim]Please enter 'c' or 'a'[/dim]")
+        console.print("  [dim]Please enter 'r', 'c', or 'a'[/dim]")
 
 
 def ask_yes_no(question: str) -> bool:

@@ -6,6 +6,7 @@ import logging
 import pathlib
 import time
 from dataclasses import replace
+import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,34 @@ from norn.checkpoint import Checkpoint, save_checkpoint, serialise_output
 from norn.dsl import Budget, ClearContext, ContextSpec, Include, Loop, OnFailure, Parallel, Pipeline, PipelineItem, Stage
 from norn.loader import load_pipeline
 from norn.models import PipelineContext, StageLogEntry, StageResult, UsageTracker
+from norn.events import (
+    CallingAgent,
+    ClearContextNotice,
+    EventKey,
+    GotReply,
+    IncludeDone,
+    IncludeStarted,
+    LoopAttempt,
+    LoopDraftPR,
+    LoopExhausted,
+    LoopSuccess,
+    ParallelDone,
+    ParallelStarted,
+    RunCancelled,
+    RunError,
+    RunFinished,
+    RunPaused,
+    RunResumed,
+    RunStarted,
+    StageFinished,
+    StageRetrying,
+    StageStarted,
+    TurnEvent,
+    UnitStarted,
+    UsageUpdated,
+    WaitingInput,
+)
+from norn.run_control import CancelledError, RunController
 from norn import ui
 
 if TYPE_CHECKING:
@@ -50,7 +79,27 @@ def _is_cached(stage: Stage, ctx: PipelineContext) -> bool:
 log = logging.getLogger(__name__)
 
 
-async def _resolve_contexts(specs: list[ContextSpec]) -> list[tuple[str, str]]:
+async def _cooperative_pause(ctx: PipelineContext) -> None:
+    """Check the run controller for pause/cancel between stages.
+
+    Emits ``RunPaused``/``RunResumed`` events when the run transitions.
+    No-op when no controller is attached (default CLI path).
+    """
+    ctrl: RunController | None = ctx.run_controller
+    if ctrl is None:
+        return
+    ctrl.check_cancelled()
+    if ctrl.is_paused:
+        _ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id)
+        ctx.event_sink.emit(RunPaused(key=_ekey))
+        await ctrl.wait_if_paused()
+        ctx.event_sink.emit(RunResumed(key=_ekey))
+
+
+async def _resolve_contexts(
+    specs: list[ContextSpec],
+    working_dir: str | None = None,
+) -> list[tuple[str, str]]:
     """Resolve context specs to ``(label, content)`` pairs.
 
     Raises ``RuntimeError`` if a file glob matches nothing or a command fails.
@@ -133,7 +182,12 @@ async def _fire_hooks(
             raise PipelineError(f"hook:{event}", result)
 
 
-async def _check_budget(budgets: list[Budget], tracker: UsageTracker) -> None:
+async def _check_budget(
+    budgets: list[Budget],
+    tracker: UsageTracker,
+    ctx: PipelineContext,
+    ekey: EventKey,
+) -> None:
     """Check all budgets against current cumulative usage. Raises or prompts on excess."""
     for b in budgets:
         exceeded = False
@@ -151,7 +205,8 @@ async def _check_budget(budgets: list[Budget], tracker: UsageTracker) -> None:
         if b.on_exceed == OnFailure.FAIL:
             raise BudgetExceededError(f"Budget exceeded: {detail}")
         if b.on_exceed == OnFailure.ASK_USER:
-            choice = ui.ask_budget_exceeded(tracker, b)
+            ctx.event_sink.emit(WaitingInput(key=ekey, kind="budget"))
+            choice = await ctx.input_responder.ask_budget(tracker, b)
             if choice == "a":
                 raise BudgetExceededError(f"Budget exceeded: {detail}")
 
@@ -202,7 +257,14 @@ async def _run_stage(
     budgets: list[Budget] | None = None,
     fork_session: bool = False,
 ) -> StageResult:
-    """Run a single stage and store the result in context."""
+    """Run a single stage and store the result in context.
+
+    *node_id* is the fully-qualified graph node id used as the event
+    ``stage_id`` so the TUI graph can attribute events to the right node.
+    Top-level stages default to ``stage:<name>``; stages inside a loop or
+    parallel pass the nested form (``loop:<L>/stage:<name>`` etc.) so the
+    id matches :func:`norn.graph.build_graph`.
+    """
     start = time.monotonic()
 
     if stage.impl.needs_agent:
@@ -224,9 +286,13 @@ async def _run_stage(
                     f"'{ctx.agent_provider}' does not support MCP tools. "
                     "MCP tools are only available with the 'claude-code' provider."
                 )
+    node_id: str | None = None,
                 result = StageResult(name=stage.name, success=False, error=error)
                 elapsed = time.monotonic() - start
                 ctx.results[stage.name] = result
+    stage_id = node_id or f"stage:{stage.name}"
+    _ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=stage_id, attempt=attempt)
+    ctx.event_sink.emit(StageStarted(key=_ekey, name=stage.name, attempt=attempt))
                 _append_stage_log(
                     ctx,
                     stage_name=stage.name,
@@ -236,8 +302,18 @@ async def _run_stage(
                     duration_ms=int(elapsed * 1000),
                     error=error,
                 )
-                ui.print_stage_failure(stage.name, elapsed, result)
-                ui.print_running_total(ctx.usage_tracker, budgets)
+                ctx.event_sink.emit(StageFinished(
+                    key=_ekey,
+                    name=stage.name,
+                    status="failed",
+                    success=False,
+                    duration_ms=int(elapsed * 1000),
+                    error=error,
+                ))
+            # Pass the fully-qualified graph node id so agent-backed stages
+            # key their CallingAgent/TurnEvent/GotReply events consistently
+            # with the StageStarted/StageFinished events emitted here.
+            "node_id": stage_id,
                 return result
             agent_kwargs["mcp_tools"] = mcp_tools
             log.debug("[%s] Attached MCP tools (%d tool(s))", stage.name, len(mcp_tools))
@@ -247,9 +323,37 @@ async def _run_stage(
 
     try:
         if stage.timeout is not None:
-            result = await asyncio.wait_for(coro, timeout=stage.timeout)
+            result = await asyncio.wait_for(task, timeout=stage.timeout)
         else:
-            result = await coro
+            result = await task
+    except asyncio.CancelledError:
+        # Distinguish user-initiated cancel from outer task cancellation.
+        if ctrl is not None and ctrl.is_cancelled:
+            elapsed = time.monotonic() - start
+            error = f"Cancelled during {stage.name!r}"
+            result = StageResult(name=stage.name, success=False, error=error)
+            ctx.results[stage.name] = result
+            _append_stage_log(
+                ctx,
+                stage_name=stage.name,
+                status="cancelled",
+                success=False,
+                attempt=attempt,
+                duration_ms=int(elapsed * 1000),
+                error=error,
+            )
+            ctx.event_sink.emit(StageFinished(
+                key=_ekey,
+                name=stage.name,
+                status="cancelled",
+                success=False,
+                duration_ms=int(elapsed * 1000),
+                error=error,
+            ))
+            raise CancelledError(stage.name)
+        # Outer cancellation (e.g. the run task itself was cancelled) — never
+        # swallow, let it propagate.
+        raise
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - start
         result = StageResult(name=stage.name, success=False, error=f"Timed out after {stage.timeout}s")
@@ -263,11 +367,31 @@ async def _run_stage(
             duration_ms=int(elapsed * 1000),
             error=result.error,
         )
-        ui.print_stage_failure(stage.name, elapsed, result)
-        ui.print_running_total(ctx.usage_tracker, budgets)
+        ctx.event_sink.emit(StageFinished(
+            key=_ekey,
+            name=stage.name,
+            status="failed",
+            success=False,
+            duration_ms=int(elapsed * 1000),
+            error=result.error,
+        ))
+    elif stage.impl.emits_events:
+        # Non-agent stage that emits its own run-events (RunCommand streaming
+        # its output).  It needs the same fully-qualified node id this function
+        # uses for StageStarted/StageFinished, or its events would be filed
+        # under a different graph node and never reach the transcript pane.
+        coro = stage.impl.run(ctx, node_id=stage_id, attempt=attempt)
         return result
 
     elapsed = time.monotonic() - start
+    # Wrap in a task so RunController.cancel() can cancel the active stage
+    # immediately, rather than waiting for the next between-stage cooperative
+    # check.  Always deregister in `finally` so a later cancel() cannot touch
+    # a finished task.
+    task = asyncio.create_task(coro)
+    ctrl: RunController | None = ctx.run_controller
+    if ctrl is not None:
+        ctrl.set_active_task(task, stage.name)
     result.name = stage.name
     if result.usage:
         result.usage.stage_name = stage.name
@@ -283,18 +407,33 @@ async def _run_stage(
         error=result.error,
     )
 
-    if result.success:
-        ui.print_stage_success(stage.name, elapsed, result)
-    else:
-        ui.print_stage_failure(stage.name, elapsed, result)
-
-    ui.print_running_total(ctx.usage_tracker, budgets)
+    ctx.event_sink.emit(StageFinished(
+        key=_ekey,
+        name=stage.name,
+        status="passed" if result.success else "failed",
+        success=result.success,
+        duration_ms=int(elapsed * 1000),
+        artifacts=list(result.artifacts),
+        error=result.error,
+        usage_input_tokens=result.usage.input_tokens if result.usage else 0,
+        usage_output_tokens=result.usage.output_tokens if result.usage else 0,
+        usage_cost_usd=result.usage.total_cost_usd if result.usage else 0.0,
+    ))
+    finally:
+        if ctrl is not None:
+            ctrl.set_active_task(None, None)
 
     if budgets and result.usage:
-        await _check_budget(budgets, ctx.usage_tracker)
+        await _check_budget(budgets, ctx.usage_tracker, ctx, _ekey)
 
     return result
 
+        ctx.event_sink.emit(UsageUpdated(
+            key=_ekey,
+            input_tokens=ctx.usage_tracker.total_input_tokens,
+            output_tokens=ctx.usage_tracker.total_output_tokens,
+            total_cost_usd=ctx.usage_tracker.total_cost_usd,
+        ))
 
 async def _handle_failure(
     on_failure: OnFailure,
@@ -303,8 +442,13 @@ async def _handle_failure(
     *,
     pipeline_name: str = "",
     alert_manager: AlertManager | None = None,
-) -> None:
-    """Handle a stage failure according to the configured policy."""
+) -> str:
+    """Handle a stage failure according to the configured policy.
+
+    Returns ``"continue"`` to proceed past the failure (treat it as
+    non-fatal) or ``"retry"`` to re-run the failed stage.  Raises
+    :class:`PipelineError` on ``FAIL`` policy or when the user aborts.
+    """
     if on_failure == OnFailure.FAIL:
         raise PipelineError(name, result)
     if on_failure == OnFailure.ASK_USER:
@@ -317,13 +461,24 @@ async def _handle_failure(
                     detail=result.error or "",
                 )
             )
-        choice = ui.ask_user_continue(name, result.error)
+        # Top-level path. `_handle_failure` is reached only from `run_pipeline`'s
+        # own item loop, so `stage:<name>` *is* the fully-qualified id here.
+        # Nested stages carry a parent prefix and must take their id from the
+        # `node_id` the runner already computed — never rebuild one there.
+        _failure_ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"stage:{name}")
+        ctx.event_sink.emit(WaitingInput(
+            key=_failure_ekey,
+            kind="failure_recovery",
+            prompt_excerpt=result.error or "",
+        ))
+        choice = await ctx.input_responder.ask_failure(name, result.error)
         if choice == "a":
             raise PipelineError(name, result)
 
 
 def _save_checkpoint_state(
     config_path: str,
+    ctx: PipelineContext,
     pipeline_name: str,
     session_id: str | None,
     completed_stages: list[str],
@@ -343,6 +498,9 @@ async def _run_loop(
     ctx: PipelineContext,
     *,
     initial_session_id: str | None = None,
+        if choice == "r":
+            return "retry"
+    return "continue"
     pipeline_name: str = "",
     alert_manager: AlertManager | None = None,
     pipeline_hooks: dict[str, list[BaseStage]] | None = None,
@@ -368,12 +526,21 @@ async def _run_loop(
             ctx.retries += 1
             if pipeline_hooks:
                 await _fire_hooks("on_retry", pipeline_hooks, ctx)
-        ui.print_loop_attempt(loop.name, attempt, loop.max_retries)
+            ctx.event_sink.emit(StageRetrying(
+                key=_loop_ekey,
+                next_attempt=attempt,
+                reason=last_result.error if last_result else "",
+            ))
+        ctx.event_sink.emit(LoopAttempt(
+            key=_loop_ekey,
+            name=loop.name,
+            attempt=attempt,
+            max_retries=loop.max_retries,
+        ))
         all_passed = True
 
         for stage in loop.stages:
             if _is_cached(stage, ctx):
-                ui.print_stage_cached(stage.name)
                 _append_stage_log(
                     ctx,
                     stage_name=stage.name,
@@ -384,8 +551,9 @@ async def _run_loop(
                 continue
 
             if _is_skipped(stage, ctx):
-                ui.print_stage_skipped(stage.name)
                 ctx.results[stage.name] = StageResult(name=stage.name, success=True)
+    _loop_ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"loop:{loop.name}")
+
                 _append_stage_log(
                     ctx,
                     stage_name=stage.name,
@@ -395,8 +563,14 @@ async def _run_loop(
                 )
                 continue
 
+            # Cooperative pause/cancel check between loop body stages
+            await _cooperative_pause(ctx)
+
+            # Fully-qualified graph node id for this loop-body stage so the
+            # TUI attributes events to the nested node, not a flat one.
+            stage_node_id = f"loop:{loop.name}/stage:{stage.name}"
+
             if stage.when is not None and not stage.when(ctx):
-                ui.print_stage_skipped_condition(stage.name)
                 ctx.results[stage.name] = StageResult(name=stage.name, success=True)
                 _append_stage_log(
                     ctx,
@@ -404,18 +578,27 @@ async def _run_loop(
                     status="skipped_condition",
                     success=True,
                     attempt=attempt,
+                ctx.event_sink.emit(StageFinished(
+                    key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=stage_node_id),
+                    name=stage.name, status="cached", success=True,
+                ))
                 )
                 continue
 
             if step_mode:
-                action = ui.step_prompt(stage, ctx, session_id=session_id)
+                _step_ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=stage_node_id)
+                ctx.event_sink.emit(WaitingInput(key=_step_ekey, kind="step"))
+                action = await ctx.input_responder.ask_step(stage, ctx, session_id=session_id)
                 if action == "s":
-                    ui.print_stage_skipped(stage.name)
                     ctx.results[stage.name] = StageResult(name=stage.name, success=True)
                     _append_stage_log(
                         ctx,
                         stage_name=stage.name,
                         status="skipped",
+                ctx.event_sink.emit(StageFinished(
+                    key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=stage_node_id),
+                    name=stage.name, status="skipped", success=True,
+                ))
                         success=True,
                         attempt=attempt,
                     )
@@ -428,9 +611,13 @@ async def _run_loop(
 
             if pipeline_hooks:
                 await _fire_hooks("pre_stage", pipeline_hooks, ctx)
+                ctx.event_sink.emit(StageFinished(
+                    key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=stage_node_id),
+                    name=stage.name, status="skipped_condition", success=True,
+                ))
             result = await _run_stage(
                 stage, ctx, session_id=session_id, attempt=attempt, budgets=budgets,
-                fork_session=_fork_pending,
+                fork_session=_fork_pending, node_id=stage_node_id,
             )
             last_result = result
 
@@ -442,6 +629,10 @@ async def _run_loop(
                 elif _fork_pending and result.usage.session_id != session_id:
                     session_id = result.usage.session_id
                     log.debug("[%s] Forked to session %s", loop.name, session_id)
+                    ctx.event_sink.emit(StageFinished(
+                        key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=stage_node_id),
+                        name=stage.name, status="skipped", success=True,
+                    ))
                 if _fork_pending:
                     _fork_pending = False
 
@@ -467,12 +658,18 @@ async def _run_loop(
                 await _fire_hooks("post_stage", pipeline_hooks, ctx)
 
         if all_passed:
-            ui.print_loop_success(loop.name)
+            ctx.event_sink.emit(LoopSuccess(
+                key=_loop_ekey,
+                name=loop.name,
+            ))
             return session_id
 
     # Retries exhausted
     assert last_result is not None
-    ui.print_loop_exhausted(loop.name, loop.max_retries)
+    ctx.event_sink.emit(LoopExhausted(
+        key=_loop_ekey,
+        loop_id=f"loop:{loop.name}",
+    ))
     if alert_manager:
         await alert_manager.fire(
             AlertMessage(
@@ -494,11 +691,19 @@ async def _run_loop(
                     detail=last_result.error or "",
                 )
             )
-        choice = ui.ask_user_continue(loop.name, last_result.error)
+        ctx.event_sink.emit(WaitingInput(
+            key=_loop_ekey,
+            kind="failure_recovery",
+            prompt_excerpt=last_result.error or "",
+        ))
+        choice = await ctx.input_responder.ask_failure(loop.name, last_result.error)
         if choice == "a":
             raise RetriesExhaustedError(loop.name, last_result)
     if loop.on_exhaust == OnFailure.DRAFT_PR:
-        ui.print_loop_draft_pr(loop.name)
+        ctx.event_sink.emit(LoopDraftPR(
+            key=_loop_ekey,
+            name=loop.name,
+        ))
     return session_id
 
 
@@ -513,13 +718,40 @@ async def _run_parallel(
     Each stage gets a fresh agent session (session_id=None). All results are
     stored in context. Raises PipelineError on the first failure encountered.
     """
-    ui.print_parallel_start(parallel.name, len(parallel.stages))
+    _par_ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"parallel:{parallel.name}")
+    ctx.event_sink.emit(ParallelStarted(
+        key=_par_ekey,
+        name=parallel.name,
+        stage_count=len(parallel.stages),
+    ))
 
-    tasks = [_run_stage(stage, ctx, budgets=budgets) for stage in parallel.stages]
+    tasks = [
+        _run_stage(
+            stage, ctx, budgets=budgets,
+            node_id=f"parallel:{parallel.name}/stage:{stage.name}",
+        )
+        for stage in parallel.stages
+    ]
     outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
     first_failure: tuple[str, StageResult] | None = None
     for stage, outcome in zip(parallel.stages, outcomes):
+        if choice == "r":
+            # Re-run the whole loop (a fresh round of attempts), keeping the
+            # current agent session so the body still remembers prior context.
+            return await _run_loop(
+                loop,
+                ctx,
+                initial_session_id=session_id,
+                pipeline_name=pipeline_name,
+                alert_manager=alert_manager,
+                pipeline_hooks=pipeline_hooks,
+                budgets=budgets,
+                checkpoint_path=checkpoint_path,
+                completed_stages=completed_stages,
+                fork_session=False,
+                step_mode=step_mode,
+            )
         if isinstance(outcome, BaseException):
             # _run_stage shouldn't raise, but guard against it
             err_result = StageResult(name=stage.name, success=False, error=str(outcome))
@@ -533,7 +765,10 @@ async def _run_parallel(
         name, result = first_failure
         raise PipelineError(name, result)
 
-    ui.print_parallel_done(parallel.name)
+    ctx.event_sink.emit(ParallelDone(
+        key=_par_ekey,
+        name=parallel.name,
+    ))
 
 
 def _append_history_snapshot(
@@ -629,13 +864,17 @@ async def run_pipeline(
     session (requires ``resume_session`` to be set). Used internally when
     running isolated sub-pipelines via ``.include(..., isolated=True)``.
     """
-    ui.print_pipeline_start(pipeline.name, resume_session)
     ctx = PipelineContext(params=dict(params or {}))
     ctx.agent_provider = agent_provider
     if pipeline.default_model:
         ctx.params.setdefault("default_model", pipeline.default_model)
     start_time = time.monotonic()
     if config_path:
+    event_sink: object | None = None,
+    input_responder: object | None = None,
+    run_controller: RunController | None = None,
+    working_dir: str | None = None,
+    run_id: str | None = None,
         from norn.history import next_run_id
 
         ctx._history_config_path = config_path
@@ -651,10 +890,47 @@ async def run_pipeline(
         ctx.env = dict(pipeline.env_vars)
         for spec in pipeline.secret_specs:
             ctx.secrets[spec.name] = resolve_secret(spec.name, spec.source)
+
+    Pass ``working_dir`` to run the pipeline in an isolated directory (e.g. a
+    git worktree). Relative stage paths resolve under it; absolute paths are
+    unchanged. When ``None``, behavior is identical to today's.
+
+    Pass ``run_id`` to seed ``ctx.run_id`` with a caller-supplied identifier
+    (e.g. a worktree branch name correlator). When omitted a UUID is generated
+    as before.
         if ctx.secrets:
             ui.register_secrets(ctx.secrets.values())
             log.debug("[secrets] Resolved %d secret(s)", len(ctx.secrets))
 
+    ctx.working_dir = working_dir
+    if event_sink is not None:
+        ctx.event_sink = event_sink
+    else:
+        # Wire the default CLI renderer as event subscriber so console
+        # output flows through the event seam instead of inline prints.
+        from norn.cli_render import CLIRenderer
+        from norn.event_sink import EventSink
+
+        _renderer = CLIRenderer(budgets=pipeline.budgets or None)
+        ctx.event_sink = EventSink(on_event=_renderer)
+    if input_responder is not None:
+        ctx.input_responder = input_responder
+    if run_controller is not None:
+        ctx.run_controller = run_controller
+    ctx.run_id = run_id if run_id is not None else str(uuid.uuid4())
+    ctx.unit_id = "unit-0"
+    ctx.event_sink.emit(RunStarted(
+        key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
+        pipeline_name=pipeline.name,
+        provider=agent_provider,
+        # Passed when the user runs with --continue; the CLI renderer prints
+        # "Resuming session <id>" so the user sees which session is continuing.
+        resume_session=resume_session,
+    ))
+    ctx.event_sink.emit(UnitStarted(
+        key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
+        model=ctx.params.get("default_model") or pipeline.default_model,
+    ))
     if pipeline.contexts:
         ctx.injected_context = await _resolve_contexts(pipeline.contexts)
         total_chars = sum(len(content) for _, content in ctx.injected_context)
@@ -724,7 +1000,15 @@ async def run_pipeline(
     try:
         for item in items:
             if isinstance(item, ClearContext):
-                ui.print_clear_context()
+                # Carry the graph node id (clear:<N>, matching build_graph) so
+                # the TUI can mark the clear-context node as done.
+                ctx.event_sink.emit(ClearContextNotice(
+                    key=EventKey(
+                        run_id=ctx.run_id, unit_id=ctx.unit_id,
+                        stage_id=f"clear:{_clear_count}",
+                    ),
+                ))
+                _clear_count += 1
                 if current_session:
                     log.debug("[clear_context] Session %s discarded", current_session)
                 current_session = None
@@ -732,20 +1016,22 @@ async def run_pipeline(
 
             if isinstance(item, Stage):
                 if _is_cached(item, ctx):
-                    ui.print_stage_cached(item.name)
                     _append_stage_log(ctx, stage_name=item.name, status="cached", success=True)
                     continue
 
                 if _is_skipped(item, ctx):
-                    ui.print_stage_skipped(item.name)
                     ctx.results[item.name] = StageResult(name=item.name, success=True)
                     _append_stage_log(ctx, stage_name=item.name, status="skipped", success=True)
                     continue
 
                 if item.when is not None and not item.when(ctx):
-                    ui.print_stage_skipped_condition(item.name)
+    _cancelled = False
+    _clear_count = 0  # position counter for top-level clear-context markers
                     ctx.results[item.name] = StageResult(name=item.name, success=True)
                     _append_stage_log(
+            # Cooperative pause/cancel check between items
+            await _cooperative_pause(ctx)
+
                         ctx,
                         stage_name=item.name,
                         status="skipped_condition",
@@ -753,44 +1039,91 @@ async def run_pipeline(
                     )
                     continue
 
+            # Top-level path. Every `stage:<name>` id built in this branch is
+            # correct: `run_pipeline` iterates the pipeline's own items, so there
+            # is no parent prefix to qualify them with. Nested stages are a
+            # different story — Loop/Parallel/Include bodies must use the
+            # pre-computed `stage_node_id` handed down by their runner (see
+            # `_run_loop`) rather than rebuilding the string, which is the bug
+            # step 4 fixed. Do not copy this pattern into a nested path.
                 if step_mode:
-                    action = ui.step_prompt(item, ctx, session_id=current_session)
+                    _step_ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"stage:{item.name}")
+                    ctx.event_sink.emit(WaitingInput(key=_step_ekey, kind="step"))
+                    action = await ctx.input_responder.ask_step(item, ctx, session_id=current_session)
                     if action == "s":
-                        ui.print_stage_skipped(item.name)
+                    ctx.event_sink.emit(StageFinished(
+                        key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"stage:{item.name}"),
+                        name=item.name, status="cached", success=True,
+                    ))
                         ctx.results[item.name] = StageResult(name=item.name, success=True)
                         _append_stage_log(ctx, stage_name=item.name, status="skipped", success=True)
                         continue
                     if action == "a":
                         raise PipelineError(
                             item.name,
+                    ctx.event_sink.emit(StageFinished(
+                        key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"stage:{item.name}"),
+                        name=item.name, status="skipped", success=True,
+                    ))
                             StageResult(name=item.name, success=False, error="Aborted by user"),
                         )
 
                 if pipeline.hooks:
                     await _fire_hooks("pre_stage", pipeline.hooks, ctx)
                 result = await _run_stage(
-                    item, ctx, session_id=current_session, budgets=budgets, fork_session=_fork_pending
+                    item, ctx, session_id=current_session, budgets=budgets,
+                    fork_session=_fork_pending, attempt=attempt,
                 )
                 if result.usage and result.usage.session_id:
                     if _fork_pending:
                         _fork_pending = False
+                    ctx.event_sink.emit(StageFinished(
+                        key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"stage:{item.name}"),
+                        name=item.name, status="skipped_condition", success=True,
+                    ))
                     current_session = result.usage.session_id
-                if not result.success:
+                # Failure handling with optional user-driven retry: on a
+                # "retry" decision re-run the stage and re-evaluate; on
+                # "continue" proceed past it; abort/FAIL raise inside
+                # _handle_failure.
+                while not result.success:
                     if pipeline.hooks:
                         await _fire_hooks("on_failure", pipeline.hooks, ctx)
-                    await _handle_failure(
+                    decision = await _handle_failure(
                         item.on_failure,
                         item.name,
                         result,
+                        ctx.event_sink.emit(StageFinished(
+                            key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"stage:{item.name}"),
+                            name=item.name, status="skipped", success=True,
+                        ))
                         pipeline_name=pipeline.name,
                         alert_manager=alert_manager,
                     )
-                else:
+                    if decision != "retry":
+                        break
+                    attempt += 1
+                    if pipeline.hooks:
+                        await _fire_hooks("pre_stage", pipeline.hooks, ctx)
+                    result = await _run_stage(
+                        item, ctx, session_id=current_session, budgets=budgets,
+                        fork_session=_fork_pending, attempt=attempt,
+                    )
+                    if result.usage and result.usage.session_id:
+                        if _fork_pending:
+                            _fork_pending = False
+                        current_session = result.usage.session_id
+
+                if result.success:
                     # Save checkpoint after each successful stage
                     if config_path:
                         if item.name not in completed_stages:
                             completed_stages.append(item.name)
                         _save_checkpoint_state(
+                # attempt tracks how many times this stage has been tried so
+                # that each run gets a distinct EventKey — matching how _run_loop
+                # passes attempt= so retry keys never collide with first-run keys.
+                attempt = 1
                             config_path,
                             pipeline.name,
                             current_session,
@@ -805,6 +1138,7 @@ async def run_pipeline(
                 coro = _run_loop(
                     item,
                     ctx,
+                        ctx=ctx,
                     initial_session_id=loop_initial_session,
                     pipeline_name=pipeline.name,
                     alert_manager=alert_manager,
@@ -839,14 +1173,21 @@ async def run_pipeline(
                 sub_params = {**ctx.params, **item.args}
                 cost_offset = ctx.usage_tracker.total_cost_usd
                 token_offset = ctx.usage_tracker.total_tokens
-                ui.print_include_start(item.path, isolated=True)
+                ctx.event_sink.emit(IncludeStarted(
+                    key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
+                    path=item.path,
+                    isolated=True,
+                ))
                 sub_ctx = await run_pipeline(
                     sub,
                     params=sub_params,
                     resume_session=current_session,
                     fork_session=True,
                 )
-                ui.print_include_done(item.path)
+                ctx.event_sink.emit(IncludeDone(
+                    key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
+                    path=item.path,
+                ))
                 # Merge usage records into parent tracker
                 for record in sub_ctx.usage_tracker.records:
                     ctx.usage_tracker.add(record)
@@ -868,6 +1209,21 @@ async def run_pipeline(
         _failed_stage = getattr(exc, "stage_name", None) or type(exc).__name__
         if alert_manager:
             await alert_manager.fire(
+                    working_dir=ctx.working_dir,
+                    run_id=ctx.run_id,
+                    # Frontend seams are owned by the caller and shared with
+                    # the sub-pipeline: events flow into the same sink so the
+                    # TUI sees them, pause/cancel propagates through the same
+                    # controller, and ask_user prompts reach the correct
+                    # responder.  Results, session, and usage tracking stay
+                    # isolated in the fresh sub-context by design.
+                    # NOTE: the sub-run emits its own RunStarted/RunFinished
+                    # pair into the shared sink (same run_id, unit_id="unit-0").
+                    # Making isolated includes omit those envelope events is a
+                    # separate change.
+                    event_sink=ctx.event_sink,
+                    input_responder=ctx.input_responder,
+                    run_controller=ctx.run_controller,
                 AlertMessage(
                     event=AlertEvent.FAILED,
                     pipeline_name=pipeline.name,
@@ -885,3 +1241,19 @@ async def run_pipeline(
             AlertMessage(event=AlertEvent.COMPLETE, pipeline_name=pipeline.name)
         )
     return ctx
+    except CancelledError as exc:
+        _failed_stage = "cancelled"
+        _cancelled = True
+        ctx.event_sink.emit(RunCancelled(
+            key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
+        ))
+        raise
+        ctx.event_sink.emit(RunError(
+            key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
+            error_kind=type(exc).__name__,
+            detail=str(exc),
+        ))
+        ctx.event_sink.emit(RunFinished(
+            key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
+            success=_failed_stage is None,
+        ))
