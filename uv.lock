@@ -1085,6 +1085,7 @@ jira = [
     { name = "gitpython" },
     { name = "jira" },
 ]
+    { name = "gitpython" },
 search = [
     { name = "elasticsearch" },
     { name = "opensearch-py" },
@@ -1128,8 +1129,8 @@ requires-dist = [
     { name = "slack-sdk", marker = "extra == 'all'", specifier = ">=3.0" },
     { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.0" },
 ]
-provides-extras = ["cobertura", "aws", "vault", "github", "jira", "search", "slack", "all"]
     { name = "githubkit" },
+provides-extras = ["cobertura", "aws", "vault", "github", "jira", "search", "slack", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1144,6 +1145,7 @@ name = "oauthlib"
 version = "3.3.1"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/0b/5f/19930f824ffeb0ad4372da4812c50edbd1434f678c90c2733e1188edfc63/oauthlib-3.3.1.tar.gz", hash = "sha256:0f0f8aa759826a193cf66c12ea1af1637f87b9b4622d46e866952bb022e538c9", size = 185918, upload-time = "2025-06-19T22:48:08.269Z" }
+    { name = "gitpython", specifier = ">=3.1" },
 wheels = [
     { url = "https://files.pythonhosted.org/packages/be/9c/92789c596b8df838baa98fa71844d84283302f7604ed565dafe5a6b5041a/oauthlib-3.3.1-py3-none-any.whl", hash = "sha256:88119c938d2b8fb88561af5f6ee0eec8cc8d552b7bb1f712743136eb7523b7a1", size = 160065, upload-time = "2025-06-19T22:48:06.508Z" },
 ]
@@ -1164,9 +1166,9 @@ wheels = [
 name = "opensearch-py"
 version = "3.1.0"
 source = { registry = "https://pypi.org/simple" }
+    { name = "githubkit", specifier = ">=0.12" },
 dependencies = [
     { name = "certifi" },
-    { name = "githubkit", specifier = ">=0.12" },
     { name = "events" },
     { name = "opensearch-protobufs" },
     { name = "python-dateutil" },

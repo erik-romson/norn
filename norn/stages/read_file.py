@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import pathlib
 from typing import Any
 
 from norn.models import PipelineContext, StageResult
+from norn.runner import resolve_run_path
 from norn.stages.base import BaseStage
 
 
@@ -29,7 +29,7 @@ class ReadFile(BaseStage):
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         try:
-            content = pathlib.Path(self.path).read_text()
+            content = resolve_run_path(ctx, self.path).read_text()
             return StageResult(name="", success=True, output=content)
         except OSError as e:
             return StageResult(name="", success=False, error=str(e))

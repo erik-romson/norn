@@ -41,17 +41,23 @@ class PromptTemplate:
     output_format: dict | None = None
 
 
-def load_template(name: str) -> PromptTemplate:
+def load_template(name: str, base_dir: str | None = None) -> PromptTemplate:
     """Load a :class:`PromptTemplate` by name from ``templates/{name}.py``.
 
-    Searches relative to the current working directory.
+    Searches relative to *base_dir* when provided, otherwise relative to the
+    current working directory.
+
+    Args:
+        name: Template name to load (without ``.py`` extension).
+        base_dir: Base directory to search under.  Defaults to process cwd.
 
     Raises:
         FileNotFoundError: if ``templates/{name}.py`` does not exist.
         ValueError: if no :class:`PromptTemplate` with the given name is found
             in the file.
     """
-    template_path = Path("templates") / f"{name}.py"
+    base = Path(base_dir) if base_dir is not None else Path.cwd()
+    template_path = base / "templates" / f"{name}.py"
     if not template_path.exists():
         raise FileNotFoundError(f"Template file not found: {template_path}")
 

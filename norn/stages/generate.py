@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-import pathlib
 import re
 import time
 from typing import TYPE_CHECKING, Any
 
 from norn import ui
 from norn.models import PipelineContext, StageResult, UsageRecord
+from norn.runner import resolve_run_path
 from norn.secrets import resolve_env
 from norn.stages.base import BaseStage
 from norn.templates import PromptTemplate, load_template
@@ -229,7 +229,7 @@ class Generate(BaseStage):
         # Resolve prompt: either from a named template or directly from self.prompt
         tmpl: PromptTemplate | None = None
         if self.template:
-            tmpl = load_template(self.template)
+            tmpl = load_template(self.template, base_dir=effective_cwd)
             resolved_input = self._resolve(self.input, ctx) if self.input else ""
             resolved_prompt = tmpl.template.format(input=resolved_input)
         else:
@@ -274,7 +274,7 @@ class Generate(BaseStage):
         if resolved_setting_sources and "project" in resolved_setting_sources:
             from norn.agents.guidance import resolve_project_guidance
 
-            guidance_text = resolve_project_guidance(cwd=self.cwd)
+            guidance_text = resolve_project_guidance(cwd=effective_cwd)
             if guidance_text:
                 system_prompt_parts.append(guidance_text)
                 log.debug("[generate] Injected portable project guidance into system_prompt")
@@ -374,7 +374,7 @@ class Generate(BaseStage):
             allowed_tools=effective_allowed_tools,
             permission_mode=effective_permission_mode,
             max_turns=effective_max_turns,
-            cwd=self.cwd,
+            cwd=effective_cwd,
             env=merged_env,
             system_prompt=system_prompt,
             output_format=output_format,
@@ -495,7 +495,7 @@ class Generate(BaseStage):
             )
             if self.output_file and not agent_has_file_tools:
                 code = self._extract_code(raw_output)
-                out_path = pathlib.Path(self.output_file)
+                out_path = resolve_run_path(ctx, self.output_file)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(code)
                 return StageResult(name="", success=True, output=code, usage=usage_record, artifacts=artifacts)

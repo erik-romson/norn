@@ -7,6 +7,8 @@ dependencies = [
     "claude-agent-sdk",
     "rich>=14.3.3",
     "pyyaml>=6.0",
+    "textual>=0.60",
+    "GitPython>=3.1",
 ]
 
 [project.scripts]
@@ -65,8 +67,8 @@ asyncio_mode = "auto"
 [dependency-groups]
 dev = [
     "gitpython>=3.1",
+    "githubkit>=0.12",
     "mockito>=2.0.3",
     "pytest",
-    "githubkit>=0.12",
     "pytest-asyncio",
 ]

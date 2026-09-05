@@ -159,9 +159,9 @@ class RunCommand(BaseStage):
             stderr=asyncio.subprocess.PIPE,
             env=subprocess_env,
             start_new_session=True,
+            cwd=ctx.working_dir,
         )
 
-        try:
         # Read both pipes concurrently rather than via proc.communicate(), so
         # output can be forwarded to the event seam while the command is still
         # running. Reading both at once is what keeps communicate()'s deadlock
@@ -179,6 +179,7 @@ class RunCommand(BaseStage):
         flusher = asyncio.create_task(self._flush_loop(emit, out, err))
         timed_out = False
 
+        try:
             if self.timeout is not None:
                 await asyncio.wait_for(self._pump(proc, out, err), timeout=self.timeout)
             else:
@@ -186,11 +187,10 @@ class RunCommand(BaseStage):
         except asyncio.TimeoutError:
             # Command overran its backstop. Kill the whole group and report a
             # clean failure so the loop/fix machinery reacts instead of hanging.
-            self._terminate_group(proc)
             timed_out = True
+            self._terminate_group(proc)
             with contextlib.suppress(Exception):
                 await proc.wait()
-            cmd_preview = self.cmd if len(self.cmd) <= 500 else self.cmd[:500] + "…"
         except asyncio.CancelledError:
             # External cancellation (pipeline abort, or a Stage-level timeout in
             # the runner). Reap the tree before propagating so nothing is left
@@ -208,6 +208,7 @@ class RunCommand(BaseStage):
             self._emit_pending(emit, out, err, final=True)
 
         if timed_out:
+            cmd_preview = self.cmd if len(self.cmd) <= 500 else self.cmd[:500] + "…"
             return StageResult(
                 name="",
                 success=False,
@@ -229,7 +230,6 @@ class RunCommand(BaseStage):
         error = self._format_error(output) if not success else None
         return StageResult(name="", success=success, output=output, error=error)
 
-    @staticmethod
     # ------------------------------------------------------------------
     # Live output streaming
     # ------------------------------------------------------------------
@@ -332,6 +332,7 @@ class RunCommand(BaseStage):
             await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
             self._emit_pending(emit, out, err)
 
+    @staticmethod
     def _terminate_group(proc: asyncio.subprocess.Process) -> None:
         """SIGKILL the command's whole process group (best effort).
 

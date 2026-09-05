@@ -2005,6 +2005,107 @@ async def test_opencode_error_finish_marks_is_error():
 
 
 # ---------------------------------------------------------------------------
+# effective_cwd — ctx.working_dir integration (step-02)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_cwd_explicit_stage_cwd_wins(fake_provider, tmp_path):
+    """Explicit stage cwd takes precedence over ctx.working_dir."""
+    stage_dir = str(tmp_path / "stage")
+    ctx_dir = str(tmp_path / "ctx")
+    gen = Generate(prompt="hi", cwd=stage_dir)
+    ctx = _ctx_for_fake(working_dir=ctx_dir)
+    await gen.run(ctx)
+    assert fake_provider.requests[0].cwd == stage_dir
+
+
+@pytest.mark.asyncio
+async def test_request_cwd_falls_back_to_working_dir(fake_provider, tmp_path):
+    """When stage cwd is not set, ctx.working_dir is used as effective cwd."""
+    ctx_dir = str(tmp_path / "ctx")
+    gen = Generate(prompt="hi")
+    ctx = _ctx_for_fake(working_dir=ctx_dir)
+    await gen.run(ctx)
+    assert fake_provider.requests[0].cwd == ctx_dir
+
+
+@pytest.mark.asyncio
+async def test_request_cwd_none_when_both_unset(fake_provider):
+    """When neither stage cwd nor ctx.working_dir is set, request.cwd is None."""
+    gen = Generate(prompt="hi")
+    ctx = _ctx_for_fake()
+    assert ctx.working_dir is None
+    await gen.run(ctx)
+    assert fake_provider.requests[0].cwd is None
+
+
+@pytest.mark.asyncio
+async def test_output_file_relative_written_under_working_dir(fake_provider, tmp_path):
+    """Relative output_file is resolved under ctx.working_dir."""
+    fake_provider.events = [
+        AgentEvent(text="result content"),
+    ]
+    gen = Generate(prompt="hi", output_file="out/result.txt")
+    ctx = _ctx_for_fake(working_dir=str(tmp_path))
+    result = await gen.run(ctx)
+    assert result.success
+    expected = tmp_path / "out" / "result.txt"
+    assert expected.exists()
+    assert expected.read_text() == "result content"
+
+
+@pytest.mark.asyncio
+async def test_guidance_read_from_working_dir(fake_provider, tmp_path):
+    """setting_sources=['project'] reads AGENTS.md from ctx.working_dir when no explicit cwd."""
+    (tmp_path / "AGENTS.md").write_text("Worktree guidance.")
+    gen = Generate(prompt="hi", setting_sources=["project"])
+    ctx = _ctx_for_fake(working_dir=str(tmp_path))
+    await gen.run(ctx)
+    req = fake_provider.requests[0]
+    assert req.system_prompt is not None
+    assert "Worktree guidance." in req.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_template_loaded_from_working_dir(fake_provider, tmp_path):
+    """Generate(template=...) resolves templates/ from ctx.working_dir when no explicit cwd."""
+    from norn.templates import PromptTemplate
+
+    tmpl_dir = tmp_path / "templates"
+    tmpl_dir.mkdir()
+    tmpl_obj = PromptTemplate(name="mytmpl", template="Template prompt: {input}")
+    # Write a real template file that defines the PromptTemplate
+    (tmpl_dir / "mytmpl.py").write_text(
+        "from norn.templates import PromptTemplate\n"
+        "mytmpl = PromptTemplate(name='mytmpl', template='Template prompt: {input}')\n"
+    )
+    gen = Generate(template="mytmpl", input="hello")
+    ctx = _ctx_for_fake(working_dir=str(tmp_path))
+    await gen.run(ctx)
+    req = fake_provider.requests[0]
+    assert "Template prompt: hello" in req.prompt
+
+
+@pytest.mark.asyncio
+async def test_explicit_cwd_overrides_working_dir_for_guidance(fake_provider, tmp_path):
+    """Explicit stage cwd overrides ctx.working_dir for project guidance."""
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    ctx_dir = tmp_path / "ctx"
+    ctx_dir.mkdir()
+    (stage_dir / "AGENTS.md").write_text("Stage guidance.")
+    (ctx_dir / "AGENTS.md").write_text("Ctx guidance.")
+    gen = Generate(prompt="hi", setting_sources=["project"], cwd=str(stage_dir))
+    ctx = _ctx_for_fake(working_dir=str(ctx_dir))
+    await gen.run(ctx)
+    req = fake_provider.requests[0]
+    assert req.system_prompt is not None
+    assert "Stage guidance." in req.system_prompt
+    assert "Ctx guidance." not in req.system_prompt
+
+
+# ---------------------------------------------------------------------------
 # Non-portable feature validation (step-10) – Generate.run() early reject
 # ---------------------------------------------------------------------------
 
