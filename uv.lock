@@ -1129,6 +1129,7 @@ requires-dist = [
     { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.0" },
 ]
 provides-extras = ["cobertura", "aws", "vault", "github", "jira", "search", "slack", "all"]
+    { name = "githubkit" },
 
 [package.metadata.requires-dev]
 dev = [
@@ -1165,6 +1166,7 @@ version = "3.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
+    { name = "githubkit", specifier = ">=0.12" },
     { name = "events" },
     { name = "opensearch-protobufs" },
     { name = "python-dateutil" },

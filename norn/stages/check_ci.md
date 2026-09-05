@@ -204,7 +204,7 @@ log with a `(no error markers found — showing last N lines)` header.
   (path-filter exclusion, no commits), `_get_latest_run` will return a
   historical run. The CheckCI stage cannot tell that the run is "stale"
   by itself — that comparison (run.head_sha vs. local HEAD) is left to
-  callers, e.g. the dogfooding pipeline's `CheckCIWithLogs` wrapper.
+  callers, e.g. the `check_and_fix_ci` pipeline's `CheckCIWithLogs` wrapper.
 * **Detached HEAD**: `_current_branch` returns an empty string and the
   stage fails with a clear error. Pass `branch=` explicitly in that
   case.
@@ -271,7 +271,7 @@ Pipeline("fix-ci")
 
 The interpolated `{ci.output}` is the dict from §1 — when used in a
 prompt template, it's rendered as the human-readable log block. This is
-the pattern `dogfooding/check_and_fix_ci.py` follows: it wraps `CheckCI`
+the pattern `norn/pipelines/check_and_fix_ci.py` follows: it wraps `CheckCI`
 in `CheckCIWithLogs` (which adds a stale-run guard and string-typed
 output) so the same `{check ci.output}` works directly.
 
