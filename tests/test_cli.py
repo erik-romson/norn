@@ -179,6 +179,100 @@ def test_history_run_shows_detailed_step_log(capsys, tmp_path):
     assert "sonnet" in captured.out
 
 
+def test_history_run_shows_finding(capsys, tmp_path):
+    """history --run prints findings when journal metrics exist."""
+    import json
+
+    config = str(tmp_path / "pipeline.py")
+    append_run(
+        config,
+        RunRecord(
+            run_id=1,
+            timestamp="2026-03-25T09:00:00+00:00",
+            success=True,
+            total_cost_usd=0.19,
+            total_tokens=15100,
+            duration_ms=10500,
+            stages=[StageHistoryEntry(name="gen", success=True, cost_usd=0.12)],
+            retries=0,
+        ),
+    )
+
+    # Create a journal run dir with findings.json
+    runs_path = tmp_path / "pipeline.runs" / "1"
+    runs_path.mkdir(parents=True)
+    (runs_path / "findings.json").write_text(json.dumps([{
+        "rule": "budget-headroom",
+        "severity": "warn",
+        "stage": None,
+        "evidence": "budget_used_pct=90%",
+        "suggestion": "Increase the budget.",
+    }]))
+
+    with patch("sys.argv", ["norn", "history", config, "--run", "1"]):
+        main()
+
+    captured = capsys.readouterr()
+    assert "budget-headroom" in captured.out
+
+
+def test_history_compare_shows_per_stage_table(capsys, tmp_path):
+    """history --compare prints a per-stage table when both runs have metrics."""
+    import json
+    from dataclasses import asdict
+    from norn.metrics import RunMetrics, StageMetrics
+
+    config = str(tmp_path / "pipeline.py")
+    for rid in (1, 2):
+        append_run(
+            config,
+            RunRecord(
+                run_id=rid,
+                timestamp="2026-03-25T09:00:00+00:00",
+                success=True,
+                total_cost_usd=0.10 * rid,
+                total_tokens=10000,
+                duration_ms=5000,
+                stages=[StageHistoryEntry(name="gen", success=True, cost_usd=0.05 * rid)],
+                retries=0,
+            ),
+        )
+        # Create metrics.json in the journal run dir
+        runs_path = tmp_path / "pipeline.runs" / str(rid)
+        runs_path.mkdir(parents=True)
+        sm = StageMetrics(
+            name="gen", node_id="gen", attempt=1, kind="agent", status="passed",
+            success=True, cost_usd=0.05 * rid, cost_share=100.0,
+            billed_input_tokens=1000, output_tokens=500, cache_hit_ratio=0.0,
+            turns=3, tokens_per_turn=500.0, tool_uses=2, tool_errors=0,
+            prompt_chars=100, system_prompt_chars=0, unresolved_placeholders=[],
+            duration_ms=2000, model="sonnet", model_id="claude-sonnet-4-6",
+            result_subtype="success", stop_reason=None, nonfatal_error=False,
+        )
+        metrics = RunMetrics(
+            run_id=str(rid), pipeline="test", provider="claude-code",
+            cost_mode="tracked", success=True, failed_stage=None,
+            cost_usd=0.10 * rid, billed_input_tokens=2000, output_tokens=500,
+            cache_read_tokens=0, cache_hit_ratio=0.0, turns=3,
+            wall_ms=5000, api_ms=3000, tool_time_ms=2000,
+            agent_stage_count=1, command_stage_count=0,
+            failed_attempts=0, failed_attempt_cost_usd=0.0, retries=0,
+            budget_max_cost_usd=None, budget_used_pct=None,
+            waiting_input={}, top_cost_stages=["gen"],
+            quota=None, codex_cost_usd_estimate=None, stages=[sm],
+        )
+        (runs_path / "metrics.json").write_text(
+            json.dumps(asdict(metrics), indent=2)
+        )
+
+    with patch("sys.argv", ["norn", "history", config, "--compare", "1", "2"]):
+        main()
+
+    captured = capsys.readouterr()
+    assert "Per-stage" in captured.out
+    assert "gen" in captured.out
+
+
 def test_history_for_external_config_prefers_cwd_state(capsys, tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     shared = tmp_path / "shared"

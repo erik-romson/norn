@@ -231,15 +231,24 @@ def main() -> None:
 
     if args.command == "history":
         from norn import ui as _ui
+        from norn.journal import runs_dir as _runs_dir
 
         if args.compare and args.run:
             parser.error("--run cannot be used with --compare")
         records = _load_history_for_config(args.config)
+
+        # Find the state key that has a .runs directory for metrics
+        _history_state_key: str | None = None
+        for candidate in _state_key_candidates(args.config):
+            if _runs_dir(candidate).is_dir():
+                _history_state_key = candidate
+                break
+
         if args.run is not None:
-            _ui.print_history_run_details(records, args.run)
+            _ui.print_history_run_details(records, args.run, state_key=_history_state_key)
         elif args.compare:
             run_a, run_b = args.compare
-            _ui.print_history_comparison(records, run_a, run_b)
+            _ui.print_history_comparison(records, run_a, run_b, state_key=_history_state_key)
         else:
             _ui.print_history_table(records)
         return
@@ -431,6 +440,20 @@ def main() -> None:
     except PipelineError as e:
         from norn.ui import console
         console.print(f"\n[bold red]Pipeline failed:[/bold red] {e}")
+        # Print findings from the latest run journal
+        try:
+            from norn.journal import latest_run_id as _latest_rid, runs_dir as _runs_dir
+            from norn.metrics import load_findings as _load_findings
+
+            _rid = _latest_rid(config_path_for_checkpoint)
+            if _rid is not None:
+                _rd = _runs_dir(config_path_for_checkpoint) / str(_rid)
+                _ff = _load_findings(_rd)
+                if _ff:
+                    from norn import ui as _ui
+                    _ui.print_findings(_ff)
+        except Exception:
+            pass  # best-effort; don't mask the real failure
         sys.exit(1)
 
 

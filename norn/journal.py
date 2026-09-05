@@ -240,10 +240,15 @@ class RunJournal:
                 record["usage"] = {
                     "input_tokens": result.usage.input_tokens,
                     "output_tokens": result.usage.output_tokens,
+                    "cache_read_input_tokens": result.usage.cache_read_input_tokens,
+                    "cache_creation_input_tokens": result.usage.cache_creation_input_tokens,
                     "total_cost_usd": result.usage.total_cost_usd,
                     "duration_ms": result.usage.duration_ms,
                     "num_turns": result.usage.num_turns,
                     "model_id": result.usage.model_id,
+                    "model": result.usage.model,
+                    "result_subtype": result.usage.result_subtype,
+                    "stop_reason": result.usage.stop_reason,
                     "tool_uses": result.usage.tool_uses,
                     "tool_errors": result.usage.tool_errors,
                 }

@@ -60,6 +60,15 @@ async def test_simple_pipeline():
 
 
 @pytest.mark.asyncio
+async def test_no_config_path_sets_no_metrics():
+    """When config_path is None, run_metrics is None and findings is empty."""
+    p = Pipeline("test").stage("s1", SuccessStage("ok"))
+    ctx = await run_pipeline(p)
+    assert ctx.run_metrics is None
+    assert ctx.findings == []
+
+
+@pytest.mark.asyncio
 async def test_stage_failure_raises():
     p = Pipeline("test").stage("s1", FailStage(), on_failure=OnFailure.FAIL)
     with pytest.raises(PipelineError):

@@ -255,7 +255,7 @@ def print_history_table(records: list[RunRecord]) -> None:
     console.print(table)
 
 
-def print_history_comparison(records: list[RunRecord], run_a: int, run_b: int) -> None:
+def print_history_comparison(records: list[RunRecord], run_a: int, run_b: int, *, state_key: str | None = None) -> None:
     """Print a side-by-side comparison of two runs."""
     by_id = {r.run_id: r for r in records}
     if run_a not in by_id:
@@ -287,8 +287,63 @@ def print_history_comparison(records: list[RunRecord], run_a: int, run_b: int) -
     console.print(f"  Retries: {a.retries} → {b.retries}")
     console.print()
 
+    # Per-stage comparison table when both runs have metrics.json
+    if state_key is not None:
+        from norn.journal import runs_dir as _runs_dir
+        from norn.metrics import load_metrics as _load_metrics
 
-def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
+        rd = _runs_dir(state_key)
+        if rd.is_dir():
+            m_a = _load_metrics(rd / str(run_a))
+            m_b = _load_metrics(rd / str(run_b))
+            if m_a is not None and m_b is not None:
+                _print_stage_comparison(m_a, m_b, run_a, run_b)
+
+
+def _print_stage_comparison(m_a: object, m_b: object, run_a: int, run_b: int) -> None:
+    """Print a per-stage comparison table between two runs with metrics."""
+    table = Table(title=f"Per-stage: #{run_a} vs #{run_b}", title_style="bold", show_edge=False)
+    table.add_column("Stage", style="cyan")
+    table.add_column(f"#{run_a} Cost", justify="right")
+    table.add_column(f"#{run_b} Cost", justify="right")
+    table.add_column("Turns", justify="right")
+    table.add_column("Tools (x)", justify="right")
+    table.add_column("Duration", justify="right")
+    table.add_column("Delta", justify="right")
+
+    # Index stages by name for run_a
+    a_by_name = {s.name: s for s in m_a.stages}
+    b_by_name = {s.name: s for s in m_b.stages}
+    all_names = list(dict.fromkeys(
+        [s.name for s in m_a.stages] + [s.name for s in m_b.stages]
+    ))
+
+    for name in all_names:
+        sa = a_by_name.get(name)
+        sb = b_by_name.get(name)
+        a_cost = f"${sa.cost_usd:.4f}" if sa else "-"
+        b_cost = f"${sb.cost_usd:.4f}" if sb else "-"
+        turns_str = f"{sa.turns if sa else 0} → {sb.turns if sb else 0}"
+        tools_a = f"{sa.tool_uses} ({sa.tool_errors}x)" if sa and sa.tool_errors else (str(sa.tool_uses) if sa else "-")
+        tools_b = f"{sb.tool_uses} ({sb.tool_errors}x)" if sb and sb.tool_errors else (str(sb.tool_uses) if sb else "-")
+        tools_str = f"{tools_a} → {tools_b}"
+        dur_str = f"{(sa.duration_ms if sa else 0) / 1000:.1f}s → {(sb.duration_ms if sb else 0) / 1000:.1f}s"
+        # Delta cost
+        if sa and sb and sa.cost_usd > 0:
+            delta = (sb.cost_usd - sa.cost_usd) / sa.cost_usd * 100
+            sign = "+" if delta > 0 else ""
+            color = "red" if delta > 0 else "green"
+            delta_str = f"[{color}]{sign}{delta:.0f}%[/{color}]"
+        else:
+            delta_str = "-"
+
+        table.add_row(name, a_cost, b_cost, turns_str, tools_str, dur_str, delta_str)
+
+    console.print(table)
+    console.print()
+
+
+def print_history_run_details(records: list[RunRecord], run_id: int, *, state_key: str | None = None) -> None:
     """Print a detailed step-by-step log for a single run."""
     by_id = {r.run_id: r for r in records}
     record = by_id.get(run_id)
@@ -316,6 +371,9 @@ def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
 
     if not record.stage_log:
         console.print("\n  [dim]No detailed stage log stored for this run.[/dim]\n")
+        # Still print metrics/findings if journal data exists
+        if state_key is not None:
+            _print_run_findings(state_key, run_id)
         return
 
     # Use a wide-enough console so the step log table is not truncated when
@@ -377,3 +435,64 @@ def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
     wide.print()
     wide.print(table)
     wide.print()
+
+    # Print metrics summary and findings if journal data exists
+    if state_key is not None:
+        _print_run_findings(state_key, run_id)
+
+
+def _print_run_findings(state_key: str, run_id: int) -> None:
+    """Load and print findings from journal run directory."""
+    from norn.journal import runs_dir as _runs_dir
+    from norn.metrics import load_findings as _load_findings, load_metrics as _load_metrics
+
+    rd = _runs_dir(state_key)
+    if rd.is_dir():
+        run_path = rd / str(run_id)
+        if run_path.is_dir():
+            m = _load_metrics(run_path)
+            f = _load_findings(run_path)
+            if m is not None or f:
+                print_findings(f, m)
+
+
+def print_findings(findings: list, metrics: object | None = None) -> None:
+    """Print findings table and one-line metrics summary."""
+    if not findings and metrics is None:
+        return
+
+    if metrics is not None:
+        m = metrics
+        cost_str = f"${getattr(m, 'cost_usd', 0):.4f}"
+        turns_str = str(getattr(m, "turns", 0))
+        wall_str = f"{getattr(m, 'wall_ms', 0) / 1000:.1f}s"
+        console.print(f"  [bold]Metrics:[/bold] cost={cost_str}  turns={turns_str}  wall={wall_str}")
+
+    if not findings:
+        console.print("  [dim]No findings.[/dim]\n")
+        return
+
+    severity_styles = {
+        "high": "[bold red]HIGH[/bold red]",
+        "warn": "[yellow]WARN[/yellow]",
+        "info": "[dim]info[/dim]",
+    }
+    table = Table(title="Findings", title_style="bold", show_edge=False)
+    table.add_column("Severity")
+    table.add_column("Rule", style="cyan")
+    table.add_column("Stage")
+    table.add_column("Evidence", overflow="fold")
+    table.add_column("Suggestion", overflow="fold")
+
+    for f in findings:
+        sev = severity_styles.get(f.severity, f.severity)
+        table.add_row(
+            sev,
+            f.rule,
+            f.stage or "-",
+            f.evidence,
+            f.suggestion,
+        )
+
+    console.print(table)
+    console.print()

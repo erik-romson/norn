@@ -1362,6 +1362,32 @@ async def run_pipeline(
         ))
 
     ui.print_usage_report(pipeline.name, ctx.usage_tracker, config_path)
+
+    # Compute deterministic metrics from journal (zero tokens)
+    if ctx.journal is not None and journal is None:
+        try:
+            from norn.metrics import compute_metrics, find_issues, load_prior_metrics, write_metrics
+
+            _run_dir = ctx.journal._dir
+            _runs_dir = _run_dir.parent
+            _journal_rid = int(_run_dir.name)
+            _metrics = compute_metrics(_run_dir)
+            _prior = load_prior_metrics(_runs_dir, _journal_rid)
+            _findings = find_issues(_metrics, _prior)
+            write_metrics(_run_dir, _metrics, _findings)
+            ctx.run_metrics = _metrics
+            ctx.findings = _findings
+        except Exception:
+            log.warning("metrics: failed to compute post-run metrics", exc_info=True)
+            ctx.run_metrics = None
+            ctx.findings = []
+    else:
+        ctx.run_metrics = None
+        ctx.findings = []
+
+    if ctx.run_metrics is not None:
+        ui.print_findings(ctx.findings, ctx.run_metrics)
+
     if alert_manager:
         await alert_manager.fire(
             AlertMessage(event=AlertEvent.COMPLETE, pipeline_name=pipeline.name)

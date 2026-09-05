@@ -257,6 +257,10 @@ class PipelineContext:
     """Run working directory; relative stage paths resolve under it when set, else process cwd."""
     journal: Any = None
     """RunJournal instance when journal recording is active."""
+    run_metrics: Any = None
+    """``RunMetrics`` after post-run metrics computation, or ``None``."""
+    findings: list[Any] = field(default_factory=list)
+    """``Finding`` list after post-run metrics computation."""
 
     def get(self, stage_name: str) -> Any:
         """Get output from a previous stage."""
