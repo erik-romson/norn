@@ -227,6 +227,18 @@ def main() -> None:
         help="Path to pipeline config .py file or bundled pipeline name (optional)",
     )
 
+    rate_parser = sub.add_parser("rate", help="Record a human rating (1–5) for a pipeline run")
+    rate_parser.add_argument("config", help="Path to the pipeline config .py file or bundled pipeline name")
+    rate_parser.add_argument("score", type=int, help="Rating score 1–5")
+    rate_parser.add_argument(
+        "--run",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Run ID to rate (default: latest run)",
+    )
+    rate_parser.add_argument("--note", default=None, metavar="TEXT", help="Optional annotation")
+
     args, remaining = parser.parse_known_args()
 
     if args.command == "history":
@@ -250,7 +262,7 @@ def main() -> None:
             run_a, run_b = args.compare
             _ui.print_history_comparison(records, run_a, run_b, state_key=_history_state_key)
         else:
-            _ui.print_history_table(records)
+            _ui.print_history_table(records, state_key=_history_state_key)
         return
 
     if args.command == "orgs":
@@ -342,6 +354,51 @@ def main() -> None:
 
     if args.command == "ui":
         _run_ui(args.pipeline)
+        return
+
+    if args.command == "rate":
+        from norn.journal import latest_run_id as _latest_run_id, run_dir as _run_dir, runs_dir as _runs_dir
+        from norn.rating import write_rating as _write_rating
+
+        # Validate score range before touching the filesystem
+        if args.score < 1 or args.score > 5:
+            print(f"Error: score must be between 1 and 5 inclusive, got {args.score!r}", file=sys.stderr)
+            sys.exit(1)
+
+        # Find state key that has a .runs directory
+        _rate_state_key: str | None = None
+        for candidate in _state_key_candidates(args.config):
+            if _runs_dir(candidate).is_dir():
+                _rate_state_key = candidate
+                break
+
+        if _rate_state_key is None:
+            print(
+                f"no journaled runs for {args.config}; runs before this feature cannot be rated",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Resolve the run id
+        if args.run is not None:
+            run_id = args.run
+        else:
+            run_id = _latest_run_id(_rate_state_key)
+            if run_id is None:
+                print(
+                    f"no journaled runs for {args.config}; runs before this feature cannot be rated",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        rd = _run_dir(_rate_state_key, run_id)
+        if not rd.is_dir():
+            print(f"Error: run directory not found: {rd}", file=sys.stderr)
+            sys.exit(1)
+
+        _write_rating(rd, args.score, args.note)
+        from norn.ui import console as _console
+        _console.print(f"  [green]✓[/green] Rated run #{run_id} as [bold]{args.score}/5[/bold]")
         return
 
     if args.command != "run":

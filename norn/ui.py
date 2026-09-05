@@ -224,11 +224,24 @@ def print_usage_report(name: str, tracker: UsageTracker, config_path: str | None
     console.print()
 
 
-def print_history_table(records: list[RunRecord]) -> None:
+def print_history_table(records: list[RunRecord], *, state_key: str | None = None) -> None:
     """Print a table of pipeline run history."""
     if not records:
         console.print("[dim]No history found.[/dim]")
         return
+
+    # Pre-load ratings for all runs when a state key is available
+    _ratings: dict[int, dict] = {}
+    if state_key is not None:
+        from norn.journal import run_dir as _run_dir, runs_dir as _runs_dir
+        from norn.rating import load_rating as _load_rating
+
+        _rd_base = _runs_dir(state_key)
+        if _rd_base.is_dir():
+            for r in records:
+                rating = _load_rating(_run_dir(state_key, r.run_id))
+                if rating is not None:
+                    _ratings[r.run_id] = rating
 
     table = Table(show_edge=False)
     table.add_column("Run", justify="right")
@@ -236,6 +249,8 @@ def print_history_table(records: list[RunRecord]) -> None:
     table.add_column("Status")
     table.add_column("Cost", justify="right")
     table.add_column("Time", justify="right")
+    table.add_column("Rating", justify="right")
+    table.add_column("Score", justify="right")
     table.add_column("Info")
 
     for r in records:
@@ -250,7 +265,10 @@ def print_history_table(records: list[RunRecord]) -> None:
         else:
             info = f"{len(r.stages)} stages" if r.success else f"stage: {r.failed_stage or '?'}"
         ts = r.timestamp[:16].replace("T", " ")
-        table.add_row(f"#{r.run_id}", ts, status, cost, duration, info)
+        rating_data = _ratings.get(r.run_id)
+        rating_str = f"{rating_data['score']}/5" if rating_data else "-"
+        score_str = "-"  # evaluation.json score — Phase 6, not yet implemented
+        table.add_row(f"#{r.run_id}", ts, status, cost, duration, rating_str, score_str, info)
 
     console.print(table)
 
