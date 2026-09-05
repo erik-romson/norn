@@ -418,3 +418,7 @@ and then `git branch -D <work_branch>`.
   journal (`<state-key>.runs/<run_id>/`) with redacted events, stage records,
   and run metadata. The history browser still shows summaries; transcript
   replay from the journal is a future extension.
+- **TUI shows no findings.** `norn/metrics.py` computes deterministic findings
+  (threshold violations) and writes them to `findings.json` in the run directory.
+  The TUI does not yet display findings; they are accessible via
+  `norn history --run <N>` on the CLI.

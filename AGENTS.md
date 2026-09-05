@@ -4,6 +4,7 @@ This is the canonical repo instruction file for agents. Keep user-facing setup a
 
 ## Principles
 - **No fallbacks. Fail fast and hard.** When something required is missing or fails — a dependency, an external tool, a file, an env var, a capability, an unexpected value — surface it immediately with a clear error or let the exception propagate. Never swallow it with a `try/except`-to-default, never silently degrade to an alternate path, never guess a default to keep going. This applies to everything, with no exceptions for any one dependency. (A multi-location lookup that a feature documents as part of its contract — e.g. resolving state files from a primary then a legacy location — is designed behavior, not an error-masking fallback.)
+- **Diagnostics-only writes (journal, metrics) that fail after a run is already underway log a warning with the path and exception and continue; they follow the history-write precedent (`norn/runner.py:836-838`) because a diagnostics file must not kill a multi-dollar run at stage 60. This is the only permitted warn-and-continue path; serialisation is total (`_json_default`) so the failure can only be I/O.**
 
 ## Commands
 - Install exactly like CI: `uv sync --group dev`.
@@ -47,6 +48,15 @@ This is the canonical repo instruction file for agents. Keep user-facing setup a
 - The "stage that fails on purpose" pause pattern (`WaitForApproval` in `_plan_review.py`) is a deliberate `StageResult(success=False)` returned by a stage with `on_failure=ask_user`; the runner fires `ASK_USER` and pauses. This is legitimate when the intent is to interrupt the run for a human review step, not to signal an error.
 - Switching `implement_features_v2` from its own inline `AssertLaunchTree` to the shared copy in `_launch_tree.py` is deferred until the v1-vs-v2 comparison period ends; do not make that change while v2 is frozen.
 - Stage plugins are discovered from the `norn.stages` entry point group declared in `pyproject.toml`.
+- `norn/journal.py` — run journal (events, prompts, outputs persisted per run under `<state-key>.runs/<run_id>/`); `JournalSink` wraps any `EventSink` and writes every redacted event before forwarding it. Journal writes warn-and-continue on I/O failure (the diagnostics-only exception in Principles).
+- `norn/metrics.py` — deterministic metrics and rule-based findings computed from the journal at end-of-run (zero tokens); thresholds are module constants. `compute_metrics` / `compute_findings` write `metrics.json` / `findings.json` beside the run journal.
+- `norn/evaluate.py` — post-run LLM evaluation: `judge_stage` (haiku, `plan` + `max_turns=1`, no write tools) scores each stage; `run_feedback` (sonnet, `plan` + read-only tools) produces `feedback.md`; `evaluate_run` orchestrates both and writes `evaluation.json`. Evaluation is post-run and journal-driven, not an in-loop quality hook.
+- `norn/rating.py` — human rating (1–5): `write_rating` / `load_rating` persist `rating.json` in the run directory; `norn rate` validates the score before any filesystem access.
+- `norn/quota.py` — opt-in CodexBar quota sampling; norn never auto-detects CodexBar. Identity fields are stripped before writing. Activated by `--quota codexbar`; `--require-quota` and `--quota-fail-open` control failure behaviour.
+- `norn/transcripts.py` — opt-in claude-code transcript reader; reads the local transcript for per-turn model-mix data. A missing transcript file is recorded as `None`, not raised (the file exists only after a run that used claude-code).
+- `StageResult.details` — free-form dict attached by stages that want to persist structured data beyond the plain `output`; serialised by `norn/checkpoint.py` and forwarded to `StageLogEntry`.
+- The `plan` permission mode + `max_turns=1` no-write-tools idiom is now used in norn core (`norn/evaluate.py`) for LLM judging: the agent sees the journal but cannot modify files, so the judge is a pure reader.
+- Evaluation cost is tracked separately in `evaluate_run` (not added to `UsageTracker`, `.history`, or any pipeline budget) and reported after the run.
 
 ## UI And Event Seam
 - The terminal UI (`norn ui`), the typed run-event seam (`norn/events.py`, `norn/event_sink.py`), and the Textual code under `norn/tui/` are documented in `docs/norn-ui.md`; read it before touching any of them.

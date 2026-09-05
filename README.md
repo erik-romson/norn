@@ -361,6 +361,70 @@ uv run python -m norn history examples/derived.py --run 1
 uv run python -m norn history examples/derived.py --compare 1 2
 ```
 
+## Evaluate, rate and compare runs
+
+After a run, norn can compute deterministic metrics, run an LLM judge over the stage records, and record a human rating — all from the same journal written during the run.
+
+### Run directory layout
+
+```
+<config>.runs/<run_id>/
+  run.json          # run metadata (pipeline, provider, start/end, success)
+  events.jsonl      # full redacted event stream
+  metrics.json      # deterministic cost/error/tool metrics (zero tokens)
+  findings.json     # rule-based findings (threshold violations)
+  stages/
+    <stage>.json    # per-stage record (prompt, output, usage)
+    <stage>.eval.json  # per-stage judge verdict (after norn evaluate)
+  evaluation.json   # aggregate evaluation result
+  feedback.md       # narrative feedback written by norn evaluate
+  rating.json       # human rating (after norn rate)
+```
+
+### Commands
+
+```bash
+# Run a pipeline and evaluate it afterwards (tokens billed separately)
+uv run python -m norn run pipeline.py --evaluate
+
+# Evaluate a completed run (by run id)
+uv run python -m norn evaluate pipeline.py --run 3
+
+# Record a human rating (1–5) for a completed run
+uv run python -m norn rate pipeline.py --run 3 4
+
+# Inspect metrics and findings for a single run
+uv run python -m norn history pipeline.py --run 3
+
+# Compare two runs side by side
+uv run python -m norn history pipeline.py --compare 2 3
+```
+
+Default models: **haiku** for the stage judge, **sonnet** for the narrative feedback pass. Use `--model opus` to upgrade both. `--max-cost` defaults to `5.0` USD; the command exits with an error if the running evaluation spend would exceed it.
+
+Evaluation cost is reported separately and never added to the pipeline's history totals.
+
+### Optional: CodexBar
+
+[CodexBar](https://codexbar.app/) is an optional macOS menu-bar tool that exposes your Claude subscription quota over a local CLI. Norn can sample it to record how much of your monthly budget a run consumed.
+
+```bash
+# Install CodexBar CLI (macOS only)
+brew install steipete/tap/codexbar
+# or use the in-app "Install CLI" option
+
+# Sample quota during a run (opt-in; norn never calls CodexBar unless asked)
+uv run python -m norn run pipeline.py --quota codexbar
+
+# Abort the run when quota cannot be read, instead of continuing
+uv run python -m norn run pipeline.py --quota codexbar --require-quota
+
+# Continue even when the quota call fails (default behaviour; explicit override)
+uv run python -m norn run pipeline.py --quota codexbar --quota-fail-open
+```
+
+norn never auto-detects or calls CodexBar. Identity fields (account, org) are stripped before anything is written to the journal.
+
 ## Pipeline Configs
 
 External pipeline files are loaded with `importlib` and must define `config = Pipeline(...)`.
