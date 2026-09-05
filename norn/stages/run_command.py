@@ -191,6 +191,24 @@ class RunCommand(BaseStage):
             self._terminate_group(proc)
             with contextlib.suppress(Exception):
                 await proc.wait()
+            # Drain whatever the StreamReader buffered before the kill.
+            # The cancelled _read_stream tasks may not have consumed bytes
+            # that arrived (or were already in the asyncio internal buffer)
+            # before cancellation.  Reading here — after the process is dead
+            # and its pipe is closed — is safe and fast: the reader is at or
+            # near EOF, so each read returns immediately with buffered data or
+            # b"" to signal EOF.
+            for _stream, _sink in ((proc.stdout, out), (proc.stderr, err)):
+                if _stream is None:
+                    continue
+                with contextlib.suppress(Exception):
+                    while not _stream.at_eof():
+                        _data = await asyncio.wait_for(
+                            _stream.read(READ_CHUNK_BYTES), timeout=1.0
+                        )
+                        if not _data:
+                            break
+                        _sink.feed(_data)
         except asyncio.CancelledError:
             # External cancellation (pipeline abort, or a Stage-level timeout in
             # the runner). Reap the tree before propagating so nothing is left
