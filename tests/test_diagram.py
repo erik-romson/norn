@@ -100,3 +100,24 @@ def test_to_markdown_bundled():
     assert "```mermaid" in result
     assert "ANTHROPIC_API_KEY" in result
     assert "**args**" in result
+
+
+def test_to_mermaid_uses_build_graph(monkeypatch):
+    """to_mermaid must drive output through build_graph (proves graph is consumed)."""
+    import norn.diagram as diagram_mod
+    from norn.graph import build_graph as real_build_graph
+
+    calls: list = []
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return real_build_graph(*args, **kwargs)
+
+    monkeypatch.setattr(diagram_mod, "build_graph", spy)
+
+    p = Pipeline("probe").stage("only", _Stub())
+    result = to_mermaid(p)
+
+    assert len(calls) == 1, "build_graph should be called exactly once"
+    assert calls[0][0] is p, "build_graph should receive the pipeline"
+    assert "only" in result
