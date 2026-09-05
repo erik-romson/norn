@@ -318,6 +318,11 @@ def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
         console.print("\n  [dim]No detailed stage log stored for this run.[/dim]\n")
         return
 
+    # Use a wide-enough console so the step log table is not truncated when
+    # stdout is not a TTY (e.g. pytest capture, CI pipe) where Rich defaults
+    # to 80 columns.  The table has 12 columns and needs ~160 chars for all
+    # values to render unclipped.
+    wide = Console(width=max(console.width, 160))
     table = Table(title=f"Run #{record.run_id} — Step Log", title_style="bold", show_edge=False)
     table.add_column("Step", style="cyan", overflow="fold")
     table.add_column("Att", justify="right")
@@ -369,6 +374,6 @@ def print_history_run_details(records: list[RunRecord], run_id: int) -> None:
             info or "-",
         )
 
-    console.print()
-    console.print(table)
-    console.print()
+    wide.print()
+    wide.print(table)
+    wide.print()

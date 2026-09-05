@@ -20,6 +20,7 @@ tmp2/
 /**/*.session
 /**/*.history
 /**/*.checkpoint
+/**/*.runs/
 
 # Environment / secrets
 .env

@@ -350,6 +350,7 @@ def main() -> None:
     params["skip"] = set(args.skip)
 
     # Resolve pipeline: --org flag, issue key auto-detection, or plain file path
+    pipeline_source: str | None = None
     if args.org:
         try:
             pipeline = load_org_config(args.org)
@@ -367,11 +368,14 @@ def main() -> None:
         params.setdefault("issue", args.config)
         config_path_for_checkpoint = _primary_state_key(args.config)
     elif get_pipeline_info(args.config):
+        info = get_pipeline_info(args.config)
         pipeline = load_bundled_pipeline(args.config)
         config_path_for_checkpoint = _primary_state_key(args.config)
+        pipeline_source = str(info.path)
     else:
         pipeline = _load_pipeline(args.config)
         config_path_for_checkpoint = _primary_state_key(args.config)
+        pipeline_source = str(Path(args.config).resolve())
 
     if args.dry_run:
         from norn.ui import print_dry_run
@@ -421,6 +425,7 @@ def main() -> None:
             step_mode=args.step,
             agent_provider=resolved_provider,
             input_responder=input_responder,
+            pipeline_source=pipeline_source,
         ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
     except PipelineError as e:

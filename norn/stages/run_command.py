@@ -207,6 +207,8 @@ class RunCommand(BaseStage):
                 await flusher
             self._emit_pending(emit, out, err, final=True)
 
+        _details = {"cmd": self.cmd, "timeout": self.timeout}
+
         if timed_out:
             cmd_preview = self.cmd if len(self.cmd) <= 500 else self.cmd[:500] + "…"
             return StageResult(
@@ -219,6 +221,7 @@ class RunCommand(BaseStage):
                     f"command timed out after {self.timeout:g}s and was killed\n"
                     f"$ {cmd_preview}"
                 ),
+                details=_details,
             )
 
         output = {
@@ -228,7 +231,7 @@ class RunCommand(BaseStage):
         }
         success = proc.returncode == 0
         error = self._format_error(output) if not success else None
-        return StageResult(name="", success=success, output=output, error=error)
+        return StageResult(name="", success=success, output=output, error=error, details=_details)
 
     # ------------------------------------------------------------------
     # Live output streaming

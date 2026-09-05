@@ -211,6 +211,8 @@ class StageResult:
     error: str | None = None
     usage: UsageRecord | None = None
     artifacts: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+    """Stage-specific diagnostics for the run journal; never read by other stages."""
 
 
 @dataclass
@@ -253,6 +255,8 @@ class PipelineContext:
     run_controller: Any = None
     working_dir: str | None = None
     """Run working directory; relative stage paths resolve under it when set, else process cwd."""
+    journal: Any = None
+    """RunJournal instance when journal recording is active."""
 
     def get(self, stage_name: str) -> Any:
         """Get output from a previous stage."""

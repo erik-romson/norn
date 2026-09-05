@@ -276,6 +276,32 @@ def _append_stage_log(
     _persist_history_snapshot(ctx)
 
 
+def _journal_record_stage(
+    ctx: PipelineContext,
+    *,
+    node_id: str,
+    attempt: int,
+    status: str,
+    started_at: str,
+    duration_ms: int,
+    result: StageResult,
+) -> None:
+    """Record a stage execution to the journal (if active)."""
+    journal = ctx.journal
+    if journal is None:
+        return
+    finished_at = datetime.now(timezone.utc).isoformat()
+    journal.record_stage(
+        node_id=node_id,
+        attempt=attempt,
+        status=status,
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=duration_ms,
+        result=result,
+    )
+
+
 async def _run_stage(
     stage: Stage,
     ctx: PipelineContext,
@@ -295,6 +321,7 @@ async def _run_stage(
     id matches :func:`norn.graph.build_graph`.
     """
     start = time.monotonic()
+    _started_at = datetime.now(timezone.utc).isoformat()
     stage_id = node_id or f"stage:{stage.name}"
     _ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=stage_id, attempt=attempt)
     ctx.event_sink.emit(StageStarted(key=_ekey, name=stage.name, attempt=attempt))
@@ -342,6 +369,8 @@ async def _run_stage(
                     duration_ms=int(elapsed * 1000),
                     error=error,
                 ))
+                _journal_record_stage(ctx, node_id=stage_id, attempt=attempt, status="failed",
+                                      started_at=_started_at, duration_ms=int(elapsed * 1000), result=result)
                 return result
             agent_kwargs["mcp_tools"] = mcp_tools
             log.debug("[%s] Attached MCP tools (%d tool(s))", stage.name, len(mcp_tools))
@@ -392,6 +421,8 @@ async def _run_stage(
                 duration_ms=int(elapsed * 1000),
                 error=error,
             ))
+            _journal_record_stage(ctx, node_id=stage_id, attempt=attempt, status="cancelled",
+                                  started_at=_started_at, duration_ms=int(elapsed * 1000), result=result)
             raise CancelledError(stage.name)
         # Outer cancellation (e.g. the run task itself was cancelled) — never
         # swallow, let it propagate.
@@ -417,6 +448,8 @@ async def _run_stage(
             duration_ms=int(elapsed * 1000),
             error=result.error,
         ))
+        _journal_record_stage(ctx, node_id=stage_id, attempt=attempt, status="failed",
+                              started_at=_started_at, duration_ms=int(elapsed * 1000), result=result)
         return result
     finally:
         if ctrl is not None:
@@ -456,6 +489,10 @@ async def _run_stage(
         usage_output_tokens=result.usage.output_tokens if result.usage else 0,
         usage_cost_usd=result.usage.total_cost_usd if result.usage else 0.0,
     ))
+
+    _journal_record_stage(ctx, node_id=stage_id, attempt=attempt,
+                          status="passed" if result.success else "failed",
+                          started_at=_started_at, duration_ms=int(elapsed * 1000), result=result)
 
     if budgets and result.usage:
         await _check_budget(budgets, ctx.usage_tracker, ctx, _ekey)
@@ -881,6 +918,8 @@ async def run_pipeline(
     run_controller: RunController | None = None,
     working_dir: str | None = None,
     run_id: str | None = None,
+    pipeline_source: str | None = None,
+    journal: object | None = None,
 ) -> PipelineContext:
     """Execute a pipeline definition, returning the final context.
 
@@ -945,6 +984,31 @@ async def run_pipeline(
         ctx._history_config_path = config_path
         ctx._history_run_id = next_run_id(config_path)
         ctx._history_start_time = start_time
+
+    # Journal setup: create or reuse a RunJournal for this run
+    if journal is not None:
+        # Isolated include: reuse the parent's journal, don't wrap the sink again.
+        ctx.journal = journal
+    elif config_path:
+        from norn.journal import JournalSink, RunJournal
+        from norn.journal import next_run_id as journal_next_run_id
+
+        _journal_run_id = journal_next_run_id(config_path)
+        _journal = RunJournal.open(config_path, _journal_run_id)
+        _journal.write_header(
+            pipeline=pipeline.name,
+            run_id=_journal_run_id,
+            state_key=config_path,
+            pipeline_source=pipeline_source,
+            provider=agent_provider,
+            params={k: ui.mask(str(v)) for k, v in (params or {}).items()},
+            budgets=[str(b) for b in (pipeline.budgets or [])],
+            default_model=pipeline.default_model,
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        ctx.journal = _journal
+        ctx.event_sink = JournalSink(ctx.event_sink, _journal)
+
     if ctx.params:
         log.debug("Pipeline params: %s", ctx.params)
 
@@ -1226,6 +1290,7 @@ async def run_pipeline(
                     event_sink=ctx.event_sink,
                     input_responder=ctx.input_responder,
                     run_controller=ctx.run_controller,
+                    journal=ctx.journal,
                 )
                 ctx.event_sink.emit(IncludeDone(
                     key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
@@ -1274,6 +1339,23 @@ async def run_pipeline(
         raise
     finally:
         _persist_history_snapshot(ctx, failed_stage=_failed_stage, in_progress=False)
+        if ctx.journal is not None and journal is None:
+            # Only finish the journal if we created it (not if passed from parent)
+            tracker = ctx.usage_tracker
+            ctx.journal.finish(
+                success=_failed_stage is None,
+                failed_stage=_failed_stage,
+                duration_ms=int((time.monotonic() - start_time) * 1000),
+                totals={
+                    "cost": tracker.total_cost_usd,
+                    "billed_input_tokens": tracker.total_billed_input_tokens,
+                    "output_tokens": tracker.total_output_tokens,
+                    "turns": tracker.total_turns,
+                    "tool_uses": tracker.total_tool_uses,
+                    "tool_errors": tracker.total_tool_errors,
+                    "retries": ctx.retries,
+                },
+            )
         ctx.event_sink.emit(RunFinished(
             key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
             success=_failed_stage is None,

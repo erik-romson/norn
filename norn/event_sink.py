@@ -37,7 +37,7 @@ from norn.ui import mask
 # ---------------------------------------------------------------------------
 
 
-def _redact_event(event: RunEvent) -> RunEvent:
+def redact_event(event: RunEvent) -> RunEvent:
     """Return a copy of *event* with displayable text fields redacted.
 
     Only event types that carry user-visible text need treatment.
@@ -138,6 +138,11 @@ def _redact_event(event: RunEvent) -> RunEvent:
     return event
 
 
+# Backward-compatible alias so ``from norn.event_sink import _redact_event``
+# (used by tests/test_event_sink.py:10) keeps working.
+_redact_event = redact_event
+
+
 # ---------------------------------------------------------------------------
 # Coalesce key helper
 # ---------------------------------------------------------------------------
@@ -185,7 +190,7 @@ class EventSink:
 
         **Never blocks the producer.** Safe to call from sync or async context.
         """
-        event = _redact_event(event)
+        event = redact_event(event)
 
         with self._lock:
             delivery = event.delivery

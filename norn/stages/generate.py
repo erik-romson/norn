@@ -388,6 +388,18 @@ class Generate(BaseStage):
             permissions=permissions,
         )
 
+        # Build details for the run journal
+        _details: dict[str, Any] = {
+            "prompt": resolved_prompt,
+            "system_prompt": system_prompt,
+            "model": self.model,
+            "resolved_model": resolved_model,
+            "permission_mode": effective_permission_mode,
+            "allowed_tools": effective_allowed_tools,
+            "effective_max_turns": effective_max_turns,
+            "resolved_setting_sources": resolved_setting_sources,
+        }
+
         # Run via the registered provider (already fetched above for capability gating)
         chunks: list[str] = []
         artifacts: list[str] = []
@@ -487,7 +499,7 @@ class Generate(BaseStage):
 
             # When output_format was declared (via template), prefer structured_output
             if structured_output is not None:
-                return StageResult(name="", success=True, output=structured_output, usage=usage_record, artifacts=artifacts)
+                return StageResult(name="", success=True, output=structured_output, usage=usage_record, artifacts=artifacts, details=_details)
 
             # Only write output_file when set AND the agent had no file-writing
             # tools — otherwise the agent already wrote files via Edit/Write tools
@@ -506,14 +518,15 @@ class Generate(BaseStage):
                 out_path = resolve_run_path(ctx, self.output_file)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(code)
-                return StageResult(name="", success=True, output=code, usage=usage_record, artifacts=artifacts)
+                return StageResult(name="", success=True, output=code, usage=usage_record, artifacts=artifacts, details=_details)
 
-            return StageResult(name="", success=True, output=raw_output, usage=usage_record, artifacts=artifacts)
+            return StageResult(name="", success=True, output=raw_output, usage=usage_record, artifacts=artifacts, details=_details)
         except ImportError as e:
             return StageResult(
                 name="",
                 success=False,
                 error=str(e),
+                details=_details,
             )
         except Exception as e:
             log.debug("[generate] Exception: %s", e)
@@ -527,4 +540,5 @@ class Generate(BaseStage):
             return StageResult(
                 name="", success=False,
                 error=_render_cli_exception(original, stderr_lines, chunks),
+                details=_details,
             )

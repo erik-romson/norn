@@ -112,7 +112,8 @@ second run can start against the same repo while the first is still live.
 | File | Role |
 | --- | --- |
 | `norn/events.py` | Typed run-event classes, `EventKey` (`run_id, unit_id, stage_id, attempt, seq`), `Delivery` enum (`LOSSLESS`/`COALESCIBLE`/`PAGEABLE`). No SDK types. |
-| `norn/event_sink.py` | `EventSink` (buffers, redacts, dispatches to `on_event`), `NullSink`. Redaction via `norn.ui.mask()` happens once here. |
+| `norn/event_sink.py` | `EventSink` (buffers, redacts, dispatches to `on_event`), `NullSink`. Redaction via `norn.ui.mask()` happens once at the seam via `redact_event()` (renamed from `_redact_event`; alias kept for test compat). |
+| `norn/journal.py` | `RunJournal` (append-only per-run record: `run.json`, `events.jsonl`, `stages/*.json`), `JournalSink` (wraps an inner `EventSink`, journals every redacted event then forwards to the inner sink). |
 | `norn/graph.py` | `PipelineGraph` / `PipelineNode`, `build_graph(pipeline)` with stable IDs (`stage:<name>`, `loop:<name>`, …). Shared by diagram, dry-run and the TUI. |
 | `norn/run_control.py` | `RunController` — pause/resume, cancel, answer-input futures. `CancelledError`. |
 | `norn/responder.py` | `InputResponder` base; `CLIResponder` (preserves `norn run` prompts), `TUIResponder` (non-blocking). |
@@ -413,5 +414,7 @@ and then `git branch -D <work_branch>`.
   disabled, dirty-tree stash not supported, untracked/ignored files must be
   committed before launch, submodules unhandled, subdir-launch semantics
   undefined.
-- **No event journal.** The history browser shows summaries, not a full
-  transcript replay.
+- **Event journal available.** `norn/journal.py` records a full per-run
+  journal (`<state-key>.runs/<run_id>/`) with redacted events, stage records,
+  and run metadata. The history browser still shows summaries; transcript
+  replay from the journal is a future extension.
