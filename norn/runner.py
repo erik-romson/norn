@@ -5,6 +5,8 @@ import glob as glob_module
 import logging
 import os
 import pathlib
+import subprocess
+import sys
 import time
 import uuid
 from dataclasses import replace
@@ -922,7 +924,6 @@ async def run_pipeline(
     journal: object | None = None,
     quota_probe: str | None = None,
     require_quota: bool = False,
-    quota_fail_open: bool = False,
 ) -> PipelineContext:
     """Execute a pipeline definition, returning the final context.
 
@@ -1015,6 +1016,17 @@ async def run_pipeline(
                     raise
                 log.warning("quota: pre-run probe failed: %s", _qe)
 
+        _git_head: str | None = None
+        try:
+            _git_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip() or None
+        except Exception:
+            pass
+
         _journal.write_header(
             pipeline=pipeline.name,
             run_id=_journal_run_id,
@@ -1028,6 +1040,8 @@ async def run_pipeline(
             started_at=datetime.now(timezone.utc).isoformat(),
             cwd=str(ctx.working_dir or os.getcwd()),
             quota_before=_quota_before,
+            git_head=_git_head,
+            argv=sys.argv[:],
         )
         ctx.journal = _journal
         ctx.event_sink = JournalSink(ctx.event_sink, _journal)
@@ -1376,6 +1390,7 @@ async def run_pipeline(
                     if require_quota:
                         raise
                     log.warning("quota: post-run probe failed: %s", _qe2)
+                    _quota_after = {"error": str(_qe2)}   # write error object per plan
 
             ctx.journal.finish(
                 success=_failed_stage is None,

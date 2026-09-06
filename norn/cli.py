@@ -205,7 +205,7 @@ def main() -> None:
     run_parser.add_argument(
         "--quota-fail-open",
         action="store_true",
-        help="Explicitly allow continuing when quota sampling fails",
+        help="(deferred — threshold-based guard not yet implemented; accepted for forward compatibility)",
     )
 
     history_parser = sub.add_parser("history", help="Show run history for a pipeline config")
@@ -604,7 +604,6 @@ def main() -> None:
             pipeline_source=pipeline_source,
             quota_probe=getattr(args, "quota_probe", None),
             require_quota=getattr(args, "require_quota", False),
-            quota_fail_open=getattr(args, "quota_fail_open", False),
         ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
     except PipelineError as e:
