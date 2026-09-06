@@ -858,6 +858,29 @@ def _build_prior_context(
 # ---------------------------------------------------------------------------
 
 
+def _assert_head_unchanged(head_file: str, during: str) -> str:
+    """Build the shell that fails when HEAD no longer matches *head_file*.
+
+    The message names both SHAs and stays neutral about the cause. HEAD moves
+    forward when something commits and backward when something resets, and the
+    two are indistinguishable here — a message that only accuses the agent of
+    committing sends the reader hunting in the wrong place when the real cause
+    was a `git reset` in another terminal while the run was in flight.
+    """
+    q = shlex.quote
+    return (
+        f'RECORDED=$(cat {q(head_file)}) && ACTUAL=$(git rev-parse HEAD) && '
+        f'if [ "$ACTUAL" != "$RECORDED" ]; then '
+        f'echo "ERROR: HEAD moved during {during}." 1>&2; '
+        f'echo "  recorded: $RECORDED" 1>&2; '
+        f'echo "  now:      $ACTUAL" 1>&2; '
+        f'echo "Nothing may commit, reset, or check out in this repo while the run is '
+        f'in flight — not the agent, not another terminal. If the move was intended, '
+        f'rerun without --resume so the baseline is re-recorded." 1>&2; '
+        f'exit 1; fi'
+    )
+
+
 def _commit_cmd(
     pre_json: str,
     head_file: str,
@@ -927,8 +950,7 @@ def _commit_cmd(
         f'without --resume (already-committed steps are auto-skipped)." 1>&2; '
         f'exit 1; fi; '
         # HEAD must not have moved since the baseline was recorded.
-        f'test "$(git rev-parse HEAD)" = "$(cat {q(head_file)})" || '
-        f'{{ echo "ERROR: HEAD moved since the baseline was recorded" 1>&2; exit 1; }}; '
+        f'{_assert_head_unchanged(head_file, "this step")}; '
         # Take a post-snapshot, diff against pre to find step-owned changes.
         f'python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(post_json)} || exit 1; '
         f'python3 {q(SNAPSHOT_HELPER)} diff {q(pre_json)} {q(post_json)} --root {q(GIT_TOPLEVEL)} > {q(changed_list)} || exit 1; '
@@ -1239,9 +1261,7 @@ for step_file in step_files:
         f"assert head unchanged {name}",
         RunCommand(cmd=(
             f'cd {shlex.quote(GIT_TOPLEVEL)} && '
-            f'test "$(git rev-parse HEAD)" = "$(cat {shlex.quote(step_head)})" || '
-            f'{{ echo "ERROR: HEAD moved during implement {name}; '
-            f'the agent must not commit"; exit 1; }} && '
+            f'{_assert_head_unchanged(step_head, f"implement {name}")} && '
             f'git diff --cached --quiet || '
             f'{{ echo "ERROR: the agent staged files during implement {name}"; exit 1; }}'
         )),
@@ -1348,9 +1368,7 @@ for step_file in step_files:
             cmd=(
                 f'cd {shlex.quote(GIT_TOPLEVEL)} && '
                 f'echo "=== head ===" && '
-                f'test "$(git rev-parse HEAD)" = "$(cat {shlex.quote(step_head)})" || '
-                f'{{ echo "ERROR: HEAD moved during validation of {name}; '
-                f'the agent must not commit"; exit 1; }} && '
+                f'{_assert_head_unchanged(step_head, f"validation of {name}")} && '
                 f'git diff --cached --quiet || '
                 f'{{ echo "ERROR: the agent staged files during validation of {name}"; exit 1; }} && '
                 f'echo "=== validation ===" && '
@@ -1577,9 +1595,7 @@ pipeline.stage(
         cmd=(
             f'cd {shlex.quote(GIT_TOPLEVEL)} && '
             f'echo "=== head ===" && '
-            f'test "$(git rev-parse HEAD)" = "$(cat {shlex.quote(agg_head)})" || '
-            f'{{ echo "ERROR: HEAD moved during aggregate validation loop; '
-            f'a repair must not commit inside the loop"; exit 1; }} && '
+            f'{_assert_head_unchanged(agg_head, "the aggregate validation loop")} && '
             f'git diff --cached --quiet || '
             f'{{ echo "ERROR: index has staged changes after aggregate loop"; exit 1; }} && '
             f'echo "=== aggregate validation ===" && '
@@ -1871,8 +1887,7 @@ def _add_review_round(n: int, when) -> None:
     postcond_cmd = (
         f"cd {q(GIT_TOPLEVEL)} && "
         # HEAD must not have moved.
-        f'test "$(git rev-parse HEAD)" = "$(cat {q(paths["head"])})" || '
-        f'{{ echo "ERROR: HEAD moved during review {n}"; exit 1; }} && '
+        f'{_assert_head_unchanged(paths["head"], f"review {n}")} && '
         # Index must be clean.
         f"git diff --cached --quiet || "
         f'{{ echo "ERROR: review {n} staged files"; exit 1; }} && '
