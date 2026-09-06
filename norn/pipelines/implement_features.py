@@ -581,6 +581,11 @@ for step_file in step_files:
     # step, then `git add -A --` only those paths. Pre-existing dirty files
     # whose status is unchanged are left untouched.
     #
+    # `--root` drops the paths `git add` would refuse — ones that became
+    # gitignored during the step, and ones the step deleted that git never
+    # tracked. One refused pathspec aborts the whole `git add`, so without the
+    # filter a single such path kills the step.
+    #
     # Uses `git commit -F -` so the subject is safe regardless of what
     # characters the H1 contained.
     #
@@ -620,6 +625,7 @@ for step_file in step_files:
                 f'git status --porcelain -uall > {shlex.quote(post_snapshot)} || exit 1; '
                 f'python3 {shlex.quote(SNAPSHOT_HELPER)} '
                 f'{shlex.quote(pre_snapshot)} {shlex.quote(post_snapshot)} '
+                f'--root {shlex.quote(GIT_TOPLEVEL)} '
                 f'> {shlex.quote(changed_list)} || exit 1; '
                 f'if [ ! -s {shlex.quote(changed_list)} ]; then '
                 f'echo "no files changed during this step"; exit 0; fi; '

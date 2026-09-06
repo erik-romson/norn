@@ -18,6 +18,7 @@ from norn.pipelines._step_snapshot import (
     hook_fixes,
     main,
     parse_status_z,
+    unstageable_paths,
 )
 
 
@@ -509,3 +510,163 @@ class TestCLIUsageErrors:
     def test_unknown_subcommand_exits_2(self) -> None:
         rc = main(["_step_snapshot.py", "frobnicate"])
         assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# diff --root — paths git add would refuse
+# ---------------------------------------------------------------------------
+
+
+def _git_add(root: Path, paths: list[str]) -> int:
+    """Stage *paths* exactly as the commit stage does; return the exit code."""
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(root), "add", "-A", "--", *paths],
+        capture_output=True,
+    ).returncode
+
+
+class TestDiffRootFilter:
+    """`diff --root` must not emit a path that would abort `git add -A --`."""
+
+    def test_newly_ignored_path_is_dropped(self, tmp_path: Path, capsysbinary) -> None:
+        """A path that became gitignored during the step is not staged.
+
+        This is the failure seen in the wild: norn's own state files were
+        untracked when the baseline was taken, then added to the target repo's
+        .gitignore, and `git add` refused the whole batch.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        (root / "pipeline.runs").write_bytes(b"norn state")
+        pre = _snapshot(tmp_path, root, "pre.json")
+
+        (root / ".gitignore").write_text("pipeline.runs\n")
+        (root / "app.py").write_bytes(b"real work")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        changed = _diff_output(capsysbinary, pre, post, ["--root", str(root)])
+
+        assert "pipeline.runs" not in changed
+        assert "app.py" in changed
+        assert ".gitignore" in changed
+        assert _git_add(root, changed) == 0
+
+    def test_unfiltered_diff_still_reports_the_ignored_path(
+        self, tmp_path: Path, capsysbinary
+    ) -> None:
+        """Without --root the behaviour is unchanged — and `git add` fails."""
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        (root / "pipeline.runs").write_bytes(b"norn state")
+        pre = _snapshot(tmp_path, root, "pre.json")
+
+        (root / ".gitignore").write_text("pipeline.runs\n")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        changed = _diff_output(capsysbinary, pre, post)
+
+        assert "pipeline.runs" in changed
+        assert _git_add(root, changed) != 0
+
+    def test_deleted_untracked_path_is_dropped(
+        self, tmp_path: Path, capsysbinary
+    ) -> None:
+        """An untracked file the step deleted is not a stageable pathspec."""
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        (root / "scratch.tmp").write_bytes(b"dirty before the step")
+        pre = _snapshot(tmp_path, root, "pre.json")
+
+        os.remove(root / "scratch.tmp")
+        (root / "app.py").write_bytes(b"real work")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        changed = _diff_output(capsysbinary, pre, post, ["--root", str(root)])
+
+        assert "scratch.tmp" not in changed
+        assert "app.py" in changed
+        assert _git_add(root, changed) == 0
+
+    def test_deleted_tracked_file_is_kept(self, tmp_path: Path, capsysbinary) -> None:
+        """A tracked file is still in the index, so its deletion must be staged."""
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        pre = _snapshot(tmp_path, root, "pre.json")
+
+        os.remove(root / "README.md")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        changed = _diff_output(capsysbinary, pre, post, ["--root", str(root)])
+
+        assert "README.md" in changed
+        assert _git_add(root, changed) == 0
+
+    def test_tracked_file_matching_an_ignore_pattern_is_kept(
+        self, tmp_path: Path, capsysbinary
+    ) -> None:
+        """git add stages tracked files regardless of .gitignore — so must we."""
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        pre = _snapshot(tmp_path, root, "pre.json")
+
+        (root / "README.md").write_bytes(b"edited by the step")
+        (root / ".gitignore").write_text("README.md\n")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        changed = _diff_output(capsysbinary, pre, post, ["--root", str(root)])
+
+        assert "README.md" in changed
+        assert _git_add(root, changed) == 0
+
+    def test_dropped_paths_are_reported_on_stderr(
+        self, tmp_path: Path, capsysbinary
+    ) -> None:
+        """Dropping a changed path silently would look like lost work."""
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        (root / "pipeline.runs").write_bytes(b"norn state")
+        pre = _snapshot(tmp_path, root, "pre.json")
+
+        (root / ".gitignore").write_text("pipeline.runs\n")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        main(["_step_snapshot.py", "diff", pre, post, "--root", str(root)])
+
+        err = capsysbinary.readouterr().err.decode()
+        assert "pipeline.runs" in err
+
+    def test_root_requires_a_value(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        pre = _snapshot(tmp_path, root, "pre.json")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        assert main(["_step_snapshot.py", "diff", pre, post, "--root"]) == 2
+
+
+class TestUnstageablePaths:
+    """Direct unit tests for the predicate behind `diff --root`."""
+
+    def test_empty_input_makes_no_git_calls(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        assert unstageable_paths([], repo.working_tree_dir) == set()
+
+    def test_existing_untracked_file_is_stageable(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        (root / "new.py").write_bytes(b"x")
+
+        assert unstageable_paths(["new.py"], str(root)) == set()
+
+    def test_ignored_and_missing_paths_are_both_reported(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        (root / ".gitignore").write_text("build/\n")
+        (root / "build").mkdir()
+        (root / "build" / "out.o").write_bytes(b"x")
+
+        result = unstageable_paths(["build/out.o", "never-existed.txt", "README.md"], str(root))
+
+        assert result == {"build/out.o", "never-existed.txt"}

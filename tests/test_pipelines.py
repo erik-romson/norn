@@ -230,3 +230,142 @@ def test_hook_fixes_ignores_staged_then_deleted_paths(tmp_path) -> None:
     status = _write_status(tmp_path, "MD vanished.py")
 
     assert hook_fixes(status) == []
+
+
+# ---------------------------------------------------------------------------
+# _snapshot_diff.py --root — paths git add would refuse (v1)
+# ---------------------------------------------------------------------------
+
+
+def _v1_status(tmp_path, root, name: str) -> str:
+    """Write a real `git status --porcelain -uall` snapshot for *root*.
+
+    The file lands outside the repo so it never shows up in its own snapshot.
+    """
+    import subprocess
+
+    out = tmp_path / f"{name}.txt"
+    result = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "-uall"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out.write_text(result.stdout)
+    return str(out)
+
+
+def _v1_repo(tmp_path):
+    """Create a git repo with an initial commit; return its path."""
+    import subprocess
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "test@example.com"],
+        ["config", "user.name", "Test User"],
+    ):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    (root / "README.md").write_text("# test\n")
+    subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "-qm", "initial"], check=True, capture_output=True
+    )
+    return root
+
+
+def _v1_diff(capsys, pre: str, post: str, extra: list[str] | None = None) -> list[str]:
+    """Run the v1 diff and return the printed paths."""
+    from norn.pipelines._snapshot_diff import main
+
+    rc = main(["_snapshot_diff.py", pre, post] + (extra or []))
+    assert rc == 0, f"diff returned {rc}"
+    return [line for line in capsys.readouterr().out.splitlines() if line]
+
+
+def _v1_git_add(root, paths: list[str]) -> int:
+    """Stage *paths* exactly as the v1 commit stage does; return the exit code."""
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(root), "add", "-A", "--", *paths],
+        capture_output=True,
+    ).returncode
+
+
+def test_v1_diff_root_drops_newly_ignored_path(tmp_path, capsys) -> None:
+    """A path gitignored during the step must not reach `git add` (v1)."""
+    root = _v1_repo(tmp_path)
+    (root / "pipeline.runs").write_text("norn state")
+    pre = _v1_status(tmp_path, root, "pre")
+
+    (root / ".gitignore").write_text("pipeline.runs\n")
+    (root / "app.py").write_text("real work")
+    post = _v1_status(tmp_path, root, "post")
+
+    changed = _v1_diff(capsys, pre, post, ["--root", str(root)])
+
+    assert "pipeline.runs" not in changed
+    assert "app.py" in changed
+    assert _v1_git_add(root, changed) == 0
+
+
+def test_v1_diff_without_root_still_reports_the_ignored_path(tmp_path, capsys) -> None:
+    """Unfiltered v1 behaviour is unchanged — and `git add` fails on it."""
+    root = _v1_repo(tmp_path)
+    (root / "pipeline.runs").write_text("norn state")
+    pre = _v1_status(tmp_path, root, "pre")
+
+    (root / ".gitignore").write_text("pipeline.runs\n")
+    post = _v1_status(tmp_path, root, "post")
+
+    changed = _v1_diff(capsys, pre, post)
+
+    assert "pipeline.runs" in changed
+    assert _v1_git_add(root, changed) != 0
+
+
+def test_v1_diff_root_drops_deleted_untracked_path(tmp_path, capsys) -> None:
+    """An untracked file the step deleted is not a stageable pathspec (v1)."""
+    root = _v1_repo(tmp_path)
+    (root / "scratch.tmp").write_text("dirty before the step")
+    pre = _v1_status(tmp_path, root, "pre")
+
+    (root / "scratch.tmp").unlink()
+    (root / "app.py").write_text("real work")
+    post = _v1_status(tmp_path, root, "post")
+
+    changed = _v1_diff(capsys, pre, post, ["--root", str(root)])
+
+    assert "scratch.tmp" not in changed
+    assert "app.py" in changed
+    assert _v1_git_add(root, changed) == 0
+
+
+def test_v1_diff_root_keeps_deleted_tracked_file(tmp_path, capsys) -> None:
+    """A tracked file is still in the index, so its deletion must be staged (v1)."""
+    root = _v1_repo(tmp_path)
+    pre = _v1_status(tmp_path, root, "pre")
+
+    (root / "README.md").unlink()
+    post = _v1_status(tmp_path, root, "post")
+
+    changed = _v1_diff(capsys, pre, post, ["--root", str(root)])
+
+    assert "README.md" in changed
+    assert _v1_git_add(root, changed) == 0
+
+
+def test_v1_diff_root_requires_a_value(tmp_path) -> None:
+    from norn.pipelines._snapshot_diff import main
+
+    assert main(["_snapshot_diff.py", "pre.txt", "post.txt", "--root"]) == 2
+
+
+def test_v1_hook_fixes_still_works_with_the_new_argv_parsing(tmp_path) -> None:
+    """--hook-fixes is dispatched before the diff argument parsing."""
+    from norn.pipelines._snapshot_diff import main
+
+    status = _write_status(tmp_path, "MM modified.py", "?? scratch.txt")
+    assert main(["_snapshot_diff.py", "--hook-fixes", status]) == 0

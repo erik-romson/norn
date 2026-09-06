@@ -877,7 +877,9 @@ def _commit_cmd(
     2. Remove a stale hookfix marker from a prior run.
     3. Verify pre_json exists (stale-checkpoint guard).
     4. Verify HEAD has not moved since the baseline.
-    5. Snapshot + diff to find step-owned changes.
+    5. Snapshot + diff to find step-owned changes.  ``diff --root`` drops the
+       paths ``git add`` would refuse (newly ignored, or gone and never
+       tracked); a single refused pathspec aborts the whole stage otherwise.
     6. Stage only those changes.
     7. Re-stage any files rewritten by auto-fixing pre-commit hooks.
     8. Commit with one retry after hook rejection: on the first rejection,
@@ -929,7 +931,7 @@ def _commit_cmd(
         f'{{ echo "ERROR: HEAD moved since the baseline was recorded" 1>&2; exit 1; }}; '
         # Take a post-snapshot, diff against pre to find step-owned changes.
         f'python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(post_json)} || exit 1; '
-        f'python3 {q(SNAPSHOT_HELPER)} diff {q(pre_json)} {q(post_json)} > {q(changed_list)} || exit 1; '
+        f'python3 {q(SNAPSHOT_HELPER)} diff {q(pre_json)} {q(post_json)} --root {q(GIT_TOPLEVEL)} > {q(changed_list)} || exit 1; '
         # If nothing changed, branch on require_changes.
         f'if [ ! -s {q(changed_list)} ]; then {no_change_branch}; fi; '
         # Stage exactly the owned paths (NUL-separated from diff).

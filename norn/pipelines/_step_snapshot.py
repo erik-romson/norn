@@ -21,10 +21,12 @@ Three subcommands
     Run ``git status`` in *dir*, build the snapshot, write JSON.  Non-zero git
     exit propagates immediately.
 
-``diff <pre.json> <post.json> [--ignore PATH]... [--ignore-file NULLIST]...``
+``diff <pre.json> <post.json> [--root DIR] [--ignore PATH]... [--ignore-file NULLIST]...``
     Print NUL-terminated changed paths after filtering any ignore lists.
     Missing *pre.json* is a hard error (exit 2) — a stale resume must be loud.
-    Missing *post.json* is also a hard error.
+    Missing *post.json* is also a hard error.  With ``--root`` the changed set
+    is additionally filtered through :func:`unstageable_paths`, so a path
+    ``git add`` would refuse never reaches the commit stage.
 
 ``hook-fixes --root <dir>``
     Print NUL-terminated partially-staged paths (index column in ``MARC`` and
@@ -161,6 +163,93 @@ def _run_git_status(root: str) -> bytes:
     return result.stdout
 
 
+def _chunks(items: list[str], size: int = 256) -> list[list[str]]:
+    """Split *items* into argv-sized chunks so long path lists cannot blow ARG_MAX."""
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _git_ignored(root: str, paths: list[str]) -> set[str]:
+    """Return the subset of *paths* that ``.gitignore`` rules exclude.
+
+    ``git check-ignore`` consults the index, so a *tracked* file matching an
+    ignore pattern is not reported — matching ``git add``, which stages it
+    happily.  Exit 0 means "some were ignored", exit 1 means "none were";
+    anything higher is a real git error and aborts.
+    """
+    if not paths:
+        return set()
+    payload = b"".join(
+        p.encode("utf-8", errors="surrogateescape") + b"\0" for p in paths
+    )
+    result = subprocess.run(
+        ["git", "-C", root, "check-ignore", "-z", "--stdin"],
+        input=payload,
+        capture_output=True,
+    )
+    if result.returncode > 1:
+        sys.stderr.buffer.write(result.stderr)
+        sys.exit(result.returncode)
+    return {
+        part.decode("utf-8", errors="surrogateescape")
+        for part in result.stdout.split(b"\0")
+        if part
+    }
+
+
+def _git_indexed(root: str, paths: list[str]) -> set[str]:
+    """Return the subset of *paths* that the git index knows about."""
+    found: set[str] = set()
+    for chunk in _chunks(paths):
+        result = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--", *chunk],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            sys.stderr.buffer.write(result.stderr)
+            sys.exit(result.returncode)
+        found.update(
+            part.decode("utf-8", errors="surrogateescape")
+            for part in result.stdout.split(b"\0")
+            if part
+        )
+    return found
+
+
+def unstageable_paths(paths: list[str], root: str) -> set[str]:
+    """Return the subset of *paths* that ``git add -A --`` would refuse.
+
+    A single refused pathspec aborts the whole ``git add``, taking the commit
+    stage down with it, so these have to be dropped before staging.  Two cases
+    reach here, both via the "disappeared from ``git status``" arm of
+    :func:`diff_snapshots`:
+
+    - **Newly ignored.** The path was untracked when the pre-snapshot was
+      taken and a ``.gitignore`` rule started covering it during the step (for
+      example norn's own ``*.checkpoint`` / ``*.runs`` state files being added
+      to the target repo's ignore list).  ``git add`` exits 1 with "The
+      following paths are ignored by one of your .gitignore files".
+    - **Gone and never tracked.** The step deleted an untracked file that was
+      dirty before it ran.  ``git add`` exits 128 with "pathspec ... did not
+      match any files".
+
+    A tracked file that was deleted is *not* unstageable — the index still
+    carries it, and staging the deletion is exactly right.
+    """
+    if not paths:
+        return set()
+    dropped = _git_ignored(root, paths)
+    missing = [
+        path
+        for path in paths
+        if path not in dropped
+        and not os.path.lexists(os.path.join(root, path))
+    ]
+    if missing:
+        indexed = _git_indexed(root, missing)
+        dropped.update(path for path in missing if path not in indexed)
+    return dropped
+
+
 # ---------------------------------------------------------------------------
 # Subcommand handlers
 # ---------------------------------------------------------------------------
@@ -182,12 +271,19 @@ def _cmd_snapshot(args: list[str]) -> int:
 
 
 def _cmd_diff(args: list[str]) -> int:
-    """diff <pre.json> <post.json> [--ignore PATH]... [--ignore-file NULLIST]..."""
+    """diff <pre.json> <post.json> [--root DIR] [--ignore PATH]... [--ignore-file NULLIST]..."""
     positional: list[str] = []
     ignore: set[str] = set()
+    root: str | None = None
     i = 0
     while i < len(args):
-        if args[i] == "--ignore":
+        if args[i] == "--root":
+            if i + 1 >= len(args):
+                print("--root requires a DIR argument", file=sys.stderr)
+                return 2
+            root = args[i + 1]
+            i += 2
+        elif args[i] == "--ignore":
             if i + 1 >= len(args):
                 print("--ignore requires a PATH argument", file=sys.stderr)
                 return 2
@@ -214,7 +310,7 @@ def _cmd_diff(args: list[str]) -> int:
     if len(positional) < 2:
         print(
             "usage: _step_snapshot.py diff <pre.json> <post.json>"
-            " [--ignore PATH]... [--ignore-file NULLIST]...",
+            " [--root DIR] [--ignore PATH]... [--ignore-file NULLIST]...",
             file=sys.stderr,
         )
         return 2
@@ -242,9 +338,20 @@ def _cmd_diff(args: list[str]) -> int:
     with open(post_path) as fh:
         post: dict[str, list[str]] = json.load(fh)
 
-    for path in diff_snapshots(pre, post):
-        if path not in ignore:
-            sys.stdout.buffer.write(path.encode("utf-8", errors="surrogateescape") + b"\0")
+    changed = [path for path in diff_snapshots(pre, post) if path not in ignore]
+
+    if root is not None:
+        dropped = unstageable_paths(changed, root)
+        if dropped:
+            # Loud on stderr: these paths changed during the step but are not
+            # going into the commit, and silence there would look like data loss.
+            print("diff: skipping paths git cannot stage:", file=sys.stderr)
+            for path in sorted(dropped):
+                print(f"  {path}", file=sys.stderr)
+        changed = [path for path in changed if path not in dropped]
+
+    for path in changed:
+        sys.stdout.buffer.write(path.encode("utf-8", errors="surrogateescape") + b"\0")
     return 0
 
 
