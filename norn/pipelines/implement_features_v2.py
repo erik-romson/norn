@@ -933,6 +933,27 @@ def _assert_no_changes_outside(
     )
 
 
+# Cap for the Validation line of the facts file.  The facts file is pasted
+# verbatim into every later step's prompt, so a long command is a per-step
+# tax on the context window.
+FACTS_VALIDATION_MAX_CHARS = 200
+
+
+def _facts_validation_label(validation_cmd: str) -> str:
+    """Render *validation_cmd* as one line for the facts file.
+
+    The facts file records three lines and is pasted into later prompts, so a
+    ``test_cmd`` written as a multi-line block scalar cannot go in verbatim.
+    Runs of whitespace collapse to single spaces and the result is truncated;
+    this is a record of what ran, not something re-executed, and the step file
+    remains the authority on the exact command.
+    """
+    flat = " ".join(validation_cmd.split())
+    if len(flat) > FACTS_VALIDATION_MAX_CHARS:
+        flat = flat[: FACTS_VALIDATION_MAX_CHARS - 1].rstrip() + "\u2026"
+    return flat
+
+
 def _commit_cmd(
     pre_json: str,
     head_file: str,
@@ -984,7 +1005,8 @@ def _commit_cmd(
     # Build the no-change branch: fail when changes are required, else exit 0.
     if require_changes:
         no_change_branch = (
-            f'echo "ERROR: no step-owned changes to commit for {subject}" 1>&2; exit 1'
+            f'printf "ERROR: no step-owned changes to commit for %s\\n" {q(subject)} 1>&2; '
+            f'exit 1'
         )
     else:
         no_change_branch = 'echo "nothing to commit"; exit 0'
@@ -1022,7 +1044,8 @@ def _commit_cmd(
         # On success, write the facts file.
         f'echo "Commit: $(git log -1 --format=\'%h %s\')" > {q(facts_file)}; '
         f'echo "Changed: $(git show --name-only --format= HEAD | paste -sd ", " -)" >> {q(facts_file)}; '
-        f'echo "Validation: PASS - {validation_cmd}" >> {q(facts_file)}; '
+        f'printf "Validation: PASS - %s\\n" {q(_facts_validation_label(validation_cmd))} '
+        f'>> {q(facts_file)}; '
         f'exit 0; fi; '
         # First commit rejected — re-stage hook fixes and retry once.
         f'echo "commit rejected; re-staging pre-commit hook fixes and retrying once" 1>&2; '
@@ -1030,7 +1053,8 @@ def _commit_cmd(
         f'if {commit_once}; then '
         f'echo "Commit: $(git log -1 --format=\'%h %s\')" > {q(facts_file)}; '
         f'echo "Changed: $(git show --name-only --format= HEAD | paste -sd ", " -)" >> {q(facts_file)}; '
-        f'echo "Validation: PASS - {validation_cmd}" >> {q(facts_file)}; '
+        f'printf "Validation: PASS - %s\\n" {q(_facts_validation_label(validation_cmd))} '
+        f'>> {q(facts_file)}; '
         f'exit 0; fi; '
         # Both attempts failed.
         f'echo "ERROR: commit failed twice." 1>&2; '

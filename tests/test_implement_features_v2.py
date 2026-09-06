@@ -3465,3 +3465,101 @@ def test_catalog_get_pipeline_info_has_one_positional_arg() -> None:
         f"implement_features_v2 should expose exactly one positional arg 'args', "
         f"got {list(info.args.keys())!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan-controlled text in the commit shell
+# ---------------------------------------------------------------------------
+
+MULTILINE_DIR = FIXTURE_DIR / "multiline-cmd"
+
+
+def test_facts_validation_label_is_one_line() -> None:
+    """A block-scalar test_cmd collapses to a single facts line."""
+    mod = _import_v2(GOOD_DIR)
+    label = mod._facts_validation_label("sh -c '\n  echo one\n  echo two\n'")
+    assert "\n" not in label
+    assert label == "sh -c ' echo one echo two '"
+
+
+def test_facts_validation_label_is_truncated() -> None:
+    """The facts file is pasted into later prompts, so the label is bounded."""
+    mod = _import_v2(GOOD_DIR)
+    label = mod._facts_validation_label("x" * 500)
+    assert len(label) == mod.FACTS_VALIDATION_MAX_CHARS
+    assert label.endswith("…")
+
+
+def test_every_generated_command_is_valid_shell() -> None:
+    """Every RunCommand the pipeline builds must parse as POSIX shell.
+
+    A `test_cmd:` block scalar used to be interpolated into the commit shell as
+    code, so a plan carrying newlines or parentheses produced a command that
+    /bin/sh refused before the commit was attempted.
+    """
+    import subprocess
+
+    mod = _import_v2(MULTILINE_DIR)
+
+    def walk(items):
+        for it in items:
+            yield it
+            for attr in ("stages", "items", "branches"):
+                sub = getattr(it, attr, None)
+                if isinstance(sub, list):
+                    yield from walk(sub)
+
+    checked = 0
+    for item in walk(mod.config.items):
+        cmd = getattr(getattr(item, "impl", None), "cmd", None)
+        if not isinstance(cmd, str):
+            continue
+        checked += 1
+        proc = subprocess.run(["/bin/sh", "-n"], input=cmd, text=True, capture_output=True)
+        assert proc.returncode == 0, (
+            f"stage {getattr(item, 'name', '?')!r} builds invalid shell: {proc.stderr.strip()}"
+        )
+    assert checked > 10, f"expected many RunCommand stages, checked {checked}"
+
+
+@pytest.mark.asyncio
+async def test_commit_does_not_execute_the_test_cmd(tmp_path, monkeypatch) -> None:
+    """The commit stage records the test_cmd as data, never runs it.
+
+    The fixture's test_cmd contains a command substitution. Interpolated as
+    code it would run during the commit; passed as data it cannot.
+    """
+    repo_path = tmp_path / "repo"
+    _init_temp_repo(repo_path)
+
+    feat_dir = repo_path / "feat"
+    shutil.copytree(MULTILINE_DIR, feat_dir)
+
+    canary = tmp_path / "canary"
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-multiline"
+    ctx = PipelineContext()
+
+    baseline = _stage(mod, f"record baseline {stem}")
+    assert (await baseline.impl.run(ctx)).success
+
+    # A change for the step to own, so the commit has something to commit.
+    (repo_path / "owned.txt").write_text("work\n")
+
+    commit = _stage(mod, f"commit {stem}")
+    result = await commit.impl.run(ctx)
+    assert result.success, f"commit failed: {result.output}"
+
+    assert not canary.exists(), "the test_cmd's command substitution was executed"
+    assert not Path("/tmp/norn-injection-canary").exists(), (
+        "the test_cmd's command substitution was executed"
+    )
+
+    facts = Path(mod.snapshot_root) / f"{stem}.facts"
+    lines = facts.read_text().splitlines()
+    assert len(lines) == 3, f"facts file must stay three lines, got: {lines}"
+    assert lines[2].startswith("Validation: PASS - sh -ex -c")
