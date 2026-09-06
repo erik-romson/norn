@@ -265,7 +265,7 @@ def main() -> None:
         type=int,
         default=None,
         metavar="N",
-        help="Run ID to rate (default: latest run)",
+        help="Run ID to rate, as shown by `norn history` (default: latest run)",
     )
     rate_parser.add_argument("--note", default=None, metavar="TEXT", help="Optional annotation")
 
@@ -276,7 +276,7 @@ def main() -> None:
         type=int,
         default=None,
         metavar="N",
-        help="Run ID to evaluate (default: latest run)",
+        help="Run ID to evaluate, as shown by `norn history` (default: latest run)",
     )
     evaluate_parser.add_argument(
         "--model",
@@ -433,7 +433,13 @@ def main() -> None:
         return
 
     if args.command == "rate":
-        from norn.journal import latest_run_id as _latest_run_id, run_dir as _run_dir, runs_dir as _runs_dir
+        from norn.journal import (
+            history_run_id as _hist_id_of,
+            history_run_id_map as _hist_map,
+            latest_run_id as _latest_run_id,
+            run_dir as _run_dir,
+            runs_dir as _runs_dir,
+        )
         from norn.rating import write_rating as _write_rating
 
         # Validate score range before touching the filesystem
@@ -455,9 +461,18 @@ def main() -> None:
             )
             sys.exit(1)
 
-        # Resolve the run id
+        # Resolve the run id. --run names the id `norn history` prints, which
+        # is the history id; the journal keeps its own counter.
         if args.run is not None:
-            run_id = args.run
+            run_id = _hist_map(_rate_state_key).get(args.run)
+            if run_id is None:
+                print(
+                    f"run #{args.run} has no journal directory; "
+                    f"runs before this feature cannot be rated",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            label = args.run
         else:
             run_id = _latest_run_id(_rate_state_key)
             if run_id is None:
@@ -466,6 +481,7 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            label = _hist_id_of(_run_dir(_rate_state_key, run_id))
 
         rd = _run_dir(_rate_state_key, run_id)
         if not rd.is_dir():
@@ -474,12 +490,20 @@ def main() -> None:
 
         _write_rating(rd, args.score, args.note)
         from norn.ui import console as _console
-        _console.print(f"  [green]✓[/green] Rated run #{run_id} as [bold]{args.score}/5[/bold]")
+        # A run journaled before `history_run_id` existed has no history id to
+        # name, and printing its directory number as one invites exactly the
+        # confusion this join removes.
+        _what = f"run #{label}" if label is not None else f"journal run {run_id}"
+        _console.print(f"  [green]✓[/green] Rated {_what} as [bold]{args.score}/5[/bold]")
         return
 
     if args.command == "evaluate":
         from norn.evaluate import EvaluationError, evaluate_run
-        from norn.journal import latest_run_id as _latest_run_id, runs_dir as _runs_dir
+        from norn.journal import (
+            history_run_id_map as _hist_map,
+            latest_run_id as _latest_run_id,
+            runs_dir as _runs_dir,
+        )
         from norn import ui as _ui
 
         # Find state key
@@ -493,8 +517,17 @@ def main() -> None:
             print(f"no journaled runs for {args.config}", file=sys.stderr)
             sys.exit(1)
 
+        # --run names the id `norn history` prints; map it to the journal id
+        # that `evaluate_run` addresses directories by.
         if args.run is not None:
-            _eval_run_id = args.run
+            _eval_run_id = _hist_map(_eval_state_key).get(args.run)
+            if _eval_run_id is None:
+                print(
+                    f"run #{args.run} has no journal directory; "
+                    f"runs before this feature cannot be evaluated",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         else:
             _eval_run_id = _latest_run_id(_eval_state_key)
             if _eval_run_id is None:

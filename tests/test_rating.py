@@ -118,21 +118,44 @@ def test_cli_rate_with_note(tmp_path, capsys):
     assert data["note"] == "Perfect run"
 
 
+def _write_run_json(run_dir: Path, history_run_id: int) -> None:
+    """Write the minimal run.json header that carries the history run id."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(json.dumps({"history_run_id": history_run_id}))
+
+
 def test_cli_rate_explicit_run_id(tmp_path):
-    """norn rate --run 2 targets run #2 specifically."""
+    """norn rate --run N names the history id, not the journal directory name."""
     from norn.cli import main
 
     config = str(tmp_path / "pipeline.py")
-    # Create two run directories; --run 2 should write to run 2
-    (tmp_path / "pipeline.runs" / "1").mkdir(parents=True)
+    # The counters diverge: journal 1/2 are history 3/4. --run 4 must land in
+    # journal directory 2, and nothing may be written to directory 1.
+    _write_run_json(tmp_path / "pipeline.runs" / "1", history_run_id=3)
     run2_dir = tmp_path / "pipeline.runs" / "2"
-    run2_dir.mkdir(parents=True)
+    _write_run_json(run2_dir, history_run_id=4)
 
-    with patch("sys.argv", ["norn", "rate", config, "3", "--run", "2"]):
+    with patch("sys.argv", ["norn", "rate", config, "3", "--run", "4"]):
         main()
 
     assert (run2_dir / "rating.json").exists()
     assert not (tmp_path / "pipeline.runs" / "1" / "rating.json").exists()
+
+
+def test_cli_rate_unknown_history_run_exits(tmp_path, capsys):
+    """A history run with no journal directory is refused, not guessed at."""
+    from norn.cli import main
+
+    config = str(tmp_path / "pipeline.py")
+    _write_run_json(tmp_path / "pipeline.runs" / "1", history_run_id=3)
+
+    with pytest.raises(SystemExit) as exc_info:
+        # Journal directory 1 exists, but it is history run 3, not run 1.
+        with patch("sys.argv", ["norn", "rate", config, "3", "--run", "1"]):
+            main()
+
+    assert exc_info.value.code == 1
+    assert "has no journal directory" in capsys.readouterr().err
 
 
 def test_cli_rate_no_runs_exits(tmp_path, capsys):
@@ -190,9 +213,9 @@ def test_history_table_shows_rating(tmp_path, capsys):
         ),
     )
 
-    # Write a rating for run 1
+    # Write a rating for history run 1, journaled as directory 1.
     run_dir = tmp_path / "pipeline.runs" / "1"
-    run_dir.mkdir(parents=True)
+    _write_run_json(run_dir, history_run_id=1)
     write_rating(run_dir, score=4, note="Good")
 
     from norn.history import load_history
@@ -231,3 +254,74 @@ def test_history_table_no_rating_shows_dash(tmp_path, capsys):
     captured = capsys.readouterr()
     # With no state_key, ratings can't be loaded — Rating column shows "-"
     assert "4/5" not in captured.out
+
+
+def test_history_table_does_not_misattribute_rating(tmp_path, capsys):
+    """A rating never lands on a run that merely shares the journal's number.
+
+    The journal counter only advances on journaled runs, so journal directory
+    N is generally not history run N.  Joining by value showed one run's
+    rating on another run's row.
+    """
+    from norn.history import RunRecord, StageHistoryEntry, append_run, load_history
+    from norn.ui import print_history_table
+
+    config = str(tmp_path / "pipeline.py")
+    for rid in (1, 2, 3):
+        append_run(
+            config,
+            RunRecord(
+                run_id=rid,
+                timestamp="2026-09-05T10:00:00+00:00",
+                success=rid == 3,
+                total_cost_usd=0.10,
+                total_tokens=5000,
+                duration_ms=3000,
+                stages=[StageHistoryEntry(name="gen", success=True, cost_usd=0.10)],
+                retries=0,
+            ),
+        )
+
+    # Only history run 3 was journaled, as directory 1. Rating it must not
+    # decorate history run 1.
+    run_dir = tmp_path / "pipeline.runs" / "1"
+    _write_run_json(run_dir, history_run_id=3)
+    write_rating(run_dir, score=5, note="the good one")
+
+    print_history_table(load_history(config), state_key=config)
+
+    out = capsys.readouterr().out
+    rows = [ln for ln in out.splitlines() if ln.strip().startswith("#")]
+    assert len(rows) == 3
+    assert "5/5" not in rows[0]
+    assert "5/5" not in rows[1]
+    assert "5/5" in rows[2]
+
+
+def test_legacy_run_without_history_id_is_ignored(tmp_path, capsys):
+    """A journal dir predating the history_run_id field decorates no row."""
+    from norn.history import RunRecord, StageHistoryEntry, append_run, load_history
+    from norn.ui import print_history_table
+
+    config = str(tmp_path / "pipeline.py")
+    append_run(
+        config,
+        RunRecord(
+            run_id=1,
+            timestamp="2026-09-05T10:00:00+00:00",
+            success=True,
+            total_cost_usd=0.10,
+            total_tokens=5000,
+            duration_ms=3000,
+            stages=[StageHistoryEntry(name="gen", success=True, cost_usd=0.10)],
+            retries=0,
+        ),
+    )
+
+    run_dir = tmp_path / "pipeline.runs" / "1"
+    run_dir.mkdir(parents=True)
+    write_rating(run_dir, score=4, note="unjoinable")
+
+    print_history_table(load_history(config), state_key=config)
+
+    assert "4/5" not in capsys.readouterr().out

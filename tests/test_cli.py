@@ -198,9 +198,11 @@ def test_history_run_shows_finding(capsys, tmp_path):
         ),
     )
 
-    # Create a journal run dir with findings.json
+    # Create a journal run dir with findings.json. run.json records which
+    # history run it belongs to — the two counters are independent.
     runs_path = tmp_path / "pipeline.runs" / "1"
     runs_path.mkdir(parents=True)
+    (runs_path / "run.json").write_text(json.dumps({"history_run_id": 1}))
     (runs_path / "findings.json").write_text(json.dumps([{
         "rule": "budget-headroom",
         "severity": "warn",
@@ -240,6 +242,7 @@ def test_history_compare_shows_per_stage_table(capsys, tmp_path):
         # Create metrics.json in the journal run dir
         runs_path = tmp_path / "pipeline.runs" / str(rid)
         runs_path.mkdir(parents=True)
+        (runs_path / "run.json").write_text(json.dumps({"history_run_id": rid}))
         sm = StageMetrics(
             name="gen", node_id="gen", attempt=1, kind="agent", status="passed",
             success=True, cost_usd=0.05 * rid, cost_share=100.0,

@@ -383,3 +383,57 @@ async def test_no_journal_leaves_metrics_unset(tmp_path):
 
     assert ctx.run_metrics is None
     assert ctx.findings == []
+
+
+# ---------------------------------------------------------------------------
+# History-id mapping
+# ---------------------------------------------------------------------------
+
+
+def test_history_run_id_map_skips_dirs_without_the_field(tmp_path):
+    """Only runs that recorded a history id appear in the map."""
+    import json as _json
+
+    from norn.journal import history_run_id_map, run_dir_for_history_id
+
+    key = str(tmp_path / "pipeline.py")
+    runs = tmp_path / "pipeline.runs"
+    (runs / "1").mkdir(parents=True)  # legacy: no run.json at all
+    (runs / "2").mkdir(parents=True)
+    (runs / "2" / "run.json").write_text(_json.dumps({"pipeline": "p"}))  # no field
+    (runs / "3").mkdir(parents=True)
+    (runs / "3" / "run.json").write_text(_json.dumps({"history_run_id": 7}))
+
+    assert history_run_id_map(key) == {7: 3}
+    assert run_dir_for_history_id(key, 7) == runs / "3"
+    assert run_dir_for_history_id(key, 3) is None
+    assert run_dir_for_history_id(key, 1) is None
+
+
+def test_history_run_id_map_is_empty_without_a_runs_dir(tmp_path):
+    from norn.journal import history_run_id_map, run_dir_for_history_id
+
+    key = str(tmp_path / "pipeline.py")
+    assert history_run_id_map(key) == {}
+    assert run_dir_for_history_id(key, 1) is None
+
+
+def test_runner_records_the_history_run_id(tmp_path):
+    """A real run writes history_run_id into run.json."""
+    import asyncio
+    import json as _json
+
+    from norn.dsl import Pipeline
+    from norn.journal import history_run_id, run_dir
+    from norn.runner import run_pipeline
+    from norn.stages.run_command import RunCommand
+
+    config = str(tmp_path / "pipeline.py")
+    p = Pipeline("t")
+    p.stage("noop", RunCommand(cmd="true"))
+    asyncio.run(run_pipeline(p, config_path=config))
+
+    rd = run_dir(config, 1)
+    recorded = _json.loads((rd / "run.json").read_text())["history_run_id"]
+    assert recorded == 1
+    assert history_run_id(rd) == 1

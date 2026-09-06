@@ -234,13 +234,23 @@ def print_history_table(records: list[RunRecord], *, state_key: str | None = Non
     _ratings: dict[int, dict] = {}
     _eval_scores: dict[int, int] = {}
     if state_key is not None:
-        from norn.journal import run_dir as _run_dir, runs_dir as _runs_dir
+        from norn.journal import (
+            history_run_id_map as _hist_map,
+            run_dir as _run_dir,
+            runs_dir as _runs_dir,
+        )
         from norn.rating import load_rating as _load_rating
 
         _rd_base = _runs_dir(state_key)
         if _rd_base.is_dir():
+            # Built once: the join is by recorded history id, never by
+            # matching the two counters' values.
+            _by_hist = _hist_map(state_key)
             for r in records:
-                _rd = _run_dir(state_key, r.run_id)
+                _jid = _by_hist.get(r.run_id)
+                if _jid is None:
+                    continue
+                _rd = _run_dir(state_key, _jid)
                 rating = _load_rating(_rd)
                 if rating is not None:
                     _ratings[r.run_id] = rating
@@ -318,13 +328,14 @@ def print_history_comparison(records: list[RunRecord], run_a: int, run_b: int, *
 
     # Per-stage comparison table when both runs have metrics.json
     if state_key is not None:
-        from norn.journal import runs_dir as _runs_dir
+        from norn.journal import run_dir_for_history_id as _rd_for_hist
         from norn.metrics import load_metrics as _load_metrics
 
-        rd = _runs_dir(state_key)
-        if rd.is_dir():
-            m_a = _load_metrics(rd / str(run_a))
-            m_b = _load_metrics(rd / str(run_b))
+        dir_a = _rd_for_hist(state_key, run_a)
+        dir_b = _rd_for_hist(state_key, run_b)
+        if dir_a is not None and dir_b is not None:
+            m_a = _load_metrics(dir_a)
+            m_b = _load_metrics(dir_b)
             if m_a is not None and m_b is not None:
                 _print_stage_comparison(m_a, m_b, run_a, run_b)
 
@@ -408,11 +419,11 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
     # Load journal metrics for optional Peak ctx column
     _peak_ctx_by_name: dict[str, int] = {}
     if state_key is not None:
-        from norn.journal import runs_dir as _runs_dir
+        from norn.journal import run_dir_for_history_id as _rd_for_hist
         from norn.metrics import load_metrics as _load_metrics
-        _rd = _runs_dir(state_key)
-        if _rd.is_dir():
-            _jm = _load_metrics(_rd / str(run_id))
+        _rd = _rd_for_hist(state_key, run_id)
+        if _rd is not None:
+            _jm = _load_metrics(_rd)
             if _jm is not None:
                 for _sm in _jm.stages:
                     if _sm.context_peak_tokens is not None:
@@ -500,18 +511,16 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
 
 
 def _print_run_findings(state_key: str, run_id: int) -> None:
-    """Load and print findings from journal run directory."""
-    from norn.journal import runs_dir as _runs_dir
+    """Load and print findings from the journal directory for a history run id."""
+    from norn.journal import run_dir_for_history_id as _rd_for_hist
     from norn.metrics import load_findings as _load_findings, load_metrics as _load_metrics
 
-    rd = _runs_dir(state_key)
-    if rd.is_dir():
-        run_path = rd / str(run_id)
-        if run_path.is_dir():
-            m = _load_metrics(run_path)
-            f = _load_findings(run_path)
-            if m is not None or f:
-                print_findings(f, m)
+    run_path = _rd_for_hist(state_key, run_id)
+    if run_path is not None and run_path.is_dir():
+        m = _load_metrics(run_path)
+        f = _load_findings(run_path)
+        if m is not None or f:
+            print_findings(f, m)
 
 
 def print_findings(findings: list, metrics: object | None = None) -> None:

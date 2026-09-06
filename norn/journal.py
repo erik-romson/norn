@@ -65,6 +65,53 @@ def next_run_id(state_key: str) -> int:
     return (latest or 0) + 1
 
 
+def history_run_id(run_dir_path: Path) -> int | None:
+    """Return the history run id recorded in *run_dir_path*``/run.json``.
+
+    ``None`` when the file is absent, unreadable, or predates the
+    ``history_run_id`` header field.
+    """
+    path = Path(run_dir_path) / "run.json"
+    try:
+        value = json.loads(path.read_text()).get("history_run_id")
+    except Exception:
+        return None
+    return value if isinstance(value, int) else None
+
+
+def history_run_id_map(state_key: str) -> dict[int, int]:
+    """Map history run ids to journal run ids for one state key.
+
+    The journal and the history file keep independent counters — a run that
+    is not journaled advances only the history counter — so the two ids
+    diverge and cannot be joined by value.  Every run journaled since the
+    ``history_run_id`` header field exists records its history id, and this
+    map is the only correct way to go from one to the other.
+
+    Runs journaled before that field are simply absent from the map; a
+    caller that finds no entry must report nothing rather than fall back to
+    matching the ids directly, which silently attributes a run's artefacts
+    to a different run.
+    """
+    d = runs_dir(state_key)
+    if not d.is_dir():
+        return {}
+    out: dict[int, int] = {}
+    for p in sorted(d.iterdir()):
+        if not (p.is_dir() and p.name.isdigit()):
+            continue
+        hid = history_run_id(p)
+        if hid is not None:
+            out[hid] = int(p.name)
+    return out
+
+
+def run_dir_for_history_id(state_key: str, hist_run_id: int) -> Path | None:
+    """Return the journal directory for a history run id, or ``None``."""
+    journal_id = history_run_id_map(state_key).get(hist_run_id)
+    return None if journal_id is None else run_dir(state_key, journal_id)
+
+
 # ---------------------------------------------------------------------------
 # JSON serialisation helpers
 # ---------------------------------------------------------------------------

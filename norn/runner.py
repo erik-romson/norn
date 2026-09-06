@@ -1058,6 +1058,11 @@ async def run_pipeline(
         _journal.write_header(
             pipeline=pipeline.name,
             run_id=_journal_run_id,
+            # The history counter advances on every run, the journal counter
+            # only on journaled ones, so the two ids diverge. Recording the
+            # history id here is what lets `norn history` join a run to its
+            # journal artefacts (rating, evaluation, metrics, findings).
+            history_run_id=getattr(ctx, "_history_run_id", None),
             state_key=config_path,
             pipeline_source=pipeline_source,
             provider=agent_provider,
