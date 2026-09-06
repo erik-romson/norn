@@ -12,13 +12,21 @@ import pytest
 from textual.widgets import Tree
 
 from norn.dsl import Parallel, Pipeline, Stage
-from norn.events import EventKey, RunStarted, StageFinished, StageStarted
+from norn.events import (
+    EventKey,
+    RunCancelled,
+    RunFinished,
+    RunPaused,
+    RunStarted,
+    StageFinished,
+    StageStarted,
+)
 from norn.graph import build_graph
 from norn.models import PipelineContext, StageResult
 from norn.stages.base import BaseStage
 from norn.tui.app import NornApp
 from norn.tui.viewmodel import RunViewModel
-from norn.tui.widgets import STATUS_GLYPHS, NornGraph, NornHeader
+from norn.tui.widgets import STATUS_GLYPHS, STATUS_LABELS, NornGraph, NornHeader
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +126,92 @@ async def test_header_shows_zero_cost_as_tokens():
         content = app.query_one(NornHeader).get_content()
         assert "tokens" in content
         assert "$" not in content
+
+
+# ---------------------------------------------------------------------------
+# Header run-status tests — "is it running or not?"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_header_spells_out_running_status():
+    """A live run says RUNNING, not just a glyph."""
+    app = NornApp(graph=build_graph(Pipeline("p").stage("s", _Stub())), vm=RunViewModel())
+
+    async with app.run_test() as pilot:
+        app.apply_event(_run_started())
+        await pilot.pause()
+
+        content = app.query_one(NornHeader).get_content()
+        assert STATUS_LABELS["running"] in content
+        assert content.startswith(STATUS_GLYPHS["running"])
+
+
+@pytest.mark.asyncio
+async def test_header_spells_out_failed_status():
+    """A failed run says FINISHED — FAILED so it cannot be read as still going."""
+    app = NornApp(graph=build_graph(Pipeline("p").stage("s", _Stub())), vm=RunViewModel())
+
+    async with app.run_test() as pilot:
+        app.apply_event(_run_started())
+        app.apply_event(RunFinished(key=_key(), success=False))
+        await pilot.pause()
+
+        content = app.query_one(NornHeader).get_content()
+        assert STATUS_LABELS["failed"] in content
+        assert STATUS_LABELS["running"] not in content
+
+
+@pytest.mark.asyncio
+async def test_header_spells_out_passed_and_paused_and_cancelled():
+    """Every terminal and held state has its own spelled-out label."""
+    for event, status in (
+        (RunFinished(key=_key(), success=True), "passed"),
+        (RunPaused(key=_key()), "paused"),
+        (RunCancelled(key=_key()), "cancelled"),
+    ):
+        app = NornApp(graph=build_graph(Pipeline("p").stage("s", _Stub())), vm=RunViewModel())
+        async with app.run_test() as pilot:
+            app.apply_event(_run_started())
+            app.apply_event(event)
+            await pilot.pause()
+
+            assert STATUS_LABELS[status] in app.query_one(NornHeader).get_content()
+
+
+@pytest.mark.asyncio
+async def test_header_colours_the_bar_by_status():
+    """The status also drives a CSS class so the whole bar changes colour."""
+    app = NornApp(graph=build_graph(Pipeline("p").stage("s", _Stub())), vm=RunViewModel())
+
+    async with app.run_test() as pilot:
+        app.apply_event(_run_started())
+        await pilot.pause()
+        header = app.query_one(NornHeader)
+        assert header.has_class("-status-running")
+
+        app.apply_event(RunFinished(key=_key(), success=False))
+        await pilot.pause()
+        assert header.has_class("-status-failed")
+        assert not header.has_class("-status-running")
+
+
+@pytest.mark.asyncio
+async def test_header_elapsed_is_live_while_running_and_frozen_after():
+    """Elapsed ticks during the run, then stops at the finish value."""
+    vm = RunViewModel()
+    app = NornApp(graph=build_graph(Pipeline("p").stage("s", _Stub())), vm=vm)
+
+    async with app.run_test() as pilot:
+        app.apply_event(_run_started())
+        await pilot.pause()
+        assert vm.display_elapsed_s > 0.0
+
+        app.apply_event(RunFinished(key=_key(), success=True))
+        await pilot.pause()
+        frozen = vm.display_elapsed_s
+        await pilot.pause()
+        assert vm.display_elapsed_s == frozen
 
 
 # ---------------------------------------------------------------------------

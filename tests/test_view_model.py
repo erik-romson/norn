@@ -729,3 +729,65 @@ def test_command_output_without_stage_id_ignored():
     vm.apply(_command_output(None, "orphan output"))
 
     assert vm.transcript == {}
+
+
+# ---------------------------------------------------------------------------
+# Terminal status: is the run still going?
+# ---------------------------------------------------------------------------
+
+
+def test_is_running_tracks_the_run_lifecycle():
+    """pending and running are live; a finished run is not."""
+    vm = RunViewModel()
+    assert vm.is_running is True
+
+    vm.apply(_run_started())
+    assert vm.is_running is True
+
+    vm.apply(RunFinished(key=_key(), success=True))
+    assert vm.is_running is False
+
+
+def test_display_elapsed_is_live_during_the_run():
+    """During a run the clock comes from the monotonic start, not the header."""
+    vm = RunViewModel()
+    vm.apply(_run_started())
+
+    # header.elapsed_s is only stamped at the end — reading it would show 0.0.
+    assert vm.header.elapsed_s == 0.0
+    assert vm.display_elapsed_s > 0.0
+
+
+def test_display_elapsed_freezes_when_the_run_finishes():
+    """Once finished the clock stops moving."""
+    vm = RunViewModel()
+    vm.apply(_run_started())
+    vm.apply(RunFinished(key=_key(), success=False))
+
+    frozen = vm.display_elapsed_s
+    time.sleep(0.01)
+    assert vm.display_elapsed_s == frozen
+
+
+def test_mark_finished_forces_terminal_status_without_a_run_finished_event():
+    """A driver that dies before RunFinished must not leave the header 'running'."""
+    vm = RunViewModel()
+    vm.apply(_run_started())
+    assert vm.header.status == "running"
+
+    vm.mark_finished(False)
+
+    assert vm.header.status == "failed"
+    assert vm.is_running is False
+    assert vm.header.elapsed_s > 0.0
+
+
+def test_mark_finished_does_not_overwrite_a_real_outcome():
+    """A run that already reported its outcome keeps it."""
+    vm = RunViewModel()
+    vm.apply(_run_started())
+    vm.apply(RunFinished(key=_key(), success=True))
+
+    vm.mark_finished(False)
+
+    assert vm.header.status == "passed"

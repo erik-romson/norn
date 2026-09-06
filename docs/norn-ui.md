@@ -70,6 +70,31 @@ Launcher ──select──▶ [Args prompt, if the pipeline declares args] ─�
 In direct mode (`norn ui <pipeline>`) there is no launcher to return to, so
 Back exits.
 
+### Run status in the header
+
+The header answers "is this still running?" three ways at once, because a
+single status glyph is too easy to miss:
+
+- **A spelled-out label** next to the glyph — `NOT STARTED`, `RUNNING`,
+  `PAUSED`, `FINISHED — PASSED`, `FINISHED — FAILED`, `FINISHED — CANCELLED`
+  (`STATUS_LABELS` in `widgets.py`).
+- **A ticking clock.** `NornHeader` redraws itself once a second
+  (`TICK_S`) for as long as `RunViewModel.is_running` holds, so `elapsed`
+  visibly advances during a run and stops dead when it ends. The header reads
+  `RunViewModel.display_elapsed_s`, which is live while the run is active and
+  the frozen `header.elapsed_s` afterwards — `header.elapsed_s` is stamped
+  only at the terminal event, so reading it during a run would show `0.0s`.
+- **The bar colour.** `refresh_vm` sets a `-status-<name>` CSS class, and
+  `RunScreen.CSS` maps it to `$success` / `$error` / `$warning` / `$surface`.
+
+`TERMINAL_STATUSES` (`viewmodel.py`) is the single definition of "the run is
+over": `passed`, `failed`, `cancelled`. `pending`, `running` and `paused` all
+count as live. When the driver ends without a `RunFinished` event — a worktree
+that could not be created, an exception raised outside `run_pipeline` —
+`on__run_done` calls `RunViewModel.mark_finished(success)`, which stamps a
+terminal status if and only if none arrived, so the header can never be left
+claiming a dead run is live.
+
 ### Key bindings (run screen)
 
 | Key | Action | Notes |
@@ -126,8 +151,8 @@ second run can start against the same repo while the first is still live.
 | File | Role |
 | --- | --- |
 | `__init__.py` | Import-safe without Textual. |
-| `viewmodel.py` | `RunViewModel` — **textual-free** projection of the event stream into render-ready state (header, per-node status, per-stage transcript, usage, waiting-input). Holds the UI logic; unit-tested without Textual. |
-| `widgets.py` | `NornHeader`, `NornGraph` (Textual `Tree`), `Transcript` (`RichLog`), `StageDetail`, `BudgetMeter`. Thin; read the ViewModel. `Transcript.refresh_vm()` **appends** only blocks not yet on screen (full redraw on stage switch or a shrinking spool) — the app refreshes on every event, so redrawing the whole log each time is quadratic under streamed command output. |
+| `viewmodel.py` | `RunViewModel` — **textual-free** projection of the event stream into render-ready state (header, per-node status, per-stage transcript, usage, waiting-input). Holds the UI logic; unit-tested without Textual. `TERMINAL_STATUSES`, `is_running`, `display_elapsed_s` and `mark_finished()` define when a run counts as over (see §1). |
+| `widgets.py` | `NornHeader`, `NornGraph` (Textual `Tree`), `Transcript` (`RichLog`), `StageDetail`, `BudgetMeter`. Thin; read the ViewModel. `NornHeader` owns its own 1s redraw timer so the elapsed clock ticks between events (§1). `Transcript.refresh_vm()` **appends** only blocks not yet on screen (full redraw on stage switch or a shrinking spool) — the app refreshes on every event, so redrawing the whole log each time is quadratic under streamed command output. |
 | `app.py` | `RunScreen` (run UI + drives `run_pipeline` in-process), `NornApp` (thin host of one `RunScreen` for direct/object runs + tests), `NornUIApp` (the unified Launcher→Args→Run navigation app). |
 | `screens.py` | `LauncherScreen`/`LauncherApp`, `HistoryBrowserScreen`/`HistoryBrowserApp`, `LaunchRequest`, the `OPEN_FILE` sentinel. |
 | `args_prompt.py` | `ArgsPromptScreen`/`ArgsPromptApp`, `is_path_arg`/`is_dir_arg`, `run_fzf`. |

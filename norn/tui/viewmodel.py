@@ -56,6 +56,12 @@ class StageDetailRecord:
 # Render-ready header summary
 # ---------------------------------------------------------------------------
 
+# Statuses after which no further run events can arrive.  Everything else
+# ("pending", "running", "paused") means the run can still produce output, so
+# the header keeps its clock ticking.
+TERMINAL_STATUSES = frozenset({"passed", "failed", "cancelled"})
+
+
 
 @dataclass
 class HeaderSummary:
@@ -172,6 +178,35 @@ class RunViewModel:
         if self._start_time is None:
             return 0.0
         return time.monotonic() - self._start_time
+
+    @property
+    def is_running(self) -> bool:
+        """True while the run can still produce events (``paused`` included)."""
+        return self.header.status not in TERMINAL_STATUSES
+
+    @property
+    def display_elapsed_s(self) -> float:
+        """Elapsed seconds to display: live while active, frozen once finished.
+
+        ``header.elapsed_s`` is only stamped when the run reaches a terminal
+        status, so reading it during a run would show ``0.0`` and make a live
+        run look stalled.
+        """
+        if self.is_running:
+            return self.elapsed_s
+        return self.header.elapsed_s
+
+    def mark_finished(self, success: bool) -> None:
+        """Force a terminal status when the run ended without a ``RunFinished``.
+
+        The TUI driver can end a run before the runner emits anything — a
+        worktree that cannot be created, or an exception raised outside
+        ``run_pipeline``'s own handling.  Without this the header would keep
+        claiming the run is live.  A run that already reached a terminal
+        status keeps it.
+        """
+        if self.is_running:
+            self._finish(success)
 
     # ------------------------------------------------------------------
     # Event dispatch
@@ -343,10 +378,14 @@ class RunViewModel:
         self._update_header_usage()
 
     def _on_run_finished(self, event: Any) -> None:
-        self.header.status = "passed" if event.success else "failed"
+        self._finish(event.success)
+
+    def _finish(self, success: bool) -> None:
+        """Stamp the terminal status and freeze the elapsed clock."""
+        self.header.status = "passed" if success else "failed"
         self.header.elapsed_s = self.elapsed_s
         if self._root_node_id:
-            self.node_status[self._root_node_id] = "passed" if event.success else "failed"
+            self.node_status[self._root_node_id] = self.header.status
         self._update_header_usage()
 
     def _update_header_usage(self) -> None:

@@ -14,7 +14,7 @@ from textual.widgets import RichLog, Static, Tree
 from textual.widgets.tree import TreeNode
 
 from norn.graph import PipelineGraph, PipelineNode
-from norn.tui.viewmodel import RunViewModel
+from norn.tui.viewmodel import TERMINAL_STATUSES, RunViewModel
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +34,24 @@ STATUS_GLYPHS: dict[str, str] = {
 }
 
 
+# Spelled-out run status.  The glyph alone is too easy to miss — a finished
+# run and a live one differ by a single character otherwise.
+STATUS_LABELS: dict[str, str] = {
+    "pending": "NOT STARTED",
+    "running": "RUNNING",
+    "passed": "FINISHED — PASSED",
+    "failed": "FINISHED — FAILED",
+    "cancelled": "FINISHED — CANCELLED",
+    "paused": "PAUSED",
+}
+
+
 def _glyph(status: str) -> str:
     return STATUS_GLYPHS.get(status, "?")
+
+
+def _label(status: str) -> str:
+    return STATUS_LABELS.get(status, status.upper())
 
 
 # ---------------------------------------------------------------------------
@@ -47,12 +63,20 @@ class NornHeader(Static):
     """Header widget showing live pipeline run summary.
 
     Reads from a :class:`~norn.tui.viewmodel.RunViewModel` and renders a
-    single-line summary: pipeline name, run-id, provider, elapsed time,
-    stage progress, and token/cost usage.
+    single-line summary: run status, pipeline name, run-id, provider, elapsed
+    time, stage progress, and token/cost usage.
+
+    The status is spelled out (``RUNNING`` / ``FINISHED — FAILED`` …), colours
+    the whole bar through a ``-status-<name>`` CSS class, and the elapsed clock
+    ticks once a second while the run is live — three independent signals that
+    answer "is this still running?".
 
     Call :meth:`refresh_vm` after applying an event to the ViewModel to
     update the displayed content.
     """
+
+    # How often the header redraws itself while a run is live.
+    TICK_S = 1.0
 
     def __init__(self, vm: RunViewModel) -> None:
         # markup=False: renders plain external text (names, numbers, raw stage
@@ -62,8 +86,19 @@ class NornHeader(Static):
         self._vm = vm
 
     def on_mount(self) -> None:
-        """Render initial content when first mounted."""
+        """Render initial content and start the live clock."""
         self.refresh_vm()
+        self.set_interval(self.TICK_S, self._tick)
+
+    def _tick(self) -> None:
+        """Re-render while the run is live so the elapsed clock visibly moves.
+
+        A frozen clock is the only thing that distinguishes a finished run
+        from one that is still working, so the header must not wait for the
+        next run event to redraw.  Terminal runs are left alone.
+        """
+        if self._vm.is_running:
+            self.refresh_vm()
 
     def get_content(self) -> str:
         """Return the current header text.
@@ -72,20 +107,25 @@ class NornHeader(Static):
         Textual's render pipeline.  Used in tests and by :meth:`refresh_vm`.
         """
         h = self._vm.header
-        status_glyph = _glyph(h.status)
         total_tokens = h.total_input_tokens + h.total_output_tokens
         usage = f"${h.total_cost_usd:.4f}" if h.total_cost_usd else f"{total_tokens:,} tokens"
         return (
-            f"{status_glyph} {h.pipeline_name or '(no pipeline)'}  "
+            f"{_glyph(h.status)} {_label(h.status)}  "
+            f"{h.pipeline_name or '(no pipeline)'}  "
             f"run: {h.run_id or '-'}  "
             f"provider: {h.provider or '-'}  "
-            f"elapsed: {h.elapsed_s:.1f}s  "
+            f"elapsed: {self._vm.display_elapsed_s:.1f}s  "
             f"stages: {h.stages_done}/{h.stages_started}  "
             f"usage: {usage}"
         )
 
     def refresh_vm(self) -> None:
         """Re-render from current ViewModel state."""
+        status = self._vm.header.status
+        # One CSS class per status so the whole bar changes colour — readable
+        # from across the room, unlike a leading glyph.
+        for known in STATUS_LABELS:
+            self.set_class(known == status, f"-status-{known}")
         self.update(self.get_content())
 
 

@@ -98,6 +98,21 @@ class RunScreen(Screen):
         color: $text;
         padding: 0 1;
     }
+    NornHeader.-status-passed {
+        background: $success;
+    }
+    NornHeader.-status-failed {
+        background: $error;
+    }
+    NornHeader.-status-cancelled {
+        background: $error;
+    }
+    NornHeader.-status-paused {
+        background: $warning;
+    }
+    NornHeader.-status-pending {
+        background: $surface;
+    }
     NornGraph {
         height: 1fr;
         width: 30;
@@ -358,6 +373,14 @@ class RunScreen(Screen):
     def on__run_done(self, message: _RunDone) -> None:
         self.run_finished = True
         self.run_success = message.success
+        # The driver can finish without a RunFinished event (worktree creation
+        # failure, an exception outside run_pipeline). Force the terminal
+        # status so the header stops claiming the run is live.
+        self._vm.mark_finished(message.success)
+        try:
+            self.query_one(NornHeader).refresh_vm()
+        except NoMatches:
+            pass
         self.worktree_message = message.worktree_message
         if message.worktree_message:
             self.notify(message.worktree_message, timeout=15)
