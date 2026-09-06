@@ -504,7 +504,15 @@ def _apply_transcript_data(
 
 
 def _extract_quota(run_json: dict) -> QuotaMetrics | None:
-    """Build QuotaMetrics from ``quota_before`` / ``quota_after`` in run.json."""
+    """Build QuotaMetrics from ``quota_before`` / ``quota_after`` in run.json.
+
+    CodexBar's ``remaining_pct`` field is **percentage of quota still available**
+    (i.e. 100 = full, 0 = exhausted).  ``before_pct``/``after_pct`` on
+    :class:`QuotaMetrics` carry the same semantics — higher means more quota
+    remaining, not more consumed.  The ``quota-pressure`` rule therefore fires
+    when ``after_pct`` falls *below* ``100 - QUOTA_PRESSURE_PCT`` (i.e. less
+    than 20 % remaining when the threshold is 80 %).
+    """
     before = run_json.get("quota_before")
     after = run_json.get("quota_after")
     if before is None and after is None:
@@ -799,12 +807,12 @@ def find_issues(metrics: RunMetrics, prior: list[RunMetrics] | None = None) -> l
     # quota-pressure
     if metrics.quota is not None:
         q = metrics.quota
-        if q.after_pct is not None and q.after_pct > QUOTA_PRESSURE_PCT:
+        if q.after_pct is not None and q.after_pct < (100 - QUOTA_PRESSURE_PCT):
             findings.append(Finding(
                 rule="quota-pressure",
                 severity="warn",
                 stage=None,
-                evidence=f"quota after_pct={q.after_pct:.0f}%",
+                evidence=f"quota remaining={q.after_pct:.0f}% (>{QUOTA_PRESSURE_PCT}% consumed)",
                 suggestion="Reduce usage or wait for quota reset.",
             ))
         if q.will_last_to_reset is False:

@@ -551,9 +551,10 @@ class TestRegressionVsPrior:
 
 class TestQuotaPressure:
     def test_fires_on_high_quota_usage(self):
+        # after_pct is % remaining; 15% remaining means 85% consumed → fires rule
         m = _make_run_metrics(
             quota=QuotaMetrics(
-                before_pct=70.0, after_pct=85.0, delta_pct=-15.0,
+                before_pct=30.0, after_pct=15.0, delta_pct=-15.0,
                 resets_at="2026-09-10T00:00:00Z", will_last_to_reset=True,
             ),
         )
@@ -561,9 +562,11 @@ class TestQuotaPressure:
         assert any(f.rule == "quota-pressure" for f in findings)
 
     def test_fires_on_will_not_last(self):
+        # after_pct=40 means 40% remaining (not below the pressure threshold on its own),
+        # but will_last_to_reset=False triggers the second quota-pressure branch.
         m = _make_run_metrics(
             quota=QuotaMetrics(
-                before_pct=50.0, after_pct=60.0, delta_pct=-10.0,
+                before_pct=50.0, after_pct=40.0, delta_pct=-10.0,
                 resets_at="2026-09-10T00:00:00Z", will_last_to_reset=False,
             ),
         )
@@ -571,6 +574,7 @@ class TestQuotaPressure:
         assert any(f.rule == "quota-pressure" for f in findings)
 
     def test_does_not_fire_on_low_usage(self):
+        # after_pct is % remaining; 85% remaining means only 15% consumed — no pressure
         m = _make_run_metrics(
             quota=QuotaMetrics(
                 before_pct=90.0, after_pct=85.0, delta_pct=-5.0,
@@ -578,10 +582,9 @@ class TestQuotaPressure:
             ),
         )
         findings = find_issues(m)
-        # after_pct > 80 should fire BUT the semantics here: after_pct=85 means 85% remaining
-        # Looking at the rule: "quota.weekly.after_pct > 80" means used > 80%
-        # The actual code checks q.after_pct > QUOTA_PRESSURE_PCT
-        # So 85 > 80 fires. Let me adjust:
+        assert not any(f.rule == "quota-pressure" for f in findings)
+
+        # 40% remaining (60% consumed) is also below the pressure threshold (< 80% consumed)
         m2 = _make_run_metrics(
             quota=QuotaMetrics(
                 before_pct=50.0, after_pct=40.0, delta_pct=-10.0,

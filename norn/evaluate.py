@@ -528,19 +528,20 @@ async def evaluate_run(
             total_input += getattr(usage, "input_tokens", 0)
             total_output += getattr(usage, "output_tokens", 0)
 
-            if total_cost > max_cost_usd:
-                raise EvaluationError(
-                    f"Evaluation cost ${total_cost:.2f} exceeds limit ${max_cost_usd:.2f}"
-                )
-
             stage_evals[node_id] = result
             stage_scores[node_id] = result.get("score", 0)
 
-            # Write eval.json
+            # Write eval.json before checking the cost limit so the result for
+            # the call that trips the limit is still persisted on disk.
             from norn.journal import _safe_node_id
             safe_id = _safe_node_id(node_id)
             eval_path = (rd / "stages") / f"{safe_id}-a{attempt}.eval.json"
             eval_path.write_text(json.dumps(result, indent=2) + "\n")
+
+            if total_cost > max_cost_usd:
+                raise EvaluationError(
+                    f"Evaluation cost ${total_cost:.2f} exceeds limit ${max_cost_usd:.2f}"
+                )
 
     # --- Feedback pass ---
     prior = load_prior_metrics(_runs_dir(state_key), run_id)
