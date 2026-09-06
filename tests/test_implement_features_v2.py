@@ -2798,6 +2798,66 @@ async def test_review_postcondition_fails_when_code_edited(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_review_postcondition_names_paths_not_culprit(tmp_path, monkeypatch) -> None:
+    """The failure must list the paths and stay neutral about who wrote them.
+
+    The snapshot diff sees that the worktree moved, not who moved it: the review
+    agent is constrained by its prompt, but an editor saving in another terminal
+    produces the identical diff.
+    """
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
+    assert (await _stage(mod, "review manifest 1").impl.run(ctx)).success
+
+    Path(os.path.join(str(feat_dir), "review.md")).write_text(
+        "VERDICT: PASS\nBase: abc\nHead: def\n"
+    )
+    (repo_path / "sneaky_edit.py").write_text("# sneaky\n")
+
+    r = await _stage(mod, "review postcondition 1").impl.run(ctx)
+    assert not r.success
+    output = f"{r.output or ''}{r.error or ''}"
+    assert "files other than review.md changed" in output
+    assert "sneaky_edit.py" in output, "the offending path must be named"
+    assert "another terminal" in output, "the message must name the other cause"
+
+
+@pytest.mark.asyncio
+async def test_review_postcondition_names_staged_paths(tmp_path, monkeypatch) -> None:
+    """A dirty index fails the gate and the staged paths are named."""
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
+    assert (await _stage(mod, "review manifest 1").impl.run(ctx)).success
+
+    (repo_path / "staged_by_someone.py").write_text("# staged\n")
+    repo.index.add(["staged_by_someone.py"])
+
+    r = await _stage(mod, "review postcondition 1").impl.run(ctx)
+    assert not r.success
+    output = f"{r.output or ''}{r.error or ''}"
+    assert "staged changes" in output, "the index gate must be the one that tripped"
+    assert "staged_by_someone.py" in output, "the staged path must be named"
+
+
+@pytest.mark.asyncio
 async def test_review_passed_fails_on_needs_fixes(tmp_path, monkeypatch) -> None:
     """review passed fails when verdict is NEEDS_FIXES."""
     repo = _init_temp_repo(tmp_path / "repo")

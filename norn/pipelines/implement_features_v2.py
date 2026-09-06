@@ -881,6 +881,58 @@ def _assert_head_unchanged(head_file: str, during: str) -> str:
     )
 
 
+def _assert_index_clean(during: str) -> str:
+    """Build the shell that fails when the index carries staged changes.
+
+    Names the staged paths and stays neutral about the cause, for the same
+    reason as :func:`_assert_head_unchanged`: `git diff --cached` sees that the
+    index moved, not who moved it. A `git add` in another terminal looks exactly
+    like an agent staging its own work, so the message names the staged paths
+    and leaves the reader to decide which it was.
+    """
+    return (
+        f'if ! git diff --cached --quiet; then '
+        f'echo "ERROR: the index has staged changes after {during}." 1>&2; '
+        f'git diff --cached --name-only 1>&2; '
+        f'echo "Nothing may stage files in this repo while the run is in flight — '
+        f'not the agent, not another terminal. Unstage them (git restore --staged) '
+        f'and rerun without --resume." 1>&2; '
+        f'exit 1; fi'
+    )
+
+
+def _assert_no_changes_outside(
+    pre_json: str,
+    post_json: str,
+    ignore_flag: str,
+    during: str,
+    allowed: str,
+) -> str:
+    """Build the shell that fails when anything but *allowed* changed during *during*.
+
+    Lists the offending paths and stays neutral about the cause, for the same
+    reason as :func:`_assert_head_unchanged`: the snapshot diff sees that the
+    worktree moved, not who moved it. The agent is constrained by its prompt
+    rather than sandboxed, so it is one candidate — an editor saving in another
+    terminal while the run is in flight is another, and the diff cannot tell the
+    two apart.
+    """
+    q = shlex.quote
+    return (
+        f'python3 {q(SNAPSHOT_HELPER)} snapshot '
+        f'--root {q(GIT_TOPLEVEL)} {q(post_json)} && '
+        f'OUTSIDE=$(python3 {q(SNAPSHOT_HELPER)} diff '
+        f'{q(pre_json)} {q(post_json)}{ignore_flag}) && '
+        f'if [ -n "$OUTSIDE" ]; then '
+        f'echo "ERROR: files other than {allowed} changed during {during}:" 1>&2; '
+        f'printf "%s\\n" "$OUTSIDE" | tr \'\\0\' \'\\n\' 1>&2; '
+        f'echo "{during} may write only {allowed}, and nothing else may write in '
+        f'this repo while the run is in flight — not the agent, not another '
+        f'terminal. Inspect the paths above with git diff before rerunning." 1>&2; '
+        f'exit 1; fi'
+    )
+
+
 def _commit_cmd(
     pre_json: str,
     head_file: str,
@@ -1262,8 +1314,7 @@ for step_file in step_files:
         RunCommand(cmd=(
             f'cd {shlex.quote(GIT_TOPLEVEL)} && '
             f'{_assert_head_unchanged(step_head, f"implement {name}")} && '
-            f'git diff --cached --quiet || '
-            f'{{ echo "ERROR: the agent staged files during implement {name}"; exit 1; }}'
+            f'{_assert_index_clean(f"implement {name}")}'
         )),
         on_failure=fail,
     )
@@ -1369,8 +1420,7 @@ for step_file in step_files:
                 f'cd {shlex.quote(GIT_TOPLEVEL)} && '
                 f'echo "=== head ===" && '
                 f'{_assert_head_unchanged(step_head, f"validation of {name}")} && '
-                f'git diff --cached --quiet || '
-                f'{{ echo "ERROR: the agent staged files during validation of {name}"; exit 1; }} && '
+                f'{_assert_index_clean(f"validation of {name}")} && '
                 f'echo "=== validation ===" && '
                 f'cd {shlex.quote(PROJECT_DIR)} && {validation_cmd}'
             ),
@@ -1596,8 +1646,7 @@ pipeline.stage(
             f'cd {shlex.quote(GIT_TOPLEVEL)} && '
             f'echo "=== head ===" && '
             f'{_assert_head_unchanged(agg_head, "the aggregate validation loop")} && '
-            f'git diff --cached --quiet || '
-            f'{{ echo "ERROR: index has staged changes after aggregate loop"; exit 1; }} && '
+            f'{_assert_index_clean("the aggregate validation loop")} && '
             f'echo "=== aggregate validation ===" && '
             f'cd {shlex.quote(PROJECT_DIR)} && {AGGREGATE_CMD}'
         ),
@@ -1889,16 +1938,9 @@ def _add_review_round(n: int, when) -> None:
         # HEAD must not have moved.
         f'{_assert_head_unchanged(paths["head"], f"review {n}")} && '
         # Index must be clean.
-        f"git diff --cached --quiet || "
-        f'{{ echo "ERROR: review {n} staged files"; exit 1; }} && '
+        f'{_assert_index_clean(f"review {n}")} && '
         # Snapshot and diff; only review.md may have changed.
-        f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(postcond_tmp)} && "
-        f"OUTSIDE=$(python3 {q(SNAPSHOT_HELPER)} diff {q(paths['pre'])} {q(postcond_tmp)}"
-        f"{ignore_flag}) && "
-        f'if [ -n "$OUTSIDE" ]; then '
-        f'echo "ERROR: review {n} changed files outside review.md:" 1>&2; '
-        f'printf "%s\\n" "$OUTSIDE" | tr \'\\0\' \'\\n\' 1>&2; '
-        f"exit 1; fi"
+        f"{_assert_no_changes_outside(paths['pre'], postcond_tmp, ignore_flag, f'review {n}', 'review.md')}"
     )
     pipeline.stage(
         f"review postcondition {n}",
@@ -2241,22 +2283,12 @@ _handoff_ignore_flag = (
 
 _handoff_postcondition_cmd = (
     f'cd {shlex.quote(GIT_TOPLEVEL)} && '
-    # HEAD must equal reviewed.head — handoff must not commit.
-    f'test "$(git rev-parse HEAD)" = "$(cat {shlex.quote(REVIEWED_HEAD)})" || '
-    f'{{ echo "ERROR: HEAD does not match reviewed.head; handoff must not commit" 1>&2; exit 1; }} && '
+    # HEAD must equal reviewed.head — nothing may commit after review passed.
+    f'{_assert_head_unchanged(REVIEWED_HEAD, "handoff")} && '
     # Index must be clean.
-    f'git diff --cached --quiet || '
-    f'{{ echo "ERROR: index has staged changes after handoff" 1>&2; exit 1; }} && '
+    f'{_assert_index_clean("handoff")} && '
     # Snapshot diff: only handoff.md may have changed.
-    f'python3 {shlex.quote(SNAPSHOT_HELPER)} snapshot '
-    f'--root {shlex.quote(GIT_TOPLEVEL)} {shlex.quote(_handoff_postcond_snap)} && '
-    f'_OUTSIDE=$(python3 {shlex.quote(SNAPSHOT_HELPER)} diff '
-    f'{shlex.quote(_handoff_pre)} {shlex.quote(_handoff_postcond_snap)}'
-    f'{_handoff_ignore_flag}) && '
-    f'if [ -n "$_OUTSIDE" ]; then '
-    f'echo "ERROR: handoff changed files outside handoff.md:" 1>&2; '
-    f'printf "%s\\n" "$_OUTSIDE" | tr \'\\0\' \'\\n\' 1>&2; '
-    f'exit 1; fi && '
+    f'{_assert_no_changes_outside(_handoff_pre, _handoff_postcond_snap, _handoff_ignore_flag, "handoff", "handoff.md")} && '
     # handoff.md must exist and be non-empty.
     f'test -s {shlex.quote(HANDOFF_MD)} || '
     f'{{ echo "ERROR: handoff.md was not written or is empty" 1>&2; exit 1; }}'
@@ -2318,12 +2350,10 @@ _final_audit_cmd = (
     f'cd {shlex.quote(GIT_TOPLEVEL)} && '
     # === head ===
     f'echo "=== head ===" && '
-    f'test "$(git rev-parse HEAD)" = "$(cat {shlex.quote(REVIEWED_HEAD)})" || '
-    f'{{ echo "ERROR: HEAD does not match reviewed.head; something committed after review passed" 1>&2; exit 1; }} && '
+    f'{_assert_head_unchanged(REVIEWED_HEAD, "the post-review phase")} && '
     # === index ===
     f'echo "=== index ===" && '
-    f'git diff --cached --quiet || '
-    f'{{ echo "ERROR: index has staged changes at final audit" 1>&2; exit 1; }} && '
+    f'{_assert_index_clean("the run")} && '
     # === owned paths ===
     # Comment: trailer verification is absent because commit trailers are a core item.
     f'echo "=== owned paths ===" && '
