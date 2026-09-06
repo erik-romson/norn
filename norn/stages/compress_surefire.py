@@ -136,10 +136,19 @@ class CompressSurefireLog(BaseStage):
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         prev = ctx.results.get(self.source_stage)
         if prev is None:
+            # Normal on a loop's first iteration when the source stage sits
+            # after this one in the loop body. Recorded as a diagnostic, not
+            # as `error` — a non-empty error on a successful stage is what
+            # the `silent-error` finding flags.
+            reason = (
+                f"compress_surefire: source stage "
+                f"'{self.source_stage}' has no result yet"
+            )
+            log.debug("[compress_surefire] %s", reason)
             return StageResult(
                 name="", success=True,
                 output="",
-                error=f"compress_surefire: source stage '{self.source_stage}' has no result yet",
+                details={"skipped": reason},
             )
 
         text = _extract_text(prev)

@@ -163,7 +163,10 @@ async def test_missing_source_stage_returns_empty():
     result = await stage.run(PipelineContext())
     assert result.success
     assert result.output == ""
-    assert "has no result yet" in (result.error or "")
+    # The diagnostic goes to details, not error: a non-empty error on a
+    # successful stage trips the `silent-error` finding.
+    assert result.error is None
+    assert "has no result yet" in result.details["skipped"]
 
 
 @pytest.mark.asyncio

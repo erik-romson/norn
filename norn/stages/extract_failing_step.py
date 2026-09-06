@@ -279,12 +279,18 @@ class ExtractFailingStep(BaseStage):
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         prev = ctx.results.get(self.source_stage)
         if prev is None:
+            # Normal on a loop's first iteration when the source stage sits
+            # after this one in the loop body. Recorded as a diagnostic, not
+            # as `error` — a non-empty error on a successful stage is what
+            # the `silent-error` finding flags.
+            reason = (
+                f"extract_failing_step: source stage "
+                f"'{self.source_stage}' has no result yet"
+            )
+            log.debug("[extract_failing_step] %s", reason)
             return StageResult(
                 name="", success=True, output="",
-                error=(
-                    f"extract_failing_step: source stage "
-                    f"'{self.source_stage}' has no result yet"
-                ),
+                details={"skipped": reason},
             )
 
         if self.skip_on_success and prev.success:
