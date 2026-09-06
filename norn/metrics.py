@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import statistics
+from collections.abc import Collection
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,8 +39,9 @@ PRIOR_RUNS_LIMIT = 5
 CONTEXT_BLOAT_TOKENS = 150_000
 MODEL_MIX_SURPRISE_OUTPUT_PCT = 30
 
-# Regex for unresolved placeholders like ``{param.args}`` in prompts
-_PLACEHOLDER_RE = re.compile(r"\{[^{}]+\.\w+\}")
+# Placeholder syntax, kept identical to the renderer in
+# ``norn/stages/generate.py``: ``{<prefix>.<suffix>}``.
+_PLACEHOLDER_RE = re.compile(r"\{([^{}]+)\.(\w+)\}")
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +145,37 @@ def _json_default(obj: Any) -> Any:
     return repr(obj)
 
 
-def unresolved_placeholders(text: str | None) -> list[str]:
-    """Return unresolved ``{param.xxx}``-style placeholders in *text*."""
+def stage_name_from_node_id(node_id: str) -> str:
+    """Return the human stage name embedded in a journal *node_id*.
+
+    Node ids are ``stage:<name>`` at the top level and
+    ``loop:<loop name>/stage:<name>`` inside a loop, while placeholders address
+    the bare stage name, so everything before it is stripped.
+    """
+    return node_id.rsplit("/", 1)[-1].split(":", 1)[-1]
+
+
+def unresolved_placeholders(text: str | None, known_stages: Collection[str]) -> list[str]:
+    """Return unresolved ``{param.x}`` / ``{stage name.output}`` placeholders in *text*.
+
+    A placeholder counts only when its prefix is ``param`` or the name of a
+    stage in this run. The renderer's regex matches any ``{...word.word}``, so
+    on its own it also fires on prose and code that merely look like one — a
+    plan step quoting ``details={"cmd": self.cmd, "timeout": self.timeout}``
+    produced a HIGH finding for text that was never a placeholder.
+
+    The cost of the prefix check is that a placeholder naming a stage which
+    never ran — one behind a ``when=`` gate, say — is not reported: the journal
+    holds records only for stages that ran, so nothing distinguishes it from
+    prose.
+    """
     if not text:
         return []
-    return _PLACEHOLDER_RE.findall(text)
+    return [
+        m.group(0)
+        for m in _PLACEHOLDER_RE.finditer(text)
+        if m.group(1) == "param" or m.group(1) in known_stages
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +298,12 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
 
     stage_metrics_list: list[StageMetrics] = []
 
+    # Every stage name in this run, so a placeholder can be told from prose that
+    # happens to share its shape.
+    known_stages = {
+        stage_name_from_node_id(rec.get("node_id", "")) for rec in stage_records
+    }
+
     for rec in stage_records:
         usage = rec.get("usage", {})
         details = rec.get("details", {})
@@ -294,7 +328,7 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
         prompt_chars = len(prompt_text) if isinstance(prompt_text, str) else 0
         system_chars = len(system_text) if isinstance(system_text, str) else 0
 
-        placeholders = unresolved_placeholders(prompt_text)
+        placeholders = unresolved_placeholders(prompt_text, known_stages)
 
         rec_success = rec.get("success", True)
         error = rec.get("error")

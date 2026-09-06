@@ -33,6 +33,7 @@ from norn.metrics import (
     load_findings,
     load_metrics,
     load_prior_metrics,
+    stage_name_from_node_id,
     unresolved_placeholders,
     write_metrics,
 )
@@ -815,15 +816,36 @@ class TestLoadPriorMetrics:
 
 class TestUnresolvedPlaceholdersFunc:
     def test_detects_placeholders(self):
-        text = "Hello {param.args}, meet {ctx.name}"
-        result = unresolved_placeholders(text)
+        text = "Hello {param.args}, meet {read manifest 1.output}"
+        result = unresolved_placeholders(text, {"read manifest 1"})
         assert "{param.args}" in result
-        assert "{ctx.name}" in result
+        assert "{read manifest 1.output}" in result
 
     def test_no_false_positives(self):
-        assert unresolved_placeholders("just normal text") == []
-        assert unresolved_placeholders(None) == []
-        assert unresolved_placeholders("") == []
+        assert unresolved_placeholders("just normal text", set()) == []
+        assert unresolved_placeholders(None, set()) == []
+        assert unresolved_placeholders("", set()) == []
+
+    def test_code_that_looks_like_a_placeholder_is_not_one(self):
+        """A plan step quoting a dict literal is prose, not a placeholder.
+
+        This exact text made review round 1 report a HIGH finding.
+        """
+        text = 'details={"cmd": self.cmd, "timeout": self.timeout} on both returns.'
+        assert unresolved_placeholders(text, {"review 1"}) == []
+
+    def test_stage_that_did_not_run_is_not_reported(self):
+        """The prefix must name a stage of this run; an unknown one is prose."""
+        assert unresolved_placeholders("{closeout step-09.output}", {"review 1"}) == []
+
+
+class TestStageNameFromNodeId:
+    def test_top_level_stage(self):
+        assert stage_name_from_node_id("stage:review 1") == "review 1"
+
+    def test_stage_inside_a_loop(self):
+        node_id = "loop:loop aggregate/stage:aggregate compress"
+        assert stage_name_from_node_id(node_id) == "aggregate compress"
 
 
 # ---------------------------------------------------------------------------
