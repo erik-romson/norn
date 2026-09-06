@@ -158,7 +158,15 @@ class RunJournal:
         except Exception:
             log.warning("journal: failed to write header to %s", self._run_path, exc_info=True)
 
-    def finish(self, *, success: bool, failed_stage: str | None, duration_ms: int, totals: dict[str, Any]) -> None:
+    def finish(
+        self,
+        *,
+        success: bool,
+        failed_stage: str | None,
+        duration_ms: int,
+        totals: dict[str, Any],
+        quota_after: dict | None = None,
+    ) -> None:
         """Update ``run.json`` with finish metadata."""
         try:
             existing: dict[str, Any] = {}
@@ -169,6 +177,8 @@ class RunJournal:
             existing["failed_stage"] = failed_stage
             existing["duration_ms"] = duration_ms
             existing["totals"] = totals
+            if quota_after is not None:
+                existing["quota_after"] = quota_after
             self._run_path.write_text(
                 json.dumps(existing, default=_json_default, indent=2) + "\n"
             )
@@ -201,60 +211,61 @@ class RunJournal:
         result: Any,
     ) -> None:
         """Write one stage record to ``stages/<seq>-<node_id>-a<attempt>.json``."""
-        self._stage_seq += 1
-        safe_id = _safe_node_id(node_id)
-        filename = f"{self._stage_seq:04d}-{safe_id}-a{attempt}.json"
-        path = self._stages_dir / filename
-
-        record: dict[str, Any] = {
-            "node_id": node_id,
-            "attempt": attempt,
-            "status": status,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "duration_ms": duration_ms,
-        }
-
-        # Serialise result fields with masking and truncation
-        if result is not None:
-            output = serialise_output(result.output)
-            if isinstance(output, str):
-                output = _truncate_string(output, "output", record)
-            output = _mask_field(output) if isinstance(output, str) else output
-            record["output"] = output
-
-            error = _mask_field(result.error)
-            record["error"] = error
-            record["success"] = result.success
-            record["artifacts"] = list(result.artifacts) if result.artifacts else []
-
-            if result.details:
-                details = dict(result.details)
-                for key in ("prompt", "system_prompt"):
-                    if key in details and isinstance(details[key], str):
-                        details[key] = _truncate_string(details[key], key, record)
-                        details[key] = _mask_field(details[key])
-                record["details"] = details
-
-            if result.usage:
-                record["usage"] = {
-                    "input_tokens": result.usage.input_tokens,
-                    "output_tokens": result.usage.output_tokens,
-                    "cache_read_input_tokens": result.usage.cache_read_input_tokens,
-                    "cache_creation_input_tokens": result.usage.cache_creation_input_tokens,
-                    "total_cost_usd": result.usage.total_cost_usd,
-                    "duration_ms": result.usage.duration_ms,
-                    "num_turns": result.usage.num_turns,
-                    "model_id": result.usage.model_id,
-                    "model": result.usage.model,
-                    "result_subtype": result.usage.result_subtype,
-                    "stop_reason": result.usage.stop_reason,
-                    "tool_uses": result.usage.tool_uses,
-                    "tool_errors": result.usage.tool_errors,
-                    "session_id": result.usage.session_id,
-                }
-
+        path: Path | None = None
         try:
+            self._stage_seq += 1
+            safe_id = _safe_node_id(node_id)
+            filename = f"{self._stage_seq:04d}-{safe_id}-a{attempt}.json"
+            path = self._stages_dir / filename
+
+            record: dict[str, Any] = {
+                "node_id": node_id,
+                "attempt": attempt,
+                "status": status,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_ms": duration_ms,
+            }
+
+            # Serialise result fields with masking and truncation
+            if result is not None:
+                output = serialise_output(result.output)
+                if isinstance(output, str):
+                    output = _truncate_string(output, "output", record)
+                output = _mask_field(output) if isinstance(output, str) else output
+                record["output"] = output
+
+                error = _mask_field(result.error)
+                record["error"] = error
+                record["success"] = result.success
+                record["artifacts"] = list(result.artifacts) if result.artifacts else []
+
+                if result.details:
+                    details = dict(result.details)
+                    for key in ("prompt", "system_prompt"):
+                        if key in details and isinstance(details[key], str):
+                            details[key] = _truncate_string(details[key], key, record)
+                            details[key] = _mask_field(details[key])
+                    record["details"] = details
+
+                if result.usage:
+                    record["usage"] = {
+                        "input_tokens": result.usage.input_tokens,
+                        "output_tokens": result.usage.output_tokens,
+                        "cache_read_input_tokens": result.usage.cache_read_input_tokens,
+                        "cache_creation_input_tokens": result.usage.cache_creation_input_tokens,
+                        "total_cost_usd": result.usage.total_cost_usd,
+                        "duration_ms": result.usage.duration_ms,
+                        "num_turns": result.usage.num_turns,
+                        "model_id": result.usage.model_id,
+                        "model": result.usage.model,
+                        "result_subtype": result.usage.result_subtype,
+                        "stop_reason": result.usage.stop_reason,
+                        "tool_uses": result.usage.tool_uses,
+                        "tool_errors": result.usage.tool_errors,
+                        "session_id": result.usage.session_id,
+                    }
+
             path.write_text(json.dumps(record, default=_json_default, indent=2) + "\n")
         except Exception:
             log.warning("journal: failed to write stage record to %s", path, exc_info=True)

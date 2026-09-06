@@ -120,6 +120,7 @@ class RunMetrics:
     quota: QuotaMetrics | None
     codex_cost_usd_estimate: float | None
     stages: list[StageMetrics]
+    loop_exhausted: int = 0
 
 
 @dataclass
@@ -395,6 +396,7 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
         quota=quota,
         codex_cost_usd_estimate=codex_cost,
         stages=stage_metrics_list,
+        loop_exhausted=digest["loop_exhausted"],
     )
 
 
@@ -695,13 +697,15 @@ def find_issues(metrics: RunMetrics, prior: list[RunMetrics] | None = None) -> l
                 suggestion="Reduce retry waste by fixing root causes of failures.",
             ))
 
-    # loop exhausted
-    digest_path = metrics  # we check via retries and failed_attempts
-    # Actually check the events digest if we have the data... we rely on the
-    # finding trigger from the step spec: "any LoopExhausted" => retry-waste
-    # Since LoopExhausted is counted in events_digest, we detect it via
-    # the fact that we're called from compute_metrics context. However, since
-    # find_issues receives metrics not the raw digest, we add a simple heuristic.
+    # loop exhausted — fires whenever at least one loop ran out of attempts
+    if metrics.loop_exhausted > 0:
+        findings.append(Finding(
+            rule="retry-waste",
+            severity="warn",
+            stage=None,
+            evidence=f"loop_exhausted={metrics.loop_exhausted}",
+            suggestion="Reduce retry waste by fixing root causes of failures or raising loop attempt limits.",
+        ))
 
     # budget-headroom
     if metrics.budget_used_pct is not None and metrics.budget_used_pct > BUDGET_HEADROOM_PCT:
@@ -729,7 +733,11 @@ def find_issues(metrics: RunMetrics, prior: list[RunMetrics] | None = None) -> l
 
     # regression-vs-prior
     if prior:
-        successful_prior = [p for p in prior if p.success]
+        current_stage_names = {s.name for s in metrics.stages}
+        successful_prior = [
+            p for p in prior
+            if p.success and {s.name for s in p.stages} == current_stage_names
+        ]
         if len(successful_prior) >= 1:
             prior_costs = [p.cost_usd for p in successful_prior if p.cost_usd > 0]
             prior_walls = [p.wall_ms for p in successful_prior if p.wall_ms > 0]

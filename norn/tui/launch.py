@@ -93,10 +93,20 @@ def build_run_setup(
     """
     graph = build_graph(pipeline_obj)
     budget = (pipeline_obj.budgets or [None])[0]
+
+    # Resolve pipeline_source: bundled pipelines use their module path; file
+    # pipelines use the absolute path of the config file.
+    info = get_pipeline_info(ref)
+    if info is not None:
+        pipeline_source = str(info.path)
+    else:
+        pipeline_source = str(Path(ref).resolve())
+
     run_kwargs: dict[str, Any] = {
         "agent_provider": resolve_agent_provider(pipeline_obj),
         "params": params,
         "config_path": history_config_key(ref),
+        "pipeline_source": pipeline_source,
     }
     return graph, budget, run_kwargs
 

@@ -920,6 +920,9 @@ async def run_pipeline(
     run_id: str | None = None,
     pipeline_source: str | None = None,
     journal: object | None = None,
+    quota_probe: str | None = None,
+    require_quota: bool = False,
+    quota_fail_open: bool = False,
 ) -> PipelineContext:
     """Execute a pipeline definition, returning the final context.
 
@@ -995,17 +998,36 @@ async def run_pipeline(
 
         _journal_run_id = journal_next_run_id(config_path)
         _journal = RunJournal.open(config_path, _journal_run_id)
+
+        # Resolve cost_mode from provider capabilities
+        from norn.agents.registry import get_provider as _get_provider
+        _prov_obj = _get_provider(agent_provider)
+        _cost_mode = _prov_obj.capabilities.cost_mode.name.lower()
+
+        # Sample quota before run if a probe is configured
+        _quota_before: dict | None = None
+        if quota_probe is not None:
+            from norn.quota import QuotaProbeError, sample_quota as _sample_quota
+            try:
+                _quota_before = _sample_quota(agent_provider)
+            except QuotaProbeError as _qe:
+                if require_quota:
+                    raise
+                log.warning("quota: pre-run probe failed: %s", _qe)
+
         _journal.write_header(
             pipeline=pipeline.name,
             run_id=_journal_run_id,
             state_key=config_path,
             pipeline_source=pipeline_source,
             provider=agent_provider,
+            cost_mode=_cost_mode,
             params={k: ui.mask(str(v)) for k, v in (params or {}).items()},
             budgets=[str(b) for b in (pipeline.budgets or [])],
             default_model=pipeline.default_model,
             started_at=datetime.now(timezone.utc).isoformat(),
             cwd=str(ctx.working_dir or os.getcwd()),
+            quota_before=_quota_before,
         )
         ctx.journal = _journal
         ctx.event_sink = JournalSink(ctx.event_sink, _journal)
@@ -1343,6 +1365,18 @@ async def run_pipeline(
         if ctx.journal is not None and journal is None:
             # Only finish the journal if we created it (not if passed from parent)
             tracker = ctx.usage_tracker
+
+            # Sample quota after run if a probe is configured
+            _quota_after: dict | None = None
+            if quota_probe is not None:
+                from norn.quota import QuotaProbeError, sample_quota as _sample_quota_after
+                try:
+                    _quota_after = _sample_quota_after(agent_provider)
+                except QuotaProbeError as _qe2:
+                    if require_quota:
+                        raise
+                    log.warning("quota: post-run probe failed: %s", _qe2)
+
             ctx.journal.finish(
                 success=_failed_stage is None,
                 failed_stage=_failed_stage,
@@ -1356,6 +1390,7 @@ async def run_pipeline(
                     "tool_errors": tracker.total_tool_errors,
                     "retries": ctx.retries,
                 },
+                quota_after=_quota_after,
             )
         ctx.event_sink.emit(RunFinished(
             key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),

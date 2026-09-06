@@ -190,6 +190,23 @@ def main() -> None:
         action="store_true",
         help="Run LLM evaluation after the pipeline completes (or fails)",
     )
+    run_parser.add_argument(
+        "--quota",
+        default=None,
+        metavar="TOOL",
+        dest="quota_probe",
+        help="Sample subscription quota using the specified tool (e.g. codexbar) before and after the run",
+    )
+    run_parser.add_argument(
+        "--require-quota",
+        action="store_true",
+        help="Abort the run if quota sampling fails (default: warn and continue)",
+    )
+    run_parser.add_argument(
+        "--quota-fail-open",
+        action="store_true",
+        help="Explicitly allow continuing when quota sampling fails",
+    )
 
     history_parser = sub.add_parser("history", help="Show run history for a pipeline config")
     history_parser.add_argument("config", help="Path to the pipeline config .py file")
@@ -585,6 +602,9 @@ def main() -> None:
             agent_provider=resolved_provider,
             input_responder=input_responder,
             pipeline_source=pipeline_source,
+            quota_probe=getattr(args, "quota_probe", None),
+            require_quota=getattr(args, "require_quota", False),
+            quota_fail_open=getattr(args, "quota_fail_open", False),
         ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
     except PipelineError as e:
