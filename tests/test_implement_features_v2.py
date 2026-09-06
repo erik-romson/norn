@@ -870,6 +870,52 @@ async def test_assert_head_unchanged_fails_when_head_moves(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_head_moved_error_names_both_shas(tmp_path, monkeypatch) -> None:
+    """The failure must say which SHA was recorded and which is current.
+
+    HEAD moves forward on a commit and backward on a reset; the gate cannot
+    tell them apart, so the message names both SHAs instead of guessing that
+    the agent committed.
+    """
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+
+    baseline_stage = _stage(mod, f"record baseline {stem}")
+    assert (await baseline_stage.impl.run(ctx)).success
+    recorded = repo.head.commit.hexsha
+
+    # Move HEAD backwards, the way a `git reset` in another terminal would.
+    (repo_path / "new.txt").write_text("new\n")
+    repo.index.add(["new.txt"])
+    repo.index.commit("move HEAD")
+    moved = repo.head.commit.hexsha
+    repo.git.reset(recorded)
+
+    check_stage = _stage(mod, f"assert head unchanged {stem}")
+    r2 = await check_stage.impl.run(ctx)
+    assert r2.success, "reset back to the recorded SHA must satisfy the gate"
+
+    # And forward again: the message carries both SHAs.
+    repo.git.reset(moved)
+    r3 = await check_stage.impl.run(ctx)
+    assert not r3.success
+    output = f"{r3.output or ''}{r3.error or ''}"
+    assert recorded in output
+    assert moved in output
+    assert "recorded:" in output
+
+
+@pytest.mark.asyncio
 async def test_assert_head_unchanged_fails_when_files_staged(tmp_path, monkeypatch) -> None:
     """assert head unchanged fails when the index is dirty."""
     repo = _init_temp_repo(tmp_path / "repo")
