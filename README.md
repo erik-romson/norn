@@ -419,9 +419,17 @@ uv run python -m norn run pipeline.py --quota codexbar
 # Abort the run when quota cannot be read, instead of continuing
 uv run python -m norn run pipeline.py --quota codexbar --require-quota
 
-# Continue even when the quota call fails (default behaviour; explicit override)
-uv run python -m norn run pipeline.py --quota codexbar --quota-fail-open
+# Refuse to start unless 20% of the session window is left
+uv run python -m norn run pipeline.py --require-quota 20
+
+# Same, against the weekly window
+uv run python -m norn run pipeline.py --require-quota 20:weekly
+
+# Start anyway when CodexBar cannot tell us how much is left
+uv run python -m norn run pipeline.py --require-quota 20 --quota-fail-open
 ```
+
+Given a percentage, `--require-quota` runs `codexbar guard` *before* the pipeline starts and stops the run when headroom is short. `--quota-fail-open` overrides it, but only for the "quota unavailable" case (CodexBar missing, timing out, or reporting exit 69) — a real "not enough quota" answer still blocks the run.
 
 norn never auto-detects or calls CodexBar. Identity fields (account, org) are stripped before anything is written to the journal.
 

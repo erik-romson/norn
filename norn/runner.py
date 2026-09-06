@@ -904,6 +904,32 @@ def _persist_history_snapshot(
     )
 
 
+def _write_run_metrics(ctx: PipelineContext) -> None:
+    """Compute deterministic metrics + findings from the journal and persist them.
+
+    Called from ``run_pipeline``'s ``finally`` so both successful and failed
+    runs get ``metrics.json`` / ``findings.json`` beside their journal. Costs
+    no tokens — everything is read back from what the run already wrote.
+
+    Diagnostics only: any failure warns and leaves the context empty rather
+    than turning a completed run into a crash.
+    """
+    try:
+        from norn.metrics import compute_metrics, find_issues, load_prior_metrics, write_metrics
+
+        run_dir = ctx.journal._dir
+        metrics = compute_metrics(run_dir)
+        prior = load_prior_metrics(run_dir.parent, int(run_dir.name))
+        findings = find_issues(metrics, prior)
+        write_metrics(run_dir, metrics, findings)
+        ctx.run_metrics = metrics
+        ctx.findings = findings
+    except Exception:
+        log.warning("metrics: failed to compute post-run metrics", exc_info=True)
+        ctx.run_metrics = None
+        ctx.findings = []
+
+
 async def run_pipeline(
     pipeline: Pipeline,
     params: dict[str, str] | None = None,
@@ -1025,7 +1051,9 @@ async def run_pipeline(
                 timeout=5,
             ).stdout.strip() or None
         except Exception:
-            pass
+            # Not a git repo, git missing, or the probe timed out — git_head is
+            # an optional header field, so this is debug, not a warning.
+            log.debug("journal: could not read git HEAD", exc_info=True)
 
         _journal.write_header(
             pipeline=pipeline.name,
@@ -1387,10 +1415,12 @@ async def run_pipeline(
                 try:
                     _quota_after = _sample_quota_after(agent_provider)
                 except QuotaProbeError as _qe2:
-                    if require_quota:
-                        raise
+                    # Always warn and continue: the run already happened, and
+                    # raising here (inside `finally`) would skip journal.finish,
+                    # leave run.json headerless, and mask the pipeline's own
+                    # result. require_quota is a pre-run gate only.
                     log.warning("quota: post-run probe failed: %s", _qe2)
-                    _quota_after = {"error": str(_qe2)}   # write error object per plan
+                    _quota_after = {"error": str(_qe2)}
 
             ctx.journal.finish(
                 success=_failed_stage is None,
@@ -1407,34 +1437,19 @@ async def run_pipeline(
                 },
                 quota_after=_quota_after,
             )
+            # Metrics live inside `finally`, right after the journal is
+            # finished: a failed run raises past everything below, and a failed
+            # run is the one most worth having findings.json for.
+            _write_run_metrics(ctx)
+        else:
+            ctx.run_metrics = None
+            ctx.findings = []
         ctx.event_sink.emit(RunFinished(
             key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
             success=_failed_stage is None,
         ))
 
     ui.print_usage_report(pipeline.name, ctx.usage_tracker, config_path)
-
-    # Compute deterministic metrics from journal (zero tokens)
-    if ctx.journal is not None and journal is None:
-        try:
-            from norn.metrics import compute_metrics, find_issues, load_prior_metrics, write_metrics
-
-            _run_dir = ctx.journal._dir
-            _runs_dir = _run_dir.parent
-            _journal_rid = int(_run_dir.name)
-            _metrics = compute_metrics(_run_dir)
-            _prior = load_prior_metrics(_runs_dir, _journal_rid)
-            _findings = find_issues(_metrics, _prior)
-            write_metrics(_run_dir, _metrics, _findings)
-            ctx.run_metrics = _metrics
-            ctx.findings = _findings
-        except Exception:
-            log.warning("metrics: failed to compute post-run metrics", exc_info=True)
-            ctx.run_metrics = None
-            ctx.findings = []
-    else:
-        ctx.run_metrics = None
-        ctx.findings = []
 
     if ctx.run_metrics is not None:
         ui.print_findings(ctx.findings, ctx.run_metrics)

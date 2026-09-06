@@ -199,13 +199,21 @@ def main() -> None:
     )
     run_parser.add_argument(
         "--require-quota",
-        action="store_true",
-        help="Abort the run if quota sampling fails (default: warn and continue)",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="PCT[:WINDOW]",
+        help=(
+            "Require quota headroom. Bare: abort if quota sampling fails "
+            "(default: warn and continue). With a value (e.g. 20 or 20:weekly): "
+            "run `codexbar guard` first and abort when less than PCT%% remains "
+            "in the session (default) or weekly window"
+        ),
     )
     run_parser.add_argument(
         "--quota-fail-open",
         action="store_true",
-        help="(deferred — threshold-based guard not yet implemented; accepted for forward compatibility)",
+        help="Start the run anyway when quota cannot be determined (overrides --require-quota)",
     )
 
     history_parser = sub.add_parser("history", help="Show run history for a pipeline config")
@@ -561,6 +569,30 @@ def main() -> None:
 
     resolved_provider = resolve_agent_provider(pipeline, cli_provider=args.agent_provider)
 
+    # --quota-fail-open overrides --require-quota everywhere: the pre-run guard
+    # starts the run anyway, and probe failures during the run stay warnings.
+    require_quota = getattr(args, "require_quota", None)
+    quota_fail_open = getattr(args, "quota_fail_open", False)
+    abort_on_quota_failure = require_quota is not None and not quota_fail_open
+
+    if isinstance(require_quota, str):
+        from norn.quota import QuotaProbeError, check_quota_guard
+        from norn.ui import console
+        try:
+            decision = check_quota_guard(
+                resolved_provider, require_quota, fail_open=quota_fail_open
+            )
+        except QuotaProbeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not decision.allowed:
+            console.print(
+                f"[bold red]Quota guard blocked the run:[/bold red] {decision.message}",
+                highlight=False,
+            )
+            sys.exit(1)
+        console.print(f"  [dim]Quota guard: {decision.message}[/dim]", highlight=False)
+
     resume_session: str | None = None
     resume_checkpoint: Checkpoint | None = None
 
@@ -603,7 +635,7 @@ def main() -> None:
             input_responder=input_responder,
             pipeline_source=pipeline_source,
             quota_probe=getattr(args, "quota_probe", None),
-            require_quota=getattr(args, "require_quota", False),
+            require_quota=abort_on_quota_failure,
         ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
     except PipelineError as e:

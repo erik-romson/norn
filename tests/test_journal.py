@@ -329,3 +329,57 @@ def test_next_run_id_auto_increments(tmp_path):
     # Create run dir 2
     RunJournal.open(config, 2)
     assert next_run_id(config) == 3
+
+
+# ---------------------------------------------------------------------------
+# Metrics are written for failed runs too
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_metrics_written_when_the_pipeline_fails(tmp_path):
+    """A failed run gets metrics.json / findings.json — it is the run most worth reading.
+
+    The metrics block used to sit after the try/finally, which a raising
+    pipeline never reaches, so every failed run wrote nothing.
+    """
+    from norn.runner import PipelineError
+
+    config = str(tmp_path / "fail_metrics")
+    p = Pipeline("fail-metrics").stage("boom", _FailStage())
+
+    with pytest.raises(PipelineError):
+        await run_pipeline(p, config_path=config)
+
+    journal_dir = runs_dir(config) / "1"
+    assert (journal_dir / "metrics.json").exists()
+    assert (journal_dir / "findings.json").exists()
+
+    header = json.loads((journal_dir / "run.json").read_text())
+    assert header["success"] is False
+    assert header["failed_stage"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_metrics_written_when_the_pipeline_succeeds(tmp_path):
+    """The success path keeps writing metrics, and exposes them on the context."""
+    config = str(tmp_path / "ok_metrics")
+    p = Pipeline("ok-metrics").stage("step", _SuccessStage())
+
+    ctx = await run_pipeline(p, config_path=config)
+
+    journal_dir = runs_dir(config) / "1"
+    assert (journal_dir / "metrics.json").exists()
+    assert (journal_dir / "findings.json").exists()
+    assert ctx.run_metrics is not None
+
+
+@pytest.mark.asyncio
+async def test_no_journal_leaves_metrics_unset(tmp_path):
+    """Without config_path there is no journal to compute metrics from."""
+    p = Pipeline("no-journal").stage("step", _SuccessStage())
+
+    ctx = await run_pipeline(p)
+
+    assert ctx.run_metrics is None
+    assert ctx.findings == []
