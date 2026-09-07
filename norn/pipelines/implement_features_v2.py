@@ -83,7 +83,11 @@ Final audit (four deterministic shell checks, all ``on_failure=fail``):
   post-handoff snapshot, after ignoring all ``*.changed``-listed paths,
   ``review.md``, and ``handoff.md``, is empty.  Files that were already
   untracked at run start are not flagged; only files that appeared or changed
-  during the run without being committed are reported.
+  during the run without being committed are reported.  The diff runs with
+  ``--root``, so paths ``git add`` would refuse — above all one that became
+  gitignored during the run — are dropped here exactly as they are at commit
+  time; flagging a path that can never be committed would end the run with no
+  move left to make.
 
 Note: trailer verification is absent because commit trailers are a core item.
 
@@ -918,14 +922,19 @@ def _assert_no_changes_outside(
     two apart.
     """
     q = shlex.quote
+    # The path list is NUL-separated, and command substitution drops NUL bytes,
+    # so the delta goes to a file: reading it back through `tr` is the only way
+    # to print one path per line instead of one jammed-together line.
+    delta = post_json + ".delta"
     return (
         f'python3 {q(SNAPSHOT_HELPER)} snapshot '
         f'--root {q(GIT_TOPLEVEL)} {q(post_json)} && '
-        f'OUTSIDE=$(python3 {q(SNAPSHOT_HELPER)} diff '
-        f'{q(pre_json)} {q(post_json)}{ignore_flag}) && '
-        f'if [ -n "$OUTSIDE" ]; then '
+        f'rm -f {q(delta)} && '
+        f'python3 {q(SNAPSHOT_HELPER)} diff '
+        f'{q(pre_json)} {q(post_json)}{ignore_flag} > {q(delta)} && '
+        f'if [ -s {q(delta)} ]; then '
         f'echo "ERROR: files other than {allowed} changed during {during}:" 1>&2; '
-        f'printf "%s\\n" "$OUTSIDE" | tr \'\\0\' \'\\n\' 1>&2; '
+        f'tr \'\\0\' \'\\n\' < {q(delta)} 1>&2; '
         f'echo "{during} may write only {allowed}, and nothing else may write in '
         f'this repo while the run is in flight — not the agent, not another '
         f'terminal. Inspect the paths above with git diff before rerunning." 1>&2; '
@@ -2195,6 +2204,7 @@ _handoff_pre       = os.path.join(snapshot_root, "handoff.pre.json")
 _handoff_postcond_snap = os.path.join(snapshot_root, "handoff.postcond.json")
 _audit_snap        = os.path.join(snapshot_root, "audit.snap.json")
 _audit_merged_ignore = os.path.join(snapshot_root, "audit.merged.ignore")
+_audit_delta         = os.path.join(snapshot_root, "audit.delta")
 
 # All .changed files produced by the pipeline (steps + aggregate + review fixes).
 # Listed statically because they are determined at import time and the final
@@ -2357,16 +2367,30 @@ for _cf in _all_changed_for_audit:
         f'>> {shlex.quote(_audit_merged_ignore)}; '
     )
 
+# ``--root`` filters the delta through ``unstageable_paths``, exactly as the
+# commit stage does.  Without it the audit flags paths git refuses to stage —
+# above all a file that was untracked at run start and became gitignored during
+# the run (a step committing a ``.gitignore`` that covers the editor's own
+# scratch files is the common case).  Such a path can never be committed, so
+# reporting it as "changed without being committed" ends the run with no move
+# the operator or the agent can make.
+#
+# The delta goes to a file rather than a shell variable because it is
+# NUL-separated and command substitution drops NUL bytes, jamming every path
+# onto one unreadable line.
 _diff_with_ignore = (
+    f'rm -f {shlex.quote(_audit_delta)} && '
     f'if [ -s {shlex.quote(_audit_merged_ignore)} ]; then '
-    f'_DELTA=$(python3 {shlex.quote(SNAPSHOT_HELPER)} diff '
+    f'python3 {shlex.quote(SNAPSHOT_HELPER)} diff '
     f'{shlex.quote(START_SNAPSHOT)} {shlex.quote(_audit_snap)} '
+    f'--root {shlex.quote(GIT_TOPLEVEL)} '
     f'--ignore-file {shlex.quote(_audit_merged_ignore)}'
-    f'{_extra_ignore_flags}); '
+    f'{_extra_ignore_flags} > {shlex.quote(_audit_delta)}; '
     f'else '
-    f'_DELTA=$(python3 {shlex.quote(SNAPSHOT_HELPER)} diff '
-    f'{shlex.quote(START_SNAPSHOT)} {shlex.quote(_audit_snap)}'
-    f'{_extra_ignore_flags}); '
+    f'python3 {shlex.quote(SNAPSHOT_HELPER)} diff '
+    f'{shlex.quote(START_SNAPSHOT)} {shlex.quote(_audit_snap)} '
+    f'--root {shlex.quote(GIT_TOPLEVEL)}'
+    f'{_extra_ignore_flags} > {shlex.quote(_audit_delta)}; '
     f'fi'
 )
 
@@ -2388,9 +2412,9 @@ _final_audit_cmd = (
     f'--root {shlex.quote(GIT_TOPLEVEL)} {shlex.quote(_audit_snap)} && '
     f'{_merge_ignore_cmds}'
     f'{_diff_with_ignore} && '
-    f'if [ -n "$_DELTA" ]; then '
+    f'if [ -s {shlex.quote(_audit_delta)} ]; then '
     f'echo "ERROR: files changed or appeared during the run without being committed:" 1>&2; '
-    f'printf "%s\\n" "$_DELTA" | tr \'\\0\' \'\\n\' 1>&2; '
+    f'tr \'\\0\' \'\\n\' < {shlex.quote(_audit_delta)} 1>&2; '
     f'echo "The run-start snapshot is the baseline; '
     f'pre-existing untracked files are not flagged." 1>&2; '
     f'echo "Only files that appeared or changed during this run without being '

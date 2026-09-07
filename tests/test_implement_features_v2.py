@@ -3389,6 +3389,64 @@ async def test_final_audit_does_not_fail_for_preexisting_untracked(tmp_path, mon
     )
 
 
+@pytest.mark.asyncio
+async def test_final_audit_does_not_fail_for_newly_ignored_file(tmp_path, monkeypatch) -> None:
+    """final audit does NOT flag a file that became gitignored during the run.
+
+    The path was untracked when the run-start snapshot was taken and a
+    ``.gitignore`` committed by a step now covers it, so it has vanished from
+    ``git status``.  ``git add`` refuses such a path, which is why the commit
+    stage drops it; flagging it here would end an otherwise clean run with
+    nothing the operator could do about it.
+    """
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+
+    # Untracked before record start, so it lands in the run-start snapshot.
+    scratch = repo_path / "editor-scratch.tmp"
+    scratch.write_text("# editor scratch\n")
+
+    r = await _stage(mod, "record start").impl.run(ctx)
+    assert r.success
+
+    # A step commits a .gitignore that covers it — the file is still on disk
+    # but no longer appears in git status.
+    (repo_path / ".gitignore").write_text("editor-scratch.tmp\n")
+    repo.index.add([".gitignore"])
+    repo.index.commit("refactor: step-01-v2-fixture-alpha — ignore editor scratch")
+
+    head_sha = repo.head.commit.hexsha
+    Path(mod.REVIEWED_HEAD).parent.mkdir(parents=True, exist_ok=True)
+    Path(mod.REVIEWED_HEAD).write_text(head_sha + "\n")
+
+    r = await _stage(mod, "final audit").impl.run(ctx)
+    assert r.success, (
+        f"final audit should not flag a path that became gitignored: {r.output}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_audit_prints_one_offending_path_per_line(tmp_path, monkeypatch) -> None:
+    """The audit's delta list is NUL-separated; each path must print on its own line."""
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+
+    r = await _stage(mod, "record start").impl.run(ctx)
+    assert r.success
+
+    head_sha = repo.head.commit.hexsha
+    Path(mod.REVIEWED_HEAD).parent.mkdir(parents=True, exist_ok=True)
+    Path(mod.REVIEWED_HEAD).write_text(head_sha + "\n")
+
+    (repo_path / "appeared_one.py").write_text("# one\n")
+    (repo_path / "appeared_two.py").write_text("# two\n")
+
+    r = await _stage(mod, "final audit").impl.run(ctx)
+    assert not r.success
+    stderr = r.output["stderr"] if isinstance(r.output, dict) else str(r.output)
+    lines = [line.strip() for line in stderr.splitlines()]
+    assert "appeared_one.py" in lines, f"path must be on its own line, got:\n{stderr}"
+    assert "appeared_two.py" in lines, f"path must be on its own line, got:\n{stderr}"
+
+
 # ===========================================================================
 # Step-09 tests: docstring and catalog contract
 # ===========================================================================
