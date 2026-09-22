@@ -13,6 +13,7 @@ import importlib
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -92,8 +93,8 @@ def test_config_items_start_with_required_stages() -> None:
     assert third.on_failure == OnFailure.FAIL
 
 
-def test_all_steps_summary_contains_all_steps() -> None:
-    """all_steps_summary must cover every step even when resume skips some."""
+def test_all_step_names_contains_all_steps() -> None:
+    """all_step_names must cover every step even when resume skips some."""
     # Monkeypatch already_committed_steps to pretend step 01 is done.
     saved = list(sys.argv)
     sys.argv = [saved[0], str(GOOD_DIR)]
@@ -114,7 +115,7 @@ def test_all_steps_summary_contains_all_steps() -> None:
         "step-03-v2-fixture-gamma",
         "step-04-v2-fixture-delta",
     ]:
-        assert stem in mod.all_steps_summary, f"{stem} missing from all_steps_summary"
+        assert stem in mod.all_step_names, f"{stem} missing from all_step_names"
 
 
 def test_feature_test_cmd_loaded_from_index() -> None:
@@ -130,10 +131,13 @@ def test_feature_test_cmd_loaded_from_index() -> None:
 
 def test_default_knobs() -> None:
     mod = _import_v2(GOOD_DIR)
-    assert mod.BUDGET == 30.0
-    assert mod.TOKEN_BUDGET == 500_000
-    assert mod.REVIEW_MODEL == "sonnet"
-    assert mod.AGGREGATE_MODEL == "sonnet"
+    steps = len(mod._all_step_files)
+    # The ceilings scale with the plan: per-step rates plus the review rounds,
+    # which cost the same however many steps came before them.
+    assert mod.BUDGET == mod.BUDGET_USD_PER_STEP * steps + mod.BUDGET_USD_REVIEW
+    assert mod.TOKEN_BUDGET == mod.BUDGET_TOKENS_PER_STEP * steps + mod.BUDGET_TOKENS_REVIEW
+    assert mod.REVIEW_MODEL == "standard"
+    assert mod.AGGREGATE_MODEL == "standard"
     assert mod.MAX_RETRIES == 3
     assert mod.ALLOW_DIRTY_INDEX is False
 
@@ -143,16 +147,16 @@ def test_custom_knobs_land_in_module() -> None:
         GOOD_DIR,
         "--arg", "budget=50",
         "--arg", "token_budget=100000",
-        "--arg", "review_model=opus",
-        "--arg", "aggregate_model=opus",
+        "--arg", "review_model=deep",
+        "--arg", "aggregate_model=deep",
         "--arg", "max_retries=5",
         "--arg", "allow_dirty_index=1",
         "--arg", "allow_dirty_worktree=1",
     )
     assert mod.BUDGET == 50.0
     assert mod.TOKEN_BUDGET == 100_000
-    assert mod.REVIEW_MODEL == "opus"
-    assert mod.AGGREGATE_MODEL == "opus"
+    assert mod.REVIEW_MODEL == "deep"
+    assert mod.AGGREGATE_MODEL == "deep"
     assert mod.MAX_RETRIES == 5
     assert mod.ALLOW_DIRTY_INDEX is True
     assert mod.ALLOW_DIRTY_WORKTREE is True
@@ -280,8 +284,8 @@ def test_bad_effort_raises() -> None:
         _import_v2(FIXTURE_DIR / "bad-effort")
 
 
-def test_bad_effort_mentions_core_support() -> None:
-    with pytest.raises(ValueError, match="norn core"):
+def test_bad_effort_mentions_label() -> None:
+    with pytest.raises(ValueError, match="label"):
         _import_v2(FIXTURE_DIR / "bad-effort")
 
 
@@ -298,6 +302,22 @@ def test_bad_model_raises() -> None:
 def test_bad_timeout_raises() -> None:
     with pytest.raises(ValueError, match="boolean"):
         _import_v2(FIXTURE_DIR / "bad-timeout")
+
+
+def test_bad_allow_noop_raises() -> None:
+    with pytest.raises(ValueError, match="allow_noop"):
+        _import_v2(FIXTURE_DIR / "bad-allow-noop")
+
+
+def test_bad_allow_noop_mentions_boolean() -> None:
+    with pytest.raises(ValueError, match="boolean"):
+        _import_v2(FIXTURE_DIR / "bad-allow-noop")
+
+
+def test_allow_noop_fixture_imports() -> None:
+    """`allow_noop: true` is an accepted step key, not a typo."""
+    mod = _import_v2(FIXTURE_DIR / "allow-noop")
+    assert _stage(mod, "assert owned diff step-02-v2-noop-gate") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -682,11 +702,11 @@ def test_no_generate_sets_cwd() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_implement_timeout_opus_2700() -> None:
-    """Step-02 uses opus model → implement timeout must be 2700."""
+def test_implement_timeout_deep_2700() -> None:
+    """Step-02 uses deep model → implement timeout must be 2700."""
     mod = _import_v2(GOOD_DIR)
     s = _stage(mod, "implement step-02-v2-fixture-beta")
-    assert s.timeout == 2700, f"opus implement timeout should be 2700, got {s.timeout}"
+    assert s.timeout == 2700, f"deep implement timeout should be 2700, got {s.timeout}"
 
 
 @pytest.mark.parametrize("stem", [
@@ -694,11 +714,13 @@ def test_implement_timeout_opus_2700() -> None:
     "step-03-v2-fixture-gamma",
     "step-04-v2-fixture-delta",
 ])
-def test_implement_timeout_sonnet_1800(stem: str) -> None:
-    """Non-opus steps → implement timeout must be 1800."""
+def test_implement_timeout_standard(stem: str) -> None:
+    """Non-deep steps → the standard implement timeout."""
     mod = _import_v2(GOOD_DIR)
     s = _stage(mod, f"implement {stem}")
-    assert s.timeout == 1800, f"{stem}: sonnet implement timeout should be 1800, got {s.timeout}"
+    assert s.timeout == mod.TIMEOUT_IMPLEMENT_SONNET == 2700, (
+        f"{stem}: standard implement timeout should be 2700, got {s.timeout}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +996,44 @@ async def test_assert_head_unchanged_succeeds_when_clean(tmp_path, monkeypatch) 
     assert r2.success, f"assert head unchanged should succeed on clean repo: {r2.error}"
 
 
+def test_validation_gate_reruns_only_when_the_loop_left_no_proof_for_this_tree(
+    tmp_path, monkeypatch
+) -> None:
+    """The gate trusts a passing in-loop run on an unchanged tree and reruns otherwise."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    shutil.copytree(GOOD_DIR, repo_path / "feat")
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(repo_path / "feat", monkeypatch)
+
+    runs = tmp_path / "runs.txt"
+    fail_flag = tmp_path / "fail"
+    cmd = f"echo run >> {runs} && test ! -f {fail_flag}"
+    in_loop, gate = mod._proven_validation("step-x", cmd)
+
+    def sh(script: str) -> subprocess.CompletedProcess:
+        return subprocess.run(script, shell=True, cwd=repo_path, capture_output=True, text=True)
+
+    def run_count() -> int:
+        return len(runs.read_text().splitlines())
+
+    assert sh(in_loop).returncode == 0
+    passed_gate = sh(gate)
+    assert passed_gate.returncode == 0, passed_gate.stderr
+    assert "not rerun" in passed_gate.stdout
+    assert run_count() == 1
+
+    (repo_path / "README.md").write_text("# changed after validation\n")
+    assert sh(gate).returncode == 0
+    assert run_count() == 2
+
+    assert sh(in_loop).returncode == 0
+    fail_flag.touch()
+    assert sh(in_loop).returncode != 0
+    assert sh(gate).returncode != 0, "a failed last loop run must not leave a proof"
+    assert run_count() == 5
+
+
 @pytest.mark.asyncio
 async def test_assert_owned_diff_fails_with_no_changes(tmp_path, monkeypatch) -> None:
     """assert owned diff fails when no worktree changes occurred after baseline."""
@@ -1030,6 +1090,173 @@ async def test_assert_owned_diff_succeeds_after_file_written(tmp_path, monkeypat
     diff_stage = _stage(mod, f"assert owned diff {stem}")
     r2 = await diff_stage.impl.run(ctx)
     assert r2.success, f"assert owned diff should succeed after file written: {r2.output}"
+
+
+# ---------------------------------------------------------------------------
+# Recoverable no-op: assert owned diff prompts, and [c]ontinue stays coherent
+# ---------------------------------------------------------------------------
+
+
+def test_assert_owned_diff_on_failure_is_ask_user() -> None:
+    """A step that changed nothing must prompt, not kill the run."""
+    from norn.dsl import OnFailure
+
+    mod = _import_v2(GOOD_DIR)
+    for stem in _GOOD_STEMS:
+        s = _stage(mod, f"assert owned diff {stem}")
+        assert s.on_failure == OnFailure.ASK_USER, (
+            f"{stem}: assert owned diff on_failure should be ASK_USER"
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_owned_diff_writes_noop_marker(tmp_path, monkeypatch) -> None:
+    """The no-op branch drops the marker that gates commit and assert committed."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+    marker = Path(mod.snapshot_root) / f"{stem}.noop"
+
+    r = await _stage(mod, f"record baseline {stem}").impl.run(ctx)
+    assert r.success
+
+    diff_stage = _stage(mod, f"assert owned diff {stem}")
+    r2 = await diff_stage.impl.run(ctx)
+    assert not r2.success
+    assert marker.exists(), "no-op branch should drop the .noop marker"
+
+    # The commit and assert-committed stages are skipped while it exists.
+    assert not _stage(mod, f"commit {stem}").when(ctx)
+    assert not _stage(mod, f"assert committed {stem}").when(ctx)
+    assert _stage(mod, f"record no-op {stem}").when(ctx)
+
+    # A retry after real work clears the marker and re-enables the commit.
+    (repo_path / "new_feature.py").write_text("# new\n")
+    r3 = await diff_stage.impl.run(ctx)
+    assert r3.success, f"assert owned diff should pass after a real change: {r3.output}"
+    assert not marker.exists(), "a passing re-run must clear the stale marker"
+    assert _stage(mod, f"commit {stem}").when(ctx)
+    assert not _stage(mod, f"record no-op {stem}").when(ctx)
+
+
+# ---------------------------------------------------------------------------
+# Declared no-op: `allow_noop: true` passes the gate without prompting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_allow_noop_step_passes_owned_diff_with_no_changes(tmp_path, monkeypatch) -> None:
+    """A verification-only step must survive a run that cannot prompt.
+
+    Without the key the gate exits 1, and `--non-interactive` answers abort —
+    which is what killed a fix_jira_issue child run on a regression-gate step.
+    """
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(FIXTURE_DIR / "allow-noop", feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-02-v2-noop-gate"
+    ctx = PipelineContext()
+    marker = Path(mod.snapshot_root) / f"{stem}.noop"
+
+    r = await _stage(mod, f"record baseline {stem}").impl.run(ctx)
+    assert r.success
+
+    r2 = await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)
+    assert r2.success, f"allow_noop step should pass with no changes: {r2.output}"
+    assert "changed nothing" in (r2.output or {}).get("stdout", "")
+
+    # The marker still drives the downstream wiring: nothing to commit, and the
+    # no-op facts file stands in for the commit's.
+    assert marker.exists(), "allow_noop must still drop the .noop marker"
+    assert not _stage(mod, f"commit {stem}").when(ctx)
+    assert not _stage(mod, f"assert committed {stem}").when(ctx)
+    assert _stage(mod, f"record no-op {stem}").when(ctx)
+
+
+@pytest.mark.asyncio
+async def test_allow_noop_does_not_leak_to_other_steps(tmp_path, monkeypatch) -> None:
+    """The waiver is per step: a sibling without the key still fails the gate."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(FIXTURE_DIR / "allow-noop", feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-noop-alpha"
+    ctx = PipelineContext()
+
+    r = await _stage(mod, f"record baseline {stem}").impl.run(ctx)
+    assert r.success
+
+    r2 = await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)
+    assert not r2.success, "a step without allow_noop must still stop on a no-op"
+
+
+@pytest.mark.asyncio
+async def test_allow_noop_step_still_fails_on_a_real_error(tmp_path, monkeypatch) -> None:
+    """Only the no-op branch is waived; a broken snapshot still fails the stage."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(FIXTURE_DIR / "allow-noop", feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-02-v2-noop-gate"
+    ctx = PipelineContext()
+
+    # No baseline snapshot was recorded, so the diff has nothing to compare to.
+    r = await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)
+    assert not r.success, "a missing pre-snapshot must still fail the gate"
+
+
+@pytest.mark.asyncio
+async def test_record_noop_writes_three_line_facts(tmp_path, monkeypatch) -> None:
+    """The no-op facts file has the same three-line shape the commit stage writes."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+
+    r = await _stage(mod, f"record no-op {stem}").impl.run(ctx)
+    assert r.success, f"record no-op should succeed: {r.output}"
+
+    facts = (Path(mod.snapshot_root) / f"{stem}.facts").read_text().splitlines()
+    assert len(facts) == 3, f"expected three facts lines, got {facts}"
+    assert facts[0].startswith("Commit: (none)")
+    assert facts[1] == "Changed: (none)"
+    assert facts[2].startswith("Validation: PASS - ")
 
 
 # ---------------------------------------------------------------------------
@@ -1934,14 +2161,14 @@ def test_aggregate_fix_when_falsy_with_no_prior_result() -> None:
 
 
 def test_aggregate_fix_model_follows_aggregate_model_knob() -> None:
-    """aggregate fix model follows --arg aggregate_model=opus."""
+    """aggregate fix model follows --arg aggregate_model=deep."""
     from norn.stages.generate import Generate
 
-    mod = _import_v2(GOOD_DIR, "--arg", "aggregate_model=opus")
+    mod = _import_v2(GOOD_DIR, "--arg", "aggregate_model=deep")
     fix_stage = _stage(mod, "aggregate fix")
     assert isinstance(fix_stage.impl, Generate)
-    assert fix_stage.impl.model == "opus", (
-        f"aggregate fix model should be 'opus', got {fix_stage.impl.model!r}"
+    assert fix_stage.impl.model == "deep", (
+        f"aggregate fix model should be 'deep', got {fix_stage.impl.model!r}"
     )
 
 
@@ -2462,17 +2689,17 @@ def test_review_generate_config() -> None:
         tools = s.impl.allowed_tools or []
         assert "Edit" not in tools, f"review {n}: should not have Edit tool"
         assert "Task" not in tools, f"review {n}: should not have Task tool"
-        assert s.impl.model == "sonnet", f"review {n}: default model should be sonnet"
+        assert s.impl.model == "standard", f"review {n}: default model should be standard"
 
 
 def test_review_model_follows_review_model_knob() -> None:
-    """review stages model follows --arg review_model=opus."""
+    """review stages model follows --arg review_model=deep."""
     from norn.stages.generate import Generate
-    mod = _import_v2(GOOD_DIR, "--arg", "review_model=opus")
+    mod = _import_v2(GOOD_DIR, "--arg", "review_model=deep")
     for n in range(1, 4):
         s = _stage(mod, f"review {n}")
         assert isinstance(s.impl, Generate)
-        assert s.impl.model == "opus", f"review {n}: model should be opus"
+        assert s.impl.model == "deep", f"review {n}: model should be deep"
 
 
 # ---------------------------------------------------------------------------
@@ -2517,12 +2744,92 @@ def test_review_prompt_contains_all_step_filenames() -> None:
         assert f"{stem}.md" in prompt, f"review prompt must reference {stem}.md"
 
 
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_review_prompt_names_steps_without_pasting_them(n: int) -> None:
+    """The plan is a directory the reviewer can read, not prompt payload."""
+    mod = _import_v2(GOOD_DIR)
+    prompt = _stage(mod, f"review {n}").impl.prompt
+    body = (GOOD_DIR / "step-01-v2-fixture-alpha.md").read_text()
+    quoted = next(ln for ln in body.splitlines() if len(ln.strip()) > 40)
+    assert quoted not in prompt
+    assert str(GOOD_DIR) in prompt
+
+
 def test_review_round_2_prompt_mentions_round_number() -> None:
     """Round 2+ review prompt mentions the round number."""
     mod = _import_v2(GOOD_DIR)
     s = _stage(mod, "review 2")
     prompt = s.impl.prompt
     assert "round 2" in prompt.lower()
+
+
+def test_review_round_1_reviews_the_whole_range() -> None:
+    prompt = _stage(_import_v2(GOOD_DIR), "review 1").impl.prompt
+    assert "every commit from that base to HEAD" in prompt
+    assert "bounded" not in prompt
+
+
+@pytest.mark.parametrize("n", [2, 3])
+def test_later_rounds_verify_instead_of_re_reviewing(n: int) -> None:
+    """An unbounded re-review never converges, so later rounds are bounded."""
+    mod = _import_v2(GOOD_DIR)
+    prompt = _stage(mod, f"review {n}").impl.prompt
+    assert "Do **not** start a fresh review of the full range" in prompt
+    assert f"Re-check every blocking finding from round {n - 1}" in prompt
+    assert "Review the fix commits themselves" in prompt
+
+
+@pytest.mark.parametrize("n", [2, 3])
+def test_later_rounds_read_the_previous_review(n: int) -> None:
+    mod = _import_v2(GOOD_DIR)
+    read_stage = _stage(mod, f"read previous review {n}")
+    assert read_stage.impl.path == mod._review_paths[n]["prev_review"]
+    prompt = _stage(mod, f"review {n}").impl.prompt
+    assert f"{{read previous review {n}.output}}" in prompt
+
+
+def test_round_1_has_no_previous_review_stage() -> None:
+    mod = _import_v2(GOOD_DIR)
+    with pytest.raises(KeyError):
+        _stage(mod, "read previous review 1")
+
+
+@pytest.mark.parametrize("n", [2, 3])
+def test_later_manifests_archive_the_previous_review_and_list_fix_commits(n: int) -> None:
+    mod = _import_v2(GOOD_DIR)
+    cmd = _stage(mod, f"review manifest {n}").impl.cmd
+    prev = mod._review_paths[n - 1]
+    assert f"cp {shlex.quote(mod.REVIEW_MD)} {shlex.quote(mod._review_paths[n]['prev_review'])}" in cmd
+    assert shlex.quote(prev["head"]) in cmd
+    assert f"## Fix commits since round {n - 1}" in cmd
+
+
+def test_round_1_manifest_has_no_fix_commit_section() -> None:
+    cmd = _stage(_import_v2(GOOD_DIR), "review manifest 1").impl.cmd
+    assert "Fix commits" not in cmd
+
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_review_prompt_gates_on_blocking_severities(n: int) -> None:
+    """Minor findings and nits must not hold the verdict."""
+    prompt = _stage(_import_v2(GOOD_DIR), f"review {n}").impl.prompt
+    assert "`VERDICT: PASS` when no critical or major finding remains" in prompt
+    assert "## Blocking findings" in prompt
+    assert "## Non-blocking" in prompt
+
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_review_prompt_sends_out_of_scope_work_to_the_human(n: int) -> None:
+    """The fix step has no git commands, so it cannot commit untouched files."""
+    prompt = _stage(_import_v2(GOOD_DIR), f"review {n}").impl.prompt
+    assert "## For the human" in prompt
+    assert "Only the commits from the base SHA to HEAD are in scope" in prompt
+
+
+def test_review_fix_prompt_applies_blocking_findings_only() -> None:
+    prompt = _stage(_import_v2(GOOD_DIR), "review fix 1").impl.prompt
+    assert "## Blocking findings" in prompt
+    assert "`## Non-blocking` findings are" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -2561,11 +2868,11 @@ def test_review_fix_timeout_is_1200() -> None:
 
 def test_review_fix_model_follows_aggregate_model_knob() -> None:
     from norn.stages.generate import Generate
-    mod = _import_v2(GOOD_DIR, "--arg", "aggregate_model=opus")
+    mod = _import_v2(GOOD_DIR, "--arg", "aggregate_model=deep")
     for n in range(1, 3):
         s = _stage(mod, f"review fix {n}")
         assert isinstance(s.impl, Generate)
-        assert s.impl.model == "opus"
+        assert s.impl.model == "deep"
 
 
 # ---------------------------------------------------------------------------
@@ -2685,9 +2992,15 @@ async def test_check_review_needs_fixes_creates_marker(tmp_path, monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_check_review_stale_head_fails(tmp_path, monkeypatch) -> None:
-    """check review 1 fails with wrong Head: line, mentioning stale."""
-    repo = _init_temp_repo(tmp_path / "repo")
+async def test_review_passed_rejects_a_stale_head(tmp_path, monkeypatch) -> None:
+    """Staleness is caught at the end of the phase, against the real HEAD.
+
+    `check review` no longer looks at the SHAs — `stamp review` writes them one
+    stage earlier, so checking them there would test norn against itself. The
+    case that matters is a review whose head no longer matches HEAD, and that
+    is what `review passed` guards.
+    """
+    _init_temp_repo(tmp_path / "repo")
     repo_path = tmp_path / "repo"
     feat_dir = repo_path / "feat"
     shutil.copytree(GOOD_DIR, feat_dir)
@@ -2697,22 +3010,18 @@ async def test_check_review_stale_head_fails(tmp_path, monkeypatch) -> None:
     from norn.models import PipelineContext
 
     ctx = PipelineContext()
-    r = await _stage(mod, "record start").impl.run(ctx)
-    assert r.success
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
 
     base_sha = Path(mod.BASE_SHA).read_text().strip()
-
-    review_md = os.path.join(str(feat_dir), "review.md")
-    Path(review_md).write_text(
-        f"VERDICT: PASS\n"
+    Path(mod.REVIEW_MD).write_text(
+        "VERDICT: PASS\n"
         f"Base: {base_sha}\n"
-        f"Head: 0000000000000000000000000000000000000000\n"
+        "Head: 0000000000000000000000000000000000000000\n"
     )
 
-    r = await _stage(mod, "check review 1").impl.run(ctx)
-    assert not r.success, "check review 1 should fail with stale Head"
-    out = str(r.output)
-    assert "stale" in out.lower(), f"failure should mention 'stale': {out}"
+    r = await _stage(mod, "review passed").impl.run(ctx)
+    assert not r.success, "review passed should reject a head that is not HEAD"
+    assert "stale" in str(r.output).lower(), f"failure should mention 'stale': {r.output}"
 
 
 @pytest.mark.asyncio
@@ -3621,3 +3930,660 @@ async def test_commit_does_not_execute_the_test_cmd(tmp_path, monkeypatch) -> No
     lines = facts.read_text().splitlines()
     assert len(lines) == 3, f"facts file must stay three lines, got: {lines}"
     assert lines[2].startswith("Validation: PASS - sh -ex -c")
+
+
+# ---------------------------------------------------------------------------
+# norn's own run state
+#
+# norn writes `<key>.runs/<n>/events.jsonl`, `<key>.checkpoint` and
+# `<key>.history` into the launch directory and keeps writing to them for the
+# whole run. When the launch directory is the target repo, the snapshot diff
+# used to see them as step-owned changes: step 01 committed the journal, the
+# next journal write dirtied it again, and `assert committed` failed.
+# ---------------------------------------------------------------------------
+
+
+def test_no_state_key_leaves_the_diff_flags_empty(tmp_path, monkeypatch) -> None:
+    """Importing outside a run (TUI, tests, --dry-run) must not change the shell."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    monkeypatch.delenv("NORN_STATE_KEY", raising=False)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    assert mod.NORN_STATE_IGNORE_FLAGS == ""
+
+
+def test_state_key_produces_ignore_flags_on_every_diff(tmp_path, monkeypatch) -> None:
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setenv("NORN_STATE_KEY", str(repo_path / "implement_features_v2"))
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    flags = mod.NORN_STATE_IGNORE_FLAGS
+    assert "--ignore-prefix implement_features_v2.runs" in flags
+    assert "--ignore implement_features_v2.checkpoint" in flags
+    assert "--ignore implement_features_v2.history" in flags
+
+    stem = "step-01-v2-fixture-alpha"
+    for stage_name in (f"commit {stem}", f"assert owned diff {stem}"):
+        cmd = _stage(mod, stage_name).impl.cmd
+        for line in cmd.split("_step_snapshot.py diff")[1:]:
+            assert "--ignore-prefix implement_features_v2.runs" in line, (
+                f"{stage_name}: a diff invocation is missing the norn-state flags"
+            )
+
+
+@pytest.mark.asyncio
+async def test_journal_writes_alone_do_not_satisfy_assert_owned_diff(
+    tmp_path, monkeypatch
+) -> None:
+    """A step that wrote nothing must still fail, even while the journal grows."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setenv("NORN_STATE_KEY", str(repo_path / "implement_features_v2"))
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+
+    journal = repo_path / "implement_features_v2.runs" / "2" / "events.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text('{"event": "stage_start"}\n')
+
+    r = await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)
+    assert not r.success, "the journal is not the step's work"
+
+
+@pytest.mark.asyncio
+async def test_run_state_is_not_committed_and_assert_committed_survives_it(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression: journal committed by step 01, dirtied again by the next write."""
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setenv("NORN_STATE_KEY", str(repo_path / "implement_features_v2"))
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+
+    # The runner writes its state while the step runs.
+    journal = repo_path / "implement_features_v2.runs" / "2" / "events.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text('{"event": "stage_start"}\n')
+    checkpoint = repo_path / "implement_features_v2.checkpoint"
+    checkpoint.write_text('{"stages": []}\n')
+    history = repo_path / "implement_features_v2.history"
+    history.write_text("[]\n")
+
+    # The step's own work.
+    (repo_path / "feature.py").write_text("# feature\n")
+
+    r = await _stage(mod, f"commit {stem}").impl.run(ctx)
+    assert r.success, f"commit failed: {r.output}"
+
+    committed = repo.git.show("--name-only", "--format=", "HEAD").split()
+    assert "feature.py" in committed
+    assert not [p for p in committed if p.startswith("implement_features_v2.")], (
+        f"norn's own run state was committed: {committed}"
+    )
+
+    # The run continues: more events, a new checkpoint.
+    journal.write_text('{"event": "stage_start"}\n{"event": "stage_end"}\n')
+    checkpoint.write_text('{"stages": ["commit"]}\n')
+
+    r = await _stage(mod, f"assert committed {stem}").impl.run(ctx)
+    assert r.success, f"assert committed failed: {r.output}"
+
+
+# ---------------------------------------------------------------------------
+# A dirty index must be caught at run start and named where it is asserted
+#
+# A run resumed into a repo with a staged change used to skip the preflight
+# (restored from the checkpoint) and then die at the first postcondition that
+# asserts a clean index — reporting it as "index is not clean after review fix
+# commit 2", naming neither the files nor the fact that they predated the stage.
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_is_never_restored_from_a_checkpoint() -> None:
+    mod = _import_v2(GOOD_DIR)
+    stage = _stage(mod, "preflight repository")
+    assert stage.always_run, "a resume must re-check the repo, not trust a cached verdict"
+
+
+def _combined_output(result) -> str:
+    out = result.output or {}
+    return f"{out.get('stdout', '')}\n{out.get('stderr', '')}"
+
+
+@pytest.mark.asyncio
+async def test_preflight_names_the_staged_paths(tmp_path, monkeypatch) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    (repo_path / "leftover.txt").write_text("staged before the run\n")
+    repo.index.add(["leftover.txt"])
+
+    result = await _stage(mod, "preflight repository").impl.run(PipelineContext())
+
+    assert not result.success, "preflight must reject a dirty index"
+    assert "leftover.txt" in _combined_output(result), (
+        f"preflight must name what is staged: {result.output}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_names_the_modified_tracked_files(tmp_path, monkeypatch) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    tracked = Path(repo.working_tree_dir) / "README.md"
+    tracked.write_text("modified before the run\n")
+
+    result = await _stage(mod, "preflight repository").impl.run(PipelineContext())
+
+    assert not result.success
+    assert "README.md" in _combined_output(result)
+
+
+@pytest.mark.asyncio
+async def test_preflight_accepts_the_work_of_the_step_a_resume_stopped_inside(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    shutil.copytree(GOOD_DIR, repo_path / "feat")
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(repo_path / "feat", monkeypatch)
+
+    from norn.models import PipelineContext
+
+    (Path(repo.working_tree_dir) / "README.md").write_text("the interrupted step's work\n")
+    stem = "step-01-v2-fixture-alpha"
+    preflight = _stage(mod, "preflight repository").impl
+
+    mid_step = PipelineContext()
+    mid_step.checkpoint_stages = {f"record baseline {stem}", f"implement {stem}"}
+    resumed = await preflight.run(mid_step)
+    assert resumed.success, _combined_output(resumed)
+    assert "README.md" in _combined_output(resumed)
+
+    between_steps = PipelineContext()
+    between_steps.checkpoint_stages = {f"record baseline {stem}", f"facts {stem}"}
+    assert not (await preflight.run(between_steps)).success, (
+        "an edit no interrupted step owns must still be rejected"
+    )
+
+
+@pytest.mark.asyncio
+async def test_head_moved_names_the_subject_that_skips_the_step(tmp_path, monkeypatch) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    shutil.copytree(GOOD_DIR, repo_path / "feat")
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(repo_path / "feat", monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+    (repo_path / "work.txt").write_text("committed by hand\n")
+    repo.index.add(["work.txt"])
+    repo.index.commit("tmp")
+
+    result = await _stage(mod, f"assert head unchanged {stem}").impl.run(ctx)
+
+    assert not result.success
+    assert f'"refactor: {stem}"' in _combined_output(result)
+
+
+@pytest.mark.asyncio
+async def test_assert_committed_names_the_staged_paths(tmp_path, monkeypatch) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+    (repo_path / "feature.py").write_text("# feature\n")
+    assert (await _stage(mod, f"commit {stem}").impl.run(ctx)).success
+
+    # Something stages a file after the commit — another terminal, a hook.
+    (repo_path / "sneaked.txt").write_text("staged behind our back\n")
+    repo.index.add(["sneaked.txt"])
+
+    result = await _stage(mod, f"assert committed {stem}").impl.run(ctx)
+
+    assert not result.success
+    assert "sneaked.txt" in _combined_output(result), (
+        f"the postcondition must name what is staged: {result.output}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_fix_postcondition_names_the_staged_paths(tmp_path, monkeypatch) -> None:
+    """The reported failure: 'index is not clean after review fix commit 2', no paths."""
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    (repo_path / "leftover.txt").write_text("staged by an earlier run\n")
+    repo.index.add(["leftover.txt"])
+
+    result = await _stage(mod, "review fix committed 2").impl.run(PipelineContext())
+
+    assert not result.success
+    assert "leftover.txt" in _combined_output(result), (
+        f"the postcondition must name what is staged: {result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The base SHA when steps are resume-skipped
+#
+# Every later phase reads base.sha: the review contract's `Base:` line, the
+# aggregate and handoff manifests, the final diff. Recording HEAD on a run
+# where the steps are already committed names a base that CONTAINS the work,
+# so the review is handed an empty range — and then rejected for not echoing
+# a base it could not sensibly use.
+# ---------------------------------------------------------------------------
+
+
+def _commit_step(repo, repo_path: Path, stem: str, filename: str):
+    """Commit a file under the subject v2's resume scan matches."""
+    (repo_path / filename).write_text(f"# {stem}\n")
+    repo.index.add([filename])
+    return repo.index.commit(f"refactor: {stem} — {stem} title")
+
+
+async def _record_start_base(mod, ctx) -> str:
+    result = await _stage(mod, "record start").impl.run(ctx)
+    assert result.success, f"record start failed: {result.error}"
+    return Path(mod.BASE_SHA).read_text().strip()
+
+
+@pytest.mark.asyncio
+async def test_base_is_head_when_no_step_is_committed(tmp_path, monkeypatch) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    assert await _record_start_base(mod, PipelineContext()) == repo.head.commit.hexsha
+
+
+@pytest.mark.asyncio
+async def test_base_backs_up_past_the_committed_steps(tmp_path, monkeypatch) -> None:
+    """The reported failure: base == HEAD left the review an empty range."""
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    true_base = repo.head.commit.hexsha
+    _commit_step(repo, repo_path, "step-01-v2-fixture-alpha", "alpha.py")
+    _commit_step(repo, repo_path, "step-02-v2-fixture-beta", "beta.py")
+    # An unrelated commit on top, as a cleanup or a review fix would be.
+    (repo_path / "chore.txt").write_text("chore\n")
+    repo.index.add(["chore.txt"])
+    repo.index.commit("chore: untrack something")
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    base = await _record_start_base(mod, PipelineContext())
+
+    assert base == true_base, "base must be the parent of the earliest step commit"
+    assert base != repo.head.commit.hexsha, "a base equal to HEAD is an empty range"
+
+
+@pytest.mark.asyncio
+async def test_base_matches_the_review_contract_after_a_partial_run(
+    tmp_path, monkeypatch
+) -> None:
+    """`check review` compares review.md line 2 to base.sha — they must agree."""
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    true_base = repo.head.commit.hexsha
+    _commit_step(repo, repo_path, "step-01-v2-fixture-alpha", "alpha.py")
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    assert await _record_start_base(mod, ctx) == true_base
+
+    # Write the review the agent would write against that base, then let the
+    # contract check read it.
+    Path(mod.REVIEW_MD).write_text(
+        "VERDICT: PASS\n"
+        f"Base: {true_base}\n"
+        f"Head: {repo.head.commit.hexsha}\n\n"
+        "Looks fine.\n"
+    )
+    result = await _stage(mod, "check review 1").impl.run(ctx)
+
+    assert result.success, f"check review rejected a correct base: {result.output}"
+
+
+@pytest.mark.asyncio
+async def test_base_falls_back_when_the_step_commit_is_the_root(
+    tmp_path, monkeypatch
+) -> None:
+    """A root step commit has no parent; record the commit rather than fail the run."""
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    repo = Repo.init(repo_path)
+    repo.config_writer().set_value("user", "name", "Test User").release()
+    repo.config_writer().set_value("user", "email", "test@example.com").release()
+
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    root = _commit_step(repo, repo_path, "step-01-v2-fixture-alpha", "alpha.py")
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    assert await _record_start_base(mod, PipelineContext()) == root.hexsha
+
+
+# ---------------------------------------------------------------------------
+# The review artifact: agent owns the verdict, norn owns the SHAs
+#
+# The old contract asked the agent to transcribe two 40-character SHAs into
+# review.md and threw away the whole review when they did not match — including
+# when the agent was right and the manifest's range was what was wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_review_prompt_asks_only_for_the_verdict() -> None:
+    mod = _import_v2(GOOD_DIR)
+    prompt = mod._review_prompt(1)
+
+    assert "VERDICT: PASS" in prompt
+    assert "VERDICT: NEEDS_FIXES" in prompt
+    assert "Base: <sha>" not in prompt, "the agent must not be asked to write SHAs"
+    assert "Head: <sha>" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_review_manifest_deletes_a_previous_review(tmp_path, monkeypatch) -> None:
+    """Freshness: a round starts with no artifact, so a silent agent cannot pass."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
+    Path(mod.REVIEW_MD).write_text("VERDICT: PASS\nfrom an earlier run\n")
+
+    assert (await _stage(mod, "review manifest 1").impl.run(ctx)).success
+    assert not Path(mod.REVIEW_MD).exists(), "a stale review.md must not survive"
+
+
+@pytest.mark.asyncio
+async def test_stamp_fails_when_the_review_wrote_nothing(tmp_path, monkeypatch) -> None:
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
+    assert (await _stage(mod, "review manifest 1").impl.run(ctx)).success
+
+    result = await _stage(mod, "stamp review 1").impl.run(ctx)
+
+    assert not result.success, "a round that wrote no review.md must fail"
+    assert "wrote no review.md" in _combined_output(result)
+
+
+@pytest.mark.asyncio
+async def test_stamp_writes_the_shas_and_keeps_the_findings(tmp_path, monkeypatch) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
+    assert (await _stage(mod, "review manifest 1").impl.run(ctx)).success
+
+    # What the agent now writes: a verdict and findings, no SHAs.
+    Path(mod.REVIEW_MD).write_text(
+        "VERDICT: NEEDS_FIXES\n\n## Findings\n\n- major: something is wrong\n"
+    )
+
+    assert (await _stage(mod, "stamp review 1").impl.run(ctx)).success
+
+    lines = Path(mod.REVIEW_MD).read_text().splitlines()
+    assert lines[0] == "VERDICT: NEEDS_FIXES"
+    assert lines[1] == f"Base: {Path(mod.BASE_SHA).read_text().strip()}"
+    assert lines[2] == f"Head: {repo.head.commit.hexsha}"
+    assert "- major: something is wrong" in "\n".join(lines)
+
+
+@pytest.mark.asyncio
+async def test_stamp_does_not_duplicate_shas_the_agent_wrote(tmp_path, monkeypatch) -> None:
+    """An agent writing the old header out of habit must not end up with two."""
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
+    assert (await _stage(mod, "review manifest 1").impl.run(ctx)).success
+
+    Path(mod.REVIEW_MD).write_text(
+        "VERDICT: PASS\n"
+        "Base: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"
+        "Head: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"
+        "\nAll good.\n"
+    )
+
+    assert (await _stage(mod, "stamp review 1").impl.run(ctx)).success
+
+    text = Path(mod.REVIEW_MD).read_text()
+    assert text.count("Base: ") == 1, f"Base written twice:\n{text}"
+    assert text.count("Head: ") == 1, f"Head written twice:\n{text}"
+    assert "deadbeef" not in text, "the agent's SHAs must be replaced, not kept"
+    assert text.splitlines()[1] == f"Base: {Path(mod.BASE_SHA).read_text().strip()}"
+    assert text.splitlines()[2] == f"Head: {repo.head.commit.hexsha}"
+    assert "All good." in text
+
+
+@pytest.mark.asyncio
+async def test_check_review_accepts_a_verdict_only_artifact(tmp_path, monkeypatch) -> None:
+    """The whole point: a review is not discarded over missing or wrong SHAs."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    Path(mod.REVIEW_MD).write_text("VERDICT: PASS\n\nNothing to fix.\n")
+
+    result = await _stage(mod, "check review 1").impl.run(ctx)
+
+    assert result.success, f"check review must judge the verdict only: {result.output}"
+
+
+@pytest.mark.asyncio
+async def test_review_round_1_stamps_before_it_checks(tmp_path, monkeypatch) -> None:
+    """Stage order: the SHAs must be on the file before the verdict is read."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    names = [i.name for i in mod.config.items if hasattr(i, "name")]
+    assert names.index("review 1") < names.index("review postcondition 1")
+    assert names.index("review postcondition 1") < names.index("stamp review 1")
+    assert names.index("stamp review 1") < names.index("check review 1")
+
+
+# ---------------------------------------------------------------------------
+# Review write-guard
+#
+# The review prompt has always said "do not edit any file except review.md",
+# but under permission_mode="acceptEdits" that is guidance an agent can decide
+# to override.  One review round did: it fixed a real jq bug in
+# _service-build.yml, and the run died at the review postcondition with the
+# review already paid for.
+# ---------------------------------------------------------------------------
+
+
+def test_review_stage_declares_the_write_guard() -> None:
+    mod = _import_v2(GOOD_DIR)
+    stage = _stage(mod, "review 1")
+    hooks = stage.impl.hooks
+    assert hooks, "review 1 must declare the write-guard hook"
+    matchers = [m["matcher"] for m in hooks["PreToolUse"]]
+    assert matchers == ["Write|Edit|MultiEdit|NotebookEdit"]
+
+
+def test_review_fix_stage_has_no_write_guard() -> None:
+    """The fix stage exists to edit code — guarding it would break the loop."""
+    mod = _import_v2(GOOD_DIR)
+    assert _stage(mod, "review fix 1").impl.hooks is None
+
+
+@pytest.mark.asyncio
+async def test_write_guard_allows_review_md_and_denies_everything_else() -> None:
+    mod = _import_v2(GOOD_DIR)
+    hook = _stage(mod, "review 1").impl.hooks["PreToolUse"][0]["hooks"][0]
+
+    allowed = await hook({"tool_input": {"file_path": mod.REVIEW_MD}}, "t1", None)
+    assert allowed == {}, "review.md must stay writable"
+
+    denied = await hook(
+        {"tool_input": {"file_path": os.path.join(mod.PROJECT_DIR, "src/app.py")}}, "t2", None
+    )
+    decision = denied["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    assert "finding" in decision["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_write_guard_is_not_fooled_by_a_dotdot_path() -> None:
+    """realpath comparison: `<feature>/../review.md` is not review.md."""
+    mod = _import_v2(GOOD_DIR)
+    hook = _stage(mod, "review 1").impl.hooks["PreToolUse"][0]["hooks"][0]
+
+    sneaky = os.path.join(os.path.dirname(mod.REVIEW_MD), "..", "review.md")
+    denied = await hook({"tool_input": {"file_path": sneaky}}, "t3", None)
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    # The same detour that lands back on review.md is allowed.
+    round_trip = os.path.join(os.path.dirname(mod.REVIEW_MD), "..",
+                              os.path.basename(os.path.dirname(mod.REVIEW_MD)), "review.md")
+    assert await hook({"tool_input": {"file_path": round_trip}}, "t4", None) == {}
+
+
+@pytest.mark.asyncio
+async def test_write_guard_ignores_tools_without_a_file_path() -> None:
+    mod = _import_v2(GOOD_DIR)
+    hook = _stage(mod, "review 1").impl.hooks["PreToolUse"][0]["hooks"][0]
+    assert await hook({"tool_input": {}}, "t5", None) == {}
+
+
+def test_write_guard_is_omitted_for_providers_without_hook_support() -> None:
+    """SDK hooks are Claude Code only; declaring them elsewhere fails the stage."""
+    mod = _import_v2(GOOD_DIR)
+    assert mod._effective_agent_provider(["--agent-provider", "codex"]) == "codex"
+    assert mod._effective_agent_provider(["--agent-provider=codex"]) == "codex"
+    assert mod._effective_agent_provider([]) == "claude-code"

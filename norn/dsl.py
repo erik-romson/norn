@@ -193,7 +193,8 @@ class Stage:
             interactively.
         when: Optional predicate ``(ctx) -> bool``. Stage is skipped when
             it returns ``False``. Use built-in helpers like
-            ``stage_succeeded()``, ``stage_failed()``, ``file_exists()``.
+            ``stage_succeeded()``, ``stage_failed()``, ``file_exists()``,
+            ``file_missing()``.
         timeout: Seconds before the stage is cancelled via
             ``asyncio.wait_for``. ``None`` means no timeout.
         always_run: When ``True``, ``--resume`` re-executes the stage instead
@@ -672,3 +673,8 @@ def output_contains(stage_name: str, text: str) -> Callable[[PipelineContext], b
 def file_exists(path: str) -> Callable[[PipelineContext], bool]:
     """Predicate: true if *path* exists on disk at evaluation time."""
     return lambda ctx: os.path.exists(path)
+
+
+def file_missing(path: str) -> Callable[[PipelineContext], bool]:
+    """Predicate: true if *path* does not exist on disk at evaluation time."""
+    return lambda ctx: not os.path.exists(path)

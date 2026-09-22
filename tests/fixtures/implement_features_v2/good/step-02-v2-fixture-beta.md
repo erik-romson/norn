@@ -1,7 +1,7 @@
 ---
 test_cmd: python3 -c "pass"
 bats_cmd: python3 -c "pass"
-model: opus
+model: deep
 ---
 
 # Step 02: beta fixture

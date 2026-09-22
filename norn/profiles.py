@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 
@@ -67,6 +68,53 @@ def build_block_hooks(patterns: list[str]) -> dict:
                     "type": "command",
                     "command": script,
                 },
+            }
+        ]
+    }
+
+
+def build_write_allowlist_hooks(allowed_paths: list[str]) -> dict:
+    """Build a PreToolUse hook that denies file writes outside *allowed_paths*.
+
+    A prompt that says "do not edit any file except X" is guidance, not a
+    constraint: under ``permission_mode="acceptEdits"`` an agent that decides a
+    bug is worth fixing simply fixes it, and the violation only surfaces later
+    at a postcondition gate — after the tokens are spent.  This turns the
+    instruction into a permission decision the agent cannot talk its way past.
+
+    Paths are compared as real paths, so a symlink or a ``../`` detour cannot
+    smuggle a write past the allowlist.  Tools with no ``file_path`` in their
+    input are left alone; the matcher already limits this to the edit tools.
+
+    Residual gap: ``Bash`` can still write (``echo > file``).  Blocking that
+    means pattern-matching shell text, which is why the postcondition gates
+    remain the backstop rather than being replaced by this hook.
+    """
+    allowed = {os.path.realpath(p) for p in allowed_paths}
+
+    async def _deny_write_outside(input_data: dict, tool_use_id: str, context: object) -> dict:
+        file_path = (input_data.get("tool_input") or {}).get("file_path")
+        if not file_path:
+            return {}
+        if os.path.realpath(file_path) in allowed:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"This stage may write only: {', '.join(sorted(allowed))}. "
+                    f"Writing {file_path} is blocked. Report the change you wanted "
+                    "to make as a finding instead of making it."
+                ),
+            }
+        }
+
+    return {
+        "PreToolUse": [
+            {
+                "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+                "hooks": [_deny_write_outside],
             }
         ]
     }

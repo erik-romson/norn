@@ -17,15 +17,22 @@ The feature directory must contain:
   ``bats_timeout``, ``final_test_cmd``.
 - ``step-NN-<name>.md``  — one file per step, numbered from 01 and contiguous;
   optional front-matter keys: ``test_cmd``, ``bats_cmd``, ``test_timeout``,
-  ``bats_timeout``, ``model`` (``sonnet`` | ``opus``).
+  ``bats_timeout``, ``model`` (intent label, e.g. ``standard`` | ``deep``).
 
 Optional ``--arg`` knobs (all have defaults; document them in plan files, not
 in pipeline invocations):
 
-- ``--arg budget=<float>``         — USD cost ceiling (default 30; unmeasured guess)
-- ``--arg token_budget=<int>``     — token ceiling (default 500000; unmeasured guess)
-- ``--arg review_model=<sonnet|opus>``    — model for review stages (default sonnet)
-- ``--arg aggregate_model=<sonnet|opus>`` — model for aggregate stages (default sonnet)
+- ``--arg budget=<float>``         — USD cost ceiling (default: scales with the
+  number of steps, see ``_default_budget``)
+- ``--arg token_budget=<int>``     — token ceiling (default: scales the same way)
+
+  Both ceilings are also settable at launch without the knob: ``norn run
+  --budget <usd> --token-budget <tokens>``, or the budget fields on the TUI
+  launcher's arguments screen.  Crossing a ceiling mid-run asks how much more
+  room to grant rather than asking again at every remaining stage.
+
+- ``--arg review_model=<label>``    — intent label for review stages (default standard)
+- ``--arg aggregate_model=<label>`` — intent label for aggregate stages (default standard)
 - ``--arg max_retries=<int>``      — per-step validation attempts, must be ≥ 1 (default 3)
 - ``--arg allow_dirty_index=1``    — skip the clean-index preflight check
 - ``--arg allow_dirty_worktree=1`` — skip the clean-worktree preflight check
@@ -38,16 +45,20 @@ command.  Otherwise v2 assembles the aggregate command from the unique
 ``validation_cmd`` values of **all** steps (including any resume-skipped ones),
 in file order, each preceded by ``echo "=== <step stem> ==="``; steps whose
 command is identical to an earlier step are deduplicated.  The aggregate phase
-allows up to two repair rounds via ``--arg aggregate_model`` (default ``sonnet``).
+allows up to two repair rounds via ``--arg aggregate_model`` (default ``standard``).
 
 Review gate
 -----------
 After aggregate validation, v2 runs a review phase with up to three review
 rounds and two fix rounds between them.  Each review and each fix runs in a
 fresh agent session.  The review writes ``<feature_dir>/review.md`` whose first
-three lines are exactly ``VERDICT: PASS`` (or ``VERDICT: NEEDS_FIXES``),
-``Base: <sha>``, ``Head: <sha>``.  A shell postcondition enforces that the
-review changed nothing except ``review.md``.
+line is exactly ``VERDICT: PASS`` or ``VERDICT: NEEDS_FIXES``; the ``stamp
+review`` stage then inserts ``Base: <sha>`` and ``Head: <sha>`` as lines 2-3
+from the pipeline's own record.  The agent owns the verdict, norn owns the
+SHAs — a review is not discarded over a mistyped hash.  Freshness comes from
+deleting ``review.md`` before each round, so a round that writes nothing fails
+instead of passing on a previous round's artifact.  A shell postcondition
+enforces that the review changed nothing except ``review.md``.
 
 Rounds are unrolled (not a ``Loop``) because a ``Loop``'s stages share one
 agent session and ``ClearContext`` cannot sit inside it.  Round 2 runs only
@@ -89,6 +100,26 @@ Final audit (four deterministic shell checks, all ``on_failure=fail``):
   time; flagging a path that can never be committed would end the run with no
   move left to make.
 
+norn's own run state
+--------------------
+``<state key>.runs/``, ``<state key>.checkpoint`` and ``<state key>.history``
+are written into the launch directory *while the run is in flight*, so when
+norn is launched from inside the target repository they sit in the worktree and
+change under every snapshot.  Two independent mechanisms keep them out:
+
+1. Every entry point calls ``norn.state.publish_state_key`` before importing a
+   pipeline, which exports ``NORN_STATE_KEY``; every snapshot diff here — step
+   ownership, the ``changed nothing`` guard, the review and handoff
+   postconditions, and the final audit — subtracts those paths.
+2. ``run_pipeline`` registers the same paths in ``.git/info/exclude``, so git
+   never reports them in ``git status`` at all.  That layer needs no
+   cooperation from the pipeline and covers gates added later.
+
+Without either, step 01 commits the journal and the next journal write dirties
+it again, failing the very ``owned paths clean`` postcondition of the step that
+committed it — which is exactly what happened for every ``norn ui`` run before
+the TUI published the state key.
+
 Note: trailer verification is absent because commit trailers are a core item.
 
 Honest limits
@@ -107,7 +138,10 @@ Honest limits
 - The prior-step handoff window covers steps executed in this invocation;
   resume-skipped steps appear only as a commit line in the ledger.
 - ``base.sha`` exists because the v1 ``{record start.output}`` placeholder rendered
-  a dict literal; v2 writes the SHA to a file and reads it back.
+  a dict literal; v2 writes the SHA to a file and reads it back.  It holds HEAD on
+  a first run, and the parent of the earliest resume-skipped step's commit on a
+  rerun — recording HEAD there would name a base that already contains the work
+  and leave the review, the manifests and the final diff an empty range.
 """
 
 from __future__ import annotations
@@ -124,15 +158,17 @@ from pathlib import Path
 from typing import Any
 
 from norn.alerts import MacOSChannel
-from norn.dsl import Pipeline, Stage, ask_user, fail, file_exists, stage_failed
+from norn.dsl import Pipeline, Stage, ask_user, fail, file_exists, file_missing, stage_failed
 from norn.models import PipelineContext, StageResult
 from norn.stages.base import BaseStage
 from norn.stages.compress_test_log import CompressTestLog
 from norn.stages.generate import Generate
 from norn.stages.read_file import ReadFile
 from norn.stages.run_command import RunCommand
+from norn.state import state_ignore_flags
 
 from norn.pipelines._preplan import parse_arg_flags
+from norn.profiles import build_write_allowlist_hooks
 
 # ---------------------------------------------------------------------------
 # Constants pinned at import time
@@ -145,7 +181,10 @@ PROJECT_DIR = os.getcwd()
 
 # Timeout and turn constants (seconds unless otherwise noted).
 DEFAULT_TEST_TIMEOUT = 1800   # per-step test run default
-TIMEOUT_IMPLEMENT_SONNET = 1800
+# A standard-label step that touches a whole subsystem runs past 30 minutes:
+# step-37 of the 2026-09-17 transaction-tracker run hit 1800s, and its retry
+# needed another 458s to finish the same work.
+TIMEOUT_IMPLEMENT_SONNET = 2700
 TIMEOUT_IMPLEMENT_OPUS   = 2700
 TIMEOUT_FIX              = 900
 TIMEOUT_CLOSEOUT         = 120
@@ -170,7 +209,7 @@ metadata = {
 # Helper functions (shared with or adapted from v1)
 # ---------------------------------------------------------------------------
 
-_VALUE_FLAGS = {"--arg", "--skip", "--org", "--agent-provider"}
+_VALUE_FLAGS = {"--arg", "--skip", "--org", "--agent-provider", "--budget", "--token-budget"}
 
 
 def parse_front_matter(text: str) -> tuple[dict, str]:
@@ -282,12 +321,30 @@ def _git_toplevel(start: str) -> str:
 
 GIT_TOPLEVEL = _git_toplevel(PROJECT_DIR)
 
+
+# ---------------------------------------------------------------------------
+# norn's own run state
+#
+# Every entry point calls `norn.state.publish_state_key` before importing a
+# pipeline, which exports NORN_STATE_KEY; these flags subtract norn's
+# checkpoint, history and run journal from every snapshot diff below.  Without
+# them step 01 commits the journal as a step-owned change and the next journal
+# write dirties it again, failing the `owned paths clean` postcondition of the
+# step that just committed it.  Empty when the module is imported outside a run
+# — `run_pipeline`'s `.git/info/exclude` registration is the backstop that does
+# not depend on import order.
+# ---------------------------------------------------------------------------
+
+NORN_STATE_IGNORE_FLAGS = state_ignore_flags(
+    os.environ.get("NORN_STATE_KEY"), GIT_TOPLEVEL
+)
+
 # ---------------------------------------------------------------------------
 # Front-matter validation
 # ---------------------------------------------------------------------------
 
 _INDEX_ALLOWED  = {"test_cmd", "bats_cmd", "test_timeout", "bats_timeout", "final_test_cmd"}
-_STEP_ALLOWED   = {"test_cmd", "bats_cmd", "test_timeout", "bats_timeout", "model"}
+_STEP_ALLOWED   = {"test_cmd", "bats_cmd", "test_timeout", "bats_timeout", "model", "allow_noop"}
 _CMD_KEYS       = {"test_cmd", "bats_cmd", "final_test_cmd"}
 _TIMEOUT_KEYS   = {"test_timeout", "bats_timeout"}
 
@@ -301,7 +358,8 @@ def _validate_front_matter(data: dict, where: str, allowed: set[str]) -> None:
     - the ``effort`` key (norn core has no effort support),
     - cmd keys that are empty or resolve to a no-op executable,
     - timeout keys that are booleans or non-positive numbers,
-    - ``model`` values other than ``sonnet`` or ``opus``.
+    - ``model`` values that are not a Generate-eligible intent label,
+    - ``allow_noop`` values that are not a YAML boolean.
     """
     if not isinstance(data, dict):
         raise ValueError(f"{where}: front matter must be a mapping, got {type(data).__name__!r}")
@@ -309,8 +367,8 @@ def _validate_front_matter(data: dict, where: str, allowed: set[str]) -> None:
     for key in data:
         if key == "effort":
             raise ValueError(
-                f"{where}: 'effort' key found — norn core has no effort support yet; "
-                "remove this key rather than ignoring it."
+                f"{where}: 'effort' key found — effort is fixed by the label; "
+                "pick a label in `norn/model_labels.toml` rather than setting effort directly."
             )
         if key not in allowed:
             raise ValueError(
@@ -341,11 +399,21 @@ def _validate_front_matter(data: dict, where: str, allowed: set[str]) -> None:
             )
         _coerce_timeout(val, f"{where}: {t_key}")
 
+    if "allow_noop" in data and "allow_noop" in allowed:
+        val = data["allow_noop"]
+        if not isinstance(val, bool):
+            raise ValueError(
+                f"{where}: 'allow_noop' must be a boolean (true/false), got {val!r}"
+            )
+
     if "model" in data and "model" in allowed:
         val = data["model"]
-        if val not in ("sonnet", "opus"):
+        from norn.model_labels import labels_for as _labels_for
+        _eligible = set(_labels_for("claude-code")) | set(_labels_for("opencode"))
+        if val not in _eligible:
             raise ValueError(
-                f"{where}: model must be 'sonnet' or 'opus', got {val!r}"
+                f"{where}: model {val!r} is not a valid Generate label; "
+                f"known labels: {', '.join(sorted(_eligible))} — see norn/model_labels.toml"
             )
 
 
@@ -373,21 +441,44 @@ def _require_knob_int(name: str, default: str) -> int:
 
 
 def _require_knob_model(name: str, default: str) -> str:
+    from norn.model_labels import labels_for as _labels_for
+    _eligible = set(_labels_for("claude-code")) | set(_labels_for("opencode"))
     raw = _args.get(name, default)
-    if raw not in ("sonnet", "opus"):
-        raise ValueError(f"--arg {name}: must be 'sonnet' or 'opus', got {raw!r}")
+    if raw not in _eligible:
+        raise ValueError(
+            f"--arg {name}: must be a Generate-eligible label "
+            f"({', '.join(sorted(_eligible))}), got {raw!r}"
+        )
     return raw
 
 
-BUDGET        = _require_knob_float("budget", "30")
-TOKEN_BUDGET  = _require_knob_int("token_budget", "500000")
-REVIEW_MODEL  = _require_knob_model("review_model", "sonnet")
-AGGREGATE_MODEL = _require_knob_model("aggregate_model", "sonnet")
+REVIEW_MODEL  = _require_knob_model("review_model", "standard")
+AGGREGATE_MODEL = _require_knob_model("aggregate_model", "standard")
 MAX_RETRIES   = _require_knob_int("max_retries", "3")
 if MAX_RETRIES < 1:
     raise ValueError(f"--arg max_retries: must be ≥ 1, got {MAX_RETRIES!r}")
 ALLOW_DIRTY_INDEX = _args.get("allow_dirty_index") == "1"
 ALLOW_DIRTY_WORKTREE = _args.get("allow_dirty_worktree") == "1"
+
+
+def _effective_agent_provider(argv: list[str]) -> str:
+    """Resolve the provider the run will use, the way the CLI resolves it.
+
+    ``--agent-provider`` wins over ``NORN_AGENT_PROVIDER``, which wins over the
+    ``claude-code`` default (``norn/models.py``).  Needed at import time because
+    SDK hooks are a Claude Code feature: a stage that declares them fails
+    outright under any other provider (``norn/stages/generate.py``), so the
+    review write-guard must only be attached when it can actually run.
+    """
+    for i, token in enumerate(argv):
+        if token == "--agent-provider" and i + 1 < len(argv):
+            return argv[i + 1]
+        if token.startswith("--agent-provider="):
+            return token.split("=", 1)[1]
+    return os.environ.get("NORN_AGENT_PROVIDER") or "claude-code"
+
+
+AGENT_PROVIDER = _effective_agent_provider(sys.argv[1:])
 
 # ---------------------------------------------------------------------------
 # Feature directory resolution
@@ -398,9 +489,10 @@ def _resolve_feature_dir(argv: list[str], project_dir: str) -> Path:
     """Resolve the feature directory from argv positional tokens.
 
     Skips flags (``--*``) and values of flags that consume the next token
-    (``--arg``, ``--skip``, ``--org``, ``--agent-provider``).  Requires
-    exactly one candidate that resolves to an existing directory as given or
-    under *project_dir*.  Zero or multiple candidates raise ``ValueError``.
+    (``--arg``, ``--skip``, ``--org``, ``--agent-provider``, ``--budget``,
+    ``--token-budget``).  Requires exactly one candidate that resolves to an
+    existing directory as given or under *project_dir*.  Zero or multiple
+    candidates raise ``ValueError``.
     """
     candidates: list[str] = []
     i = 0
@@ -545,6 +637,29 @@ for _sf in _all_step_files:
             )
 
 # ---------------------------------------------------------------------------
+# Budget ceilings — scaled to the size of the plan
+# ---------------------------------------------------------------------------
+
+# A ceiling is a checkpoint, not a kill switch: it should pause a run that is
+# going wrong, not one that is merely long.  A flat default did neither — 30 USD
+# and 500k tokens are a whole plan's worth for five steps and a quarter of it
+# for forty.  These rates come from two measured runs of this pipeline against
+# transaction-tracker (2026-09-16/17): ~4 USD and ~80k output tokens per step,
+# plus the review rounds at the end, which do not scale with step count.
+BUDGET_USD_PER_STEP    = 4.0
+BUDGET_USD_REVIEW      = 25.0
+BUDGET_TOKENS_PER_STEP = 80_000
+BUDGET_TOKENS_REVIEW   = 200_000
+
+_step_count   = len(_all_step_files)
+BUDGET        = _require_knob_float(
+    "budget", str(BUDGET_USD_PER_STEP * _step_count + BUDGET_USD_REVIEW)
+)
+TOKEN_BUDGET  = _require_knob_int(
+    "token_budget", str(BUDGET_TOKENS_PER_STEP * _step_count + BUDGET_TOKENS_REVIEW)
+)
+
+# ---------------------------------------------------------------------------
 # Resume scan: skip steps whose commit is already on HEAD
 # ---------------------------------------------------------------------------
 
@@ -586,11 +701,11 @@ if skipped_for_resume:
         file=sys.stderr,
     )
 
-# all_steps_summary is built from the UNFILTERED list so review and handoff
-# see every step regardless of how many were resume-skipped.
-all_steps_summary = ""
-for _sf in _all_step_files:
-    all_steps_summary += f"### {Path(_sf).name}\n\n{Path(_sf).read_text()}\n\n---\n\n"
+# Built from the UNFILTERED list so review sees every step regardless of how
+# many were resume-skipped.  Names only: the review agent has Read/Glob/Grep
+# and the plan is a directory on disk, so pasting all of it into every round's
+# prompt (317KB in the run that prompted this) bought nothing.
+all_step_names = "\n".join(f"- `{Path(_sf).name}`" for _sf in _all_step_files)
 
 # ---------------------------------------------------------------------------
 # Launch-tree assertion stage
@@ -862,7 +977,7 @@ def _build_prior_context(
 # ---------------------------------------------------------------------------
 
 
-def _assert_head_unchanged(head_file: str, during: str) -> str:
+def _assert_head_unchanged(head_file: str, during: str, step: str | None = None) -> str:
     """Build the shell that fails when HEAD no longer matches *head_file*.
 
     The message names both SHAs and stays neutral about the cause. HEAD moves
@@ -870,8 +985,19 @@ def _assert_head_unchanged(head_file: str, during: str) -> str:
     two are indistinguishable here — a message that only accuses the agent of
     committing sends the reader hunting in the wrong place when the real cause
     was a `git reset` in another terminal while the run was in flight.
+
+    With *step*, the message also names the commit subject that makes the next
+    run skip the step.  An operator who commits a step's work by hand gets a
+    commit this pipeline cannot recognise, and a fresh run then pays an agent
+    to rediscover that the work is done and stops at the 'changed nothing' guard.
     """
     q = shlex.quote
+    by_hand = (
+        f'echo "If this step\'s work was committed by hand, give that commit the subject '
+        f'\\"refactor: {step}\\" (git commit --amend) and rerun without --resume: '
+        f'the step is then skipped." 1>&2; '
+        if step else ""
+    )
     return (
         f'RECORDED=$(cat {q(head_file)}) && ACTUAL=$(git rev-parse HEAD) && '
         f'if [ "$ACTUAL" != "$RECORDED" ]; then '
@@ -881,6 +1007,7 @@ def _assert_head_unchanged(head_file: str, during: str) -> str:
         f'echo "Nothing may commit, reset, or check out in this repo while the run is '
         f'in flight — not the agent, not another terminal. If the move was intended, '
         f'rerun without --resume so the baseline is re-recorded." 1>&2; '
+        f'{by_hand}'
         f'exit 1; fi'
     )
 
@@ -903,6 +1030,45 @@ def _assert_index_clean(during: str) -> str:
         f'and rerun without --resume." 1>&2; '
         f'exit 1; fi'
     )
+
+
+def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
+    """Build the in-loop validation shell and the gate's validation shell.
+
+    The gate after a validation loop exists only because `[c]ontinue` on an
+    exhausted loop counts as success. Rerunning the whole command there when
+    the loop's last run already passed doubles the suite's wall time and gives
+    any timing-sensitive test a second chance to fail: a run once died at the
+    gate on a flaky test from an earlier, committed step, seconds after the
+    same suite had passed on the same tree.
+
+    So the in-loop run leaves a proof on success, a content-aware snapshot
+    of the worktree taken after the command, and removes it before it starts, so
+    a failed last run leaves none. The gate reruns the command unless the proof
+    exists and the tree still matches it. The file name carries a hash of the
+    command, so a proof never vouches for a command that was edited between
+    runs. HEAD and index are asserted separately by the gate.
+    """
+    q = shlex.quote
+    digest = hashlib.sha1(validation_cmd.encode()).hexdigest()[:12]
+    proof = os.path.join(snapshot_root, f"{key}.validated.{digest}.json")
+    now = proof + ".now"
+    delta = proof + ".delta"
+    in_loop = (
+        f"rm -f {q(proof)} && {{ {validation_cmd} ; }} && "
+        f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(proof)}"
+    )
+    gate = (
+        f"rm -f {q(delta)} && "
+        f"if [ -f {q(proof)} ]; then "
+        f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(now)} && "
+        f"python3 {q(SNAPSHOT_HELPER)} diff {q(proof)} {q(now)}{NORN_STATE_IGNORE_FLAGS}"
+        f" > {q(delta)}; fi && "
+        f"if [ -f {q(proof)} ] && [ ! -s {q(delta)} ]; then "
+        f'echo "=== validation: passed in the loop on this exact tree, not rerun ==="; '
+        f'else echo "=== validation ===" && {{ {validation_cmd} ; }}; fi'
+    )
+    return in_loop, gate
 
 
 def _assert_no_changes_outside(
@@ -931,7 +1097,8 @@ def _assert_no_changes_outside(
         f'--root {q(GIT_TOPLEVEL)} {q(post_json)} && '
         f'rm -f {q(delta)} && '
         f'python3 {q(SNAPSHOT_HELPER)} diff '
-        f'{q(pre_json)} {q(post_json)}{ignore_flag} > {q(delta)} && '
+        f'{q(pre_json)} {q(post_json)}{ignore_flag}{NORN_STATE_IGNORE_FLAGS}'
+        f' > {q(delta)} && '
         f'if [ -s {q(delta)} ]; then '
         f'echo "ERROR: files other than {allowed} changed during {during}:" 1>&2; '
         f'tr \'\\0\' \'\\n\' < {q(delta)} 1>&2; '
@@ -1036,7 +1203,8 @@ def _commit_cmd(
         f'{_assert_head_unchanged(head_file, "this step")}; '
         # Take a post-snapshot, diff against pre to find step-owned changes.
         f'python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(post_json)} || exit 1; '
-        f'python3 {q(SNAPSHOT_HELPER)} diff {q(pre_json)} {q(post_json)} --root {q(GIT_TOPLEVEL)} > {q(changed_list)} || exit 1; '
+        f'python3 {q(SNAPSHOT_HELPER)} diff {q(pre_json)} {q(post_json)} '
+        f'--root {q(GIT_TOPLEVEL)}{NORN_STATE_IGNORE_FLAGS} > {q(changed_list)} || exit 1; '
         # If nothing changed, branch on require_changes.
         f'if [ ! -s {q(changed_list)} ]; then {no_change_branch}; fi; '
         # Stage exactly the owned paths (NUL-separated from diff).
@@ -1101,24 +1269,82 @@ if not ALLOW_DIRTY_INDEX:
     _preflight_parts.append(
         'echo "=== clean index ===" && '
         "git diff --cached --quiet || "
-        '{ echo "ERROR: the index has staged changes at run start. '
-        "Commit or reset them before running, or pass --arg allow_dirty_index=1 "
-        "to override. A staged change at run start would be swept into the first "
-        "step's commit.\"; exit 1; }"
+        '{ echo "ERROR: the index has staged changes at run start:"; '
+        "git diff --cached --name-only; "
+        'echo "Commit or reset them before running (git restore --staged <path>), '
+        "or pass --arg allow_dirty_index=1 to override. A staged change at run "
+        "start would be swept into the first step's commit.\"; exit 1; }"
     )
+_worktree_check = ""
 if not ALLOW_DIRTY_WORKTREE:
-    _preflight_parts.append(
+    _worktree_check = (
         'echo "=== clean worktree ===" && '
         "git diff --quiet || "
-        '{ echo "ERROR: tracked files are modified at run start. '
-        "Commit, stash or reset them before running, or pass "
+        '{ echo "ERROR: tracked files are modified at run start:"; '
+        "git diff --name-only; "
+        'echo "Commit, stash or reset them before running, or pass '
         "--arg allow_dirty_worktree=1 to override. Step ownership is computed by "
         "diffing worktree snapshots, so a pre-existing modification is committed "
         "whole by the first step that touches the file, and a step whose work is "
         "already sitting in the tree fails the 'changed nothing' guard.\"; exit 1; }"
     )
 
-_preflight_cmd = " && ".join(_preflight_parts)
+_preflight_cmd = " && ".join(_preflight_parts + ([_worktree_check] if _worktree_check else []))
+
+# Phases that record a worktree baseline and later commit against it, as
+# (opening stage, closing stage).  A resume whose checkpoint holds an opening
+# stage but not its closing one stopped inside that phase, so the phase's own
+# uncommitted work is legitimately in the tree — and its ownership is still
+# diffed against the baseline the checkpoint restored.
+_BASELINE_PHASES: list[tuple[str, str]] = (
+    [(f"record baseline {Path(f).stem}", f"facts {Path(f).stem}") for f in step_files]
+    + [("aggregate baseline", "aggregate committed")]
+    + [(f"review fix baseline {n}", f"review fix committed {n}") for n in (1, 2)]
+)
+
+
+def _interrupted_phase(ctx: PipelineContext) -> str | None:
+    """Return the opening stage of the phase a resume stopped inside, if any."""
+    for opening, closing in _BASELINE_PHASES:
+        if opening in ctx.checkpoint_stages and closing not in ctx.checkpoint_stages:
+            return opening
+    return None
+
+
+class _PreflightRepository(RunCommand):
+    """The repository preflight, tolerant of the work a resume stopped inside.
+
+    The clean-worktree check exists so no pre-existing edit is swept into a
+    step's commit.  On a resume that stopped mid-step, though, the tree holds
+    that step's own work, the check rejects it, and the only ways forward were
+    to commit it by hand (which moves HEAD and fails the step's HEAD guard) or
+    to throw the work away.  So when the checkpoint shows an interrupted phase
+    the modified files are listed rather than rejected.  A resume between
+    phases keeps the strict check: nothing would own those edits.
+    """
+
+    def __init__(self, cmd: str, resume_cmd: str) -> None:
+        super().__init__(cmd=cmd)
+        self.resume_cmd = resume_cmd
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        phase = _interrupted_phase(ctx)
+        if phase is None or self.cmd == self.resume_cmd:
+            return await super().run(ctx, **kwargs)
+        resumed = RunCommand(
+            cmd=self.resume_cmd.replace("__PHASE__", shlex.quote(phase)), timeout=self.timeout
+        )
+        return await resumed.run(ctx, **kwargs)
+
+
+_preflight_resume_cmd = _preflight_cmd
+if _worktree_check:
+    _preflight_resume_cmd = " && ".join(_preflight_parts + [
+        'echo "=== clean worktree ===" && '
+        "{ git diff --quiet || "
+        '{ echo "NOTE: resuming inside" __PHASE__"; its uncommitted work is expected '
+        'in the tree:"; git diff --name-only; }; }'
+    ])
 
 # ---------------------------------------------------------------------------
 # Aggregate validation command and timeout
@@ -1199,7 +1425,7 @@ AGGREGATE_CMD, AGGREGATE_TIMEOUT = _compute_aggregate_cmd_and_timeout()
 # ---------------------------------------------------------------------------
 
 pipeline = (
-    Pipeline("implement_features_v2", default_model="sonnet")
+    Pipeline("implement_features_v2", default_model="standard")
     .alert(MacOSChannel())
     .budget(max_cost_usd=BUDGET, max_tokens=TOKEN_BUDGET, on_exceed=ask_user)
 )
@@ -1212,15 +1438,44 @@ pipeline.stage(
 
 pipeline.stage(
     "preflight repository",
-    RunCommand(cmd=_preflight_cmd),
+    _PreflightRepository(_preflight_cmd, _preflight_resume_cmd),
     on_failure=fail,
+    # Never restored from a checkpoint.  A resume that skips this check
+    # inherits a verdict about the repo as it stood when the earlier run
+    # passed; if the index picked up a staged change in between, the run
+    # sails past its own precondition and dies later at a postcondition,
+    # blaming the stage that happened to assert first.
+    always_run=True,
 )
+
+# The base SHA is the commit this feature's work starts from, and every
+# later phase reads it: the review contract (`Base: <sha>` on line 2), the
+# aggregate and handoff manifests, and the final diff.
+#
+# On a first run that is HEAD.  When steps are resume-skipped their commits
+# are ALREADY on HEAD, so recording HEAD would name a base that contains the
+# work — leaving the review an empty range to describe.  Back up to the parent
+# of the earliest skipped step's commit instead, which is the same commit the
+# original run recorded.
+#
+# A root commit has no parent; `--verify` then fails and the fallback records
+# the step commit itself, costing the review sight of that first step rather
+# than ending the run.
+if skipped_for_resume:
+    _first_committed_step = _done[Path(skipped_for_resume[0]).stem]
+    _record_base = (
+        f"BASE=$(git rev-parse --verify --quiet {shlex.quote(_first_committed_step)}^ || "
+        f"git rev-parse --verify {shlex.quote(_first_committed_step)}) && "
+        f'printf "%s\\n" "$BASE" > {shlex.quote(BASE_SHA)}'
+    )
+else:
+    _record_base = f"git rev-parse HEAD > {shlex.quote(BASE_SHA)}"
 
 pipeline.stage(
     "record start",
     RunCommand(cmd=(
         f"cd {shlex.quote(GIT_TOPLEVEL)} && "
-        f"git rev-parse HEAD > {shlex.quote(BASE_SHA)} && "
+        f"{_record_base} && "
         f"python3 {shlex.quote(SNAPSHOT_HELPER)} snapshot "
         f"--root {shlex.quote(GIT_TOPLEVEL)} {shlex.quote(START_SNAPSHOT)}"
     )),
@@ -1230,6 +1485,13 @@ pipeline.stage(
 # Per-step stages: baseline → implement → assertions → preflight → validation
 # loop → validation gate → closeout → commit → revalidate (when hooks rewrote) →
 # assert committed → facts → clear context.
+#
+# The "assert owned diff" assertion is the one recoverable gate in that chain:
+# a step that changed nothing prompts instead of failing, and [c]ontinue drops
+# a `.noop` marker that skips commit and assert-committed and substitutes a
+# no-op facts file.  A step whose front matter sets `allow_noop: true` declares
+# itself verification-only: the gate drops that marker and passes without
+# prompting, which is what lets such a step survive `--non-interactive`.
 for step_file in step_files:
     name = Path(step_file).stem
     raw_step_text = Path(step_file).read_text()
@@ -1259,9 +1521,14 @@ for step_file in step_files:
         or DEFAULT_TEST_TIMEOUT
     )
 
-    # Per-step model. "sonnet" is the explicit default so the closeout stage
+    # Per-step model. "standard" is the explicit default so the closeout stage
     # (step 5) can reference it by name.
-    step_model: str = step_fm.get("model") or "sonnet"
+    step_model: str = step_fm.get("model") or "standard"
+
+    # A verification-only step (a regression gate) is expected to change
+    # nothing, so the owned-diff guard below must not stop the run waiting for
+    # an operator who may not be there — see the gate's comment.
+    allow_noop: bool = step_fm.get("allow_noop") is True
 
     # One validation command: test alone, or both with section markers so there
     # is a single RunCommand, a single compress stage, and no stale BATS result
@@ -1277,7 +1544,9 @@ for step_file in step_files:
         validation_cmd = test_cmd
         validation_timeout = test_timeout
 
-    implement_timeout = TIMEOUT_IMPLEMENT_OPUS if step_model == "opus" else TIMEOUT_IMPLEMENT_SONNET
+    validation_in_loop, validation_at_gate = _proven_validation(name, validation_cmd)
+
+    implement_timeout = TIMEOUT_IMPLEMENT_OPUS if step_model == "deep" else TIMEOUT_IMPLEMENT_SONNET
 
     # Snapshot file paths for this step (all in snapshot_root, outside the repo
     # so these files never appear in git status output).
@@ -1290,6 +1559,7 @@ for step_file in step_files:
     step_hookfix = os.path.join(snapshot_root, f"{name}.hookfix")
     step_hookfix_marker = os.path.join(snapshot_root, f"{name}.hookfix.marker")
     step_facts   = os.path.join(snapshot_root, f"{name}.facts")
+    step_noop    = os.path.join(snapshot_root, f"{name}.noop")
 
     # Stage names referenced by multiple stages — the gate must differ from
     # the in-loop name so ctx.results holds a fresh result at the gate.
@@ -1346,7 +1616,7 @@ for step_file in step_files:
         f"assert head unchanged {name}",
         RunCommand(cmd=(
             f'cd {shlex.quote(GIT_TOPLEVEL)} && '
-            f'{_assert_head_unchanged(step_head, f"implement {name}")} && '
+            f'{_assert_head_unchanged(step_head, f"implement {name}", name)} && '
             f'{_assert_index_clean(f"implement {name}")}'
         )),
         on_failure=fail,
@@ -1355,22 +1625,62 @@ for step_file in step_files:
     # ------------------------------------------------------------------
     # 4. Assert the agent actually changed something (guards the P0-2b
     #    regression: a silent no-op that left the worktree unmodified).
+    #
+    # A no-op is not always a defect: a checklist-style step can be
+    # satisfied already, and on a resume the step's work may still be
+    # sitting uncommitted in the tree.  So this is `on_failure=ask_user`,
+    # not `fail` — [c]ontinue treats the step as a deliberate no-op,
+    # [r]etry re-checks after the operator cleans the tree, [a]bort stops.
+    #
+    # Before failing, the shell drops a `.noop` marker.  That marker is what
+    # makes [c]ontinue coherent downstream: the commit and assert-committed
+    # stages are skipped (there is nothing to commit and HEAD will not
+    # advance), and a no-op facts file is written instead.  The marker is
+    # removed at the top of this command, so a retry — or a later run
+    # reusing the same snapshot dir — never sees a stale one.
+    #
+    # A step that declares `allow_noop: true` drops the same marker and
+    # succeeds instead of prompting.  Without it, a verification-only step —
+    # one whose whole job is to run a suite and change nothing — aborts every
+    # run started with `--non-interactive` (a child run under fix_jira_issue
+    # has no operator to press [c]ontinue; NonInteractiveResponder answers
+    # abort).  The guard stays intact for every step that does not opt in.
     # ------------------------------------------------------------------
+    if allow_noop:
+        _noop_branch = (
+            f'{{ touch {shlex.quote(step_noop)}; '
+            f'echo "NOTE: implement {name} changed nothing; accepted as a '
+            f'no-op (allow_noop: true in its front matter)"; }}'
+        )
+    else:
+        _noop_branch = (
+            f'{{ touch {shlex.quote(step_noop)}; '
+            f'echo "ERROR: implement {name} changed nothing"; '
+            f'echo "If this step\'s work is already in the working tree from an '
+            f'earlier run, commit or reset it before resuming."; '
+            f'echo "If it was committed by hand, give that commit the subject '
+            f'\\"refactor: {name}\\" (git commit --amend) and rerun: the step is then '
+            f'skipped."; '
+            f'echo "[c]ontinue accepts this step as a no-op: nothing is '
+            f'committed and the run moves on. [r]etry re-checks the tree."; '
+            f'exit 1; }}'
+        )
+
     pipeline.stage(
         f"assert owned diff {name}",
         RunCommand(cmd=(
             f"cd {shlex.quote(GIT_TOPLEVEL)} && "
+            f"rm -f {shlex.quote(step_noop)} && "
             f"python3 {shlex.quote(SNAPSHOT_HELPER)} snapshot "
             f"--root {shlex.quote(GIT_TOPLEVEL)} {shlex.quote(step_mid)} && "
             f"python3 {shlex.quote(SNAPSHOT_HELPER)} diff "
-            f"{shlex.quote(step_pre)} {shlex.quote(step_mid)} "
+            f"{shlex.quote(step_pre)} {shlex.quote(step_mid)}"
+            f"{NORN_STATE_IGNORE_FLAGS} "
             f"> {shlex.quote(step_mid_chg)} && "
-            f"[ -s {shlex.quote(step_mid_chg)} ] || "
-            f'{{ echo "ERROR: implement {name} changed nothing"; '
-            f'echo "If this step\'s work is already in the working tree from an '
-            f'earlier run, commit or reset it before resuming."; exit 1; }}'
+            f"{{ [ -s {shlex.quote(step_mid_chg)} ] || "
+            f"{_noop_branch}; }}"
         )),
-        on_failure=fail,
+        on_failure=ask_user,
     )
 
     # ------------------------------------------------------------------
@@ -1423,7 +1733,7 @@ for step_file in step_files:
         Stage(
             run_stage_name,
             RunCommand(
-                cmd=f"cd {shlex.quote(PROJECT_DIR)} && {validation_cmd}",
+                cmd=f"cd {shlex.quote(PROJECT_DIR)} && {validation_in_loop}",
                 timeout=validation_timeout,
             ),
         ),
@@ -1444,7 +1754,8 @@ for step_file in step_files:
     # check inside the loop must be repeated here as a top-level stage with
     # on_failure=fail.  The name must differ from the in-loop
     # "run validation <name>" so ctx.results holds a fresh result here
-    # rather than the loop's stale one.
+    # rather than the loop's stale one.  Validation is rerun only when the
+    # loop did not leave a proof for this exact tree (_proven_validation).
     # ------------------------------------------------------------------
     pipeline.stage(
         gate_name,
@@ -1452,10 +1763,9 @@ for step_file in step_files:
             cmd=(
                 f'cd {shlex.quote(GIT_TOPLEVEL)} && '
                 f'echo "=== head ===" && '
-                f'{_assert_head_unchanged(step_head, f"validation of {name}")} && '
+                f'{_assert_head_unchanged(step_head, f"validation of {name}", name)} && '
                 f'{_assert_index_clean(f"validation of {name}")} && '
-                f'echo "=== validation ===" && '
-                f'cd {shlex.quote(PROJECT_DIR)} && {validation_cmd}'
+                f'cd {shlex.quote(PROJECT_DIR)} && {validation_at_gate}'
             ),
             timeout=validation_timeout,
         ),
@@ -1496,6 +1806,10 @@ for step_file in step_files:
     # those paths, and commits with a two-attempt hook protocol.  The
     # retry lives inside the shell, so a failed commit stage must never
     # prompt to continue — the stage is `on_failure=fail`.
+    #
+    # Skipped when the operator accepted the step as a no-op at the owned
+    # diff gate: there is nothing to stage, and `require_changes=True`
+    # would turn that accepted answer back into a hard failure.
     # ------------------------------------------------------------------
     pipeline.stage(
         f"commit {name}",
@@ -1511,6 +1825,7 @@ for step_file in step_files:
             validation_cmd=validation_cmd,
             require_changes=True,
         )),
+        when=file_missing(step_noop),
         on_failure=fail,
     )
 
@@ -1546,6 +1861,9 @@ for step_file in step_files:
     # ------------------------------------------------------------------
     # 11. Assert the commit postcondition: HEAD advanced by exactly one
     #     commit, nothing is staged, and owned paths are clean.
+    #
+    #     Skipped alongside the commit stage on an accepted no-op — HEAD
+    #     did not advance, which is the whole point.
     # ------------------------------------------------------------------
     pipeline.stage(
         f"assert committed {name}",
@@ -1555,8 +1873,7 @@ for step_file in step_files:
             f'test "$(git rev-parse HEAD~1)" = "$(cat {shlex.quote(step_head)})" || '
             f'{{ echo "ERROR: expected exactly one commit for {name}"; exit 1; }} && '
             f'echo "=== index clean ===" && '
-            f'git diff --cached --quiet || '
-            f'{{ echo "ERROR: index is not clean after commit {name}"; exit 1; }} && '
+            f'{_assert_index_clean(f"commit {name}")} && '
             f'echo "=== owned paths clean ===" && '
             f'if [ -s {shlex.quote(step_changed)} ]; then '
             f'DIRTY=$(xargs -0 git status --porcelain -- < {shlex.quote(step_changed)}); '
@@ -1564,11 +1881,32 @@ for step_file in step_files:
             f'echo "ERROR: owned paths are dirty after commit {name}:" 1>&2; '
             f'echo "$DIRTY" 1>&2; exit 1; fi; fi'
         )),
+        when=file_missing(step_noop),
         on_failure=fail,
     )
 
     # ------------------------------------------------------------------
-    # 12. Read the facts file so `{facts <name>.output}` resolves to the
+    # 12. Write the facts file for an accepted no-op, since the commit
+    #     stage that normally writes it was skipped.  Same three-line
+    #     shape so `{facts <name>.output}` reads the same in later
+    #     prompts; validation is recorded as PASS because the top-level
+    #     validation gate had to pass to reach this point.
+    # ------------------------------------------------------------------
+    pipeline.stage(
+        f"record no-op {name}",
+        RunCommand(cmd=(
+            f'{{ echo "Commit: (none) - no changes; accepted as a no-op"; '
+            f'echo "Changed: (none)"; '
+            f'printf "Validation: PASS - %s\\n" '
+            f'{shlex.quote(_facts_validation_label(validation_cmd))}; '
+            f'}} > {shlex.quote(step_facts)}'
+        )),
+        when=file_exists(step_noop),
+        on_failure=fail,
+    )
+
+    # ------------------------------------------------------------------
+    # 13. Read the facts file so `{facts <name>.output}` resolves to the
     #     three-line commit summary in later implement prompts.  ReadFile
     #     output is plain text — a RunCommand result would render as a
     #     dict literal (norn fact 6).
@@ -1579,7 +1917,7 @@ for step_file in step_files:
     )
 
     # ------------------------------------------------------------------
-    # 13. Drop the agent session so the next step starts fresh.
+    # 14. Drop the agent session so the next step starts fresh.
     # ------------------------------------------------------------------
     pipeline.clear_context()
 
@@ -1632,6 +1970,8 @@ pipeline.stage(
 # Aggregate loop: up to max_retries=3 (one run + two repairs).
 # new_session=True so the repair does not inherit the last step's session.
 # ------------------------------------------------------------------
+_AGG_IN_LOOP, _AGG_AT_GATE = _proven_validation("aggregate", AGGREGATE_CMD)
+
 _agg_loop_stages = [
     Stage(
         "aggregate compress",
@@ -1652,7 +1992,7 @@ _agg_loop_stages = [
     Stage(
         "aggregate run",
         RunCommand(
-            cmd=f"cd {shlex.quote(PROJECT_DIR)} && {AGGREGATE_CMD}",
+            cmd=f"cd {shlex.quote(PROJECT_DIR)} && {_AGG_IN_LOOP}",
             timeout=AGGREGATE_TIMEOUT,
         ),
     ),
@@ -1667,7 +2007,8 @@ pipeline.loop(
 )
 
 # ------------------------------------------------------------------
-# Aggregate gate: re-check HEAD/index and re-run validation.
+# Aggregate gate: re-check HEAD/index and re-run validation unless the
+# loop proved it on this exact tree (_proven_validation).
 #
 # Named "aggregate passed" (not "aggregate run") so ctx.results holds
 # a fresh result here rather than the loop's stale one.
@@ -1680,8 +2021,7 @@ pipeline.stage(
             f'echo "=== head ===" && '
             f'{_assert_head_unchanged(agg_head, "the aggregate validation loop")} && '
             f'{_assert_index_clean("the aggregate validation loop")} && '
-            f'echo "=== aggregate validation ===" && '
-            f'cd {shlex.quote(PROJECT_DIR)} && {AGGREGATE_CMD}'
+            f'cd {shlex.quote(PROJECT_DIR)} && {_AGG_AT_GATE}'
         ),
         timeout=AGGREGATE_TIMEOUT,
     ),
@@ -1745,9 +2085,11 @@ pipeline.clear_context()
 # Review phase: an enforcing gate with bounded fresh-session fix rounds
 #
 # v1's advisory review is replaced with a reviewed-artifact contract enforced
-# in shell.  The review writes `<feature_dir>/review.md` whose first three
-# lines are exactly:
+# in shell.  The review writes `<feature_dir>/review.md` whose first line is
+# exactly:
 #     VERDICT: PASS          (or VERDICT: NEEDS_FIXES)
+#
+# `stamp review N` then writes lines 2-3 from the pipeline's own record:
 #     Base: <sha>
 #     Head: <sha>
 #
@@ -1785,6 +2127,10 @@ for _n in range(1, 4):
         "head":         os.path.join(snapshot_root, f"review-{_n}.head"),
         "pre":          os.path.join(snapshot_root, f"review-{_n}.pre.json"),
         "needs_fixes":  os.path.join(snapshot_root, f"review-{_n}.needs-fixes"),
+        # Round N's copy of the review.md round N-1 wrote, taken before this
+        # round deletes it.  Rounds after the first read it instead of
+        # re-deriving the whole review.
+        "prev_review":  os.path.join(snapshot_root, f"review-{_n}.previous.md"),
     }
 for _n in range(1, 3):  # fix rounds only for 1, 2
     _review_paths[_n].update({
@@ -1807,56 +2153,88 @@ REVIEWED_HEAD = os.path.join(snapshot_root, "reviewed.head")
 def _review_prompt(n: int) -> str:
     """Build the review prompt for round *n*.
 
+    Round 1 reviews the whole base..HEAD range.  Later rounds are deliberately
+    bounded: they re-check the previous round's blocking findings and review
+    the fix commits, and are told not to start a fresh full review.  An
+    unbounded re-review always finds one more nit, so ``VERDICT: PASS`` was
+    never reachable and the rounds always ended in failure.
+
     Module-level so tests can inspect the contract without running an agent.
     """
     read_manifest_stage = f"read review manifest {n}"
-    round_note = ""
-    if n > 1:
-        round_note = (
-            f"\nThis is review round {n}; the previous round's findings were addressed "
-            "in the most recent commit. Review the whole range again, not only the fix.\n"
+
+    if n == 1:
+        objective = (
+            f"Review the implementation in this repository against the plan.\n\n"
+            f"Working directory: `{PROJECT_DIR}`\n\n"
+            f"Read the base SHA from `{BASE_SHA}` first.\n\n"
+            f"Review every commit from that base to HEAD against the plan in "
+            f"`{feature_dir}`. Do not edit any file except `{REVIEW_MD}`.\n\n"
+            f"Start from the manifest below and pull only the hunks you need "
+            f"(`git show <sha>`, `git diff <base> <head> -- <path>`).\n\n"
+            "## Focus\n\n"
+            "- Correctness: does the code match the plan's intent?\n"
+            "- Safety: are there fallbacks, swallowed errors, or silent degradation?\n"
+            "- Tests: are the changes tested and do the tests actually verify the behaviour?\n"
+            "- Style: does the code follow the project conventions (AGENTS.md)?\n\n"
         )
+    else:
+        objective = (
+            f"This is review round {n}. Round {n - 1}'s review is reproduced below, and "
+            f"its blocking findings were addressed in the fix commits listed in the "
+            f"manifest.\n\n"
+            f"Working directory: `{PROJECT_DIR}`\n\n"
+            f"Do not edit any file except `{REVIEW_MD}`.\n\n"
+            "Your job this round is bounded. Do exactly this:\n\n"
+            f"1. Re-check every blocking finding from round {n - 1} against the code as "
+            f"it stands now, and say for each whether it is fixed.\n"
+            "2. Review the fix commits themselves — the range is in the manifest — for "
+            "correctness, regressions and test coverage.\n\n"
+            "Do **not** start a fresh review of the full range: earlier rounds covered "
+            "it, and re-reviewing it costs the run more than it finds. Report a new "
+            "problem only when it is in the fix commits, or when it is a blocking "
+            "problem you happen to walk past while checking them.\n\n"
+        )
+
     return (
         f"## Objective\n\n"
-        f"Review the implementation in this repository against the plan.\n\n"
-        f"Working directory: `{PROJECT_DIR}`\n\n"
-        f"Read the base SHA from `{BASE_SHA}` first.\n\n"
-        f"Review the plan in `{feature_dir}` at HEAD against that base. "
-        f"Do not edit any file except `{REVIEW_MD}`.\n\n"
-        f"Start from the manifest below and pull only the hunks you need "
-        f"(`git show <sha>`, `git diff <base> <head> -- <path>`).\n\n"
-        "## Focus\n\n"
-        "- Correctness: does the code match the plan's intent?\n"
-        "- Safety: are there fallbacks, swallowed errors, or silent degradation?\n"
-        "- Tests: are the changes tested and do the tests actually verify the behaviour?\n"
-        "- Style: does the code follow the project conventions (AGENTS.md)?\n\n"
+        f"{objective}"
+        "## Scope\n\n"
+        f"Only the commits from the base SHA to HEAD are in scope. Files that are not "
+        f"part of those commits — anything that was already in the working tree when "
+        f"the run started, or that the run never touched — cannot be changed by the "
+        f"fix step that follows you, which has no git commands. Record anything of "
+        f"that kind under `## For the human` instead of asking for it.\n\n"
         "## Review artifact contract\n\n"
-        f"Write `{REVIEW_MD}` with exactly these first three lines:\n\n"
+        f"Write `{REVIEW_MD}`. Its **first line** must be exactly one of:\n\n"
         "```\n"
         "VERDICT: PASS\n"
-        "Base: <sha>\n"
-        "Head: <sha>\n"
         "```\n\n"
-        "Or:\n\n"
         "```\n"
         "VERDICT: NEEDS_FIXES\n"
-        "Base: <sha>\n"
-        "Head: <sha>\n"
         "```\n\n"
-        "After the header, list findings in severity order. Each finding:\n"
-        "- Severity (critical / major / minor / nit)\n"
-        "- Step name\n"
-        "- File and line\n"
-        "- Evidence (quote the code)\n"
-        "- Impact\n"
-        "- Required change\n\n"
-        "PASS only when no required changes remain.\n\n"
-        f"{round_note}"
+        "Do not write the reviewed SHAs into the file — the pipeline records "
+        "the base and head it reviewed at, immediately after you return.\n\n"
+        "After the verdict, use these three sections:\n\n"
+        "- `## Blocking findings` — critical and major only. Each: severity, step name, "
+        "file and line, evidence (quote the code), impact, required change.\n"
+        "- `## Non-blocking` — minor findings and nits, one line each. They are handed "
+        "to the human in the handoff; nobody will fix them in this run.\n"
+        "- `## For the human` — anything out of scope, per the section above.\n\n"
+        "`VERDICT: PASS` when no critical or major finding remains. Minor findings and "
+        "nits do **not** hold the verdict: a run that is correct except for nits is a "
+        "run that should finish.\n\n"
         f"## Manifest\n\n"
         f"{{{read_manifest_stage}.output}}\n\n"
-        f"{shared_context}"
-        f"## Plan \u2014 all steps\n\n"
-        f"{all_steps_summary}\n"
+        + (
+            f"## Round {n - 1} review\n\n"
+            f"{{{f'read previous review {n}'}.output}}\n\n"
+            if n > 1 else ""
+        )
+        + f"{shared_context}"
+        f"## Plan — step files in `{feature_dir}`\n\n"
+        f"Open the ones you need; do not assume their contents.\n\n"
+        f"{all_step_names}\n"
     )
 
 
@@ -1868,8 +2246,11 @@ def _review_fix_prompt(n: int) -> str:
     forbidden = ", ".join(f"`{v}`" for v in _GIT_FORBIDDEN_VERBS)
     return (
         f"## Objective\n\n"
-        f"Apply every **required** change listed in `{REVIEW_MD}` "
+        f"Apply every required change under `## Blocking findings` in `{REVIEW_MD}` "
         f"(read it first).\n\n"
+        f"Its other sections are not yours to act on: `## Non-blocking` findings are "
+        f"handed to the human as they are, and `## For the human` lists work this run "
+        f"cannot do. Changing either one is an unrelated change.\n\n"
         f"Working directory: `{PROJECT_DIR}`\n\n"
         f"IMPORTANT: When creating or editing files, always use absolute paths "
         f"based on `{PROJECT_DIR}`.\n\n"
@@ -1890,6 +2271,18 @@ def _review_fix_prompt(n: int) -> str:
 # Review round builder
 # ---------------------------------------------------------------------------
 
+# Write-guard for the review stages: review.md is the only file a reviewer may
+# write.  Empty under any provider but claude-code, because SDK hooks are a
+# Claude Code feature and a stage that declares them fails outright elsewhere
+# (norn/stages/generate.py).  The review postcondition stays the backstop for
+# those providers, and for writes made through Bash under any provider.
+_REVIEW_WRITE_GUARD = (
+    build_write_allowlist_hooks([REVIEW_MD])
+    if AGENT_PROVIDER == "claude-code"
+    else None
+)
+
+
 def _add_review_round(n: int, when) -> None:
     """Add the stages for review round *n* to the pipeline.
 
@@ -1908,8 +2301,35 @@ def _add_review_round(n: int, when) -> None:
     ignore_flag = ""
     if REVIEW_MD_REL is not None:
         ignore_flag = f" --ignore {q(REVIEW_MD_REL)}"
+    # Rounds after the first read the previous round's review instead of
+    # re-deriving it, so that file is copied out before this round deletes it.
+    # It must exist: round n only runs when round n-1 wrote NEEDS_FIXES.
+    archive_prev = ""
+    fix_commits_section = ""
+    if n > 1:
+        prev = _review_paths[n - 1]
+        archive_prev = f"cp {q(REVIEW_MD)} {q(paths['prev_review'])} && "
+        fix_commits_section = (
+            f'echo "" >> {q(paths["manifest"])} && '
+            f'echo "## Fix commits since round {n - 1}" >> {q(paths["manifest"])} && '
+            f'echo "" >> {q(paths["manifest"])} && '
+            f'PREV_HEAD=$(cat {q(prev["head"])}) && '
+            f'echo "Range: $PREV_HEAD..$HEAD_SHA" >> {q(paths["manifest"])} && '
+            f'echo "" >> {q(paths["manifest"])} && '
+            f'git log --oneline "$PREV_HEAD".."$HEAD_SHA" >> {q(paths["manifest"])} && '
+            f'echo "" >> {q(paths["manifest"])} && '
+            f'git diff --stat "$PREV_HEAD" "$HEAD_SHA" >> {q(paths["manifest"])} && '
+        )
+
     manifest_cmd = (
         f"cd {q(GIT_TOPLEVEL)} && "
+        f"{archive_prev}"
+        # Delete any earlier review.md before the pre-snapshot is taken.  This
+        # is what makes a stale artifact impossible: the round either writes a
+        # new one or `stamp review` finds nothing and fails.  It replaces the
+        # old freshness guarantee, which asked the agent to transcribe HEAD
+        # into the file and threw the whole review away when it did not match.
+        f"rm -f {q(REVIEW_MD)} && "
         f"git rev-parse HEAD > {q(paths['head'])} && "
         # Write the manifest file.
         f"BASE=$(cat {q(BASE_SHA)}) && "
@@ -1928,6 +2348,7 @@ def _add_review_round(n: int, when) -> None:
         f'echo "## Stat" >> {q(paths["manifest"])} && '
         f'echo "" >> {q(paths["manifest"])} && '
         f'git diff --stat "$BASE" "$HEAD_SHA" >> {q(paths["manifest"])} && '
+        f"{fix_commits_section}"
         # Pre-snapshot for postcondition.
         f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(paths['pre'])}"
     )
@@ -1945,7 +2366,22 @@ def _add_review_round(n: int, when) -> None:
         when=when,
     )
 
+    # --- read previous review N ---
+    # The round-n prompt quotes round n-1's findings, so the reviewer can
+    # re-check them without reviewing the whole range again.
+    if n > 1:
+        pipeline.stage(
+            f"read previous review {n}",
+            ReadFile(path=paths["prev_review"]),
+            when=when,
+        )
+
     # --- review N ---
+    # The prompt says "do not edit any file except review.md"; under
+    # acceptEdits that is guidance, not a constraint, and a reviewer that
+    # spots a real bug fixes it — which the postcondition below then catches
+    # after the review is paid for.  The write-guard turns the instruction
+    # into a denied permission, so the reviewer reports the fix instead.
     pipeline.stage(
         f"review {n}",
         Generate(
@@ -1955,6 +2391,7 @@ def _add_review_round(n: int, when) -> None:
             setting_sources=["project"],
             model=REVIEW_MODEL,
             max_turns=MAX_TURNS_REVIEW,
+            hooks=_REVIEW_WRITE_GUARD,
         ),
         on_failure=ask_user,
         timeout=TIMEOUT_REVIEW,
@@ -1982,25 +2419,62 @@ def _add_review_round(n: int, when) -> None:
         when=when,
     )
 
+    # --- stamp review N ---
+    # The pipeline knows the base and the head it reviewed at; the agent does
+    # not need to transcribe them.  Asking it to cost a $1, five-minute review
+    # every time a 40-character hex string came back wrong — including when the
+    # agent was right and the manifest's range was the thing at fault.  So the
+    # agent owns the verdict, norn owns the SHAs, and they are written here.
+    #
+    # A review round that wrote nothing fails here rather than being read as a
+    # verdict: `review manifest` deleted the file, so absence means the agent
+    # produced no artifact at all.
+    #
+    # The awk drops lines 2-3 when they are already Base:/Head: lines, so an
+    # agent that writes them out of habit does not end up with them twice.
+    stamped_tmp = os.path.join(snapshot_root, f"review-{n}.stamped")
+    _strip_old_header = (
+        "awk 'NR==1{next} NR<=3 && /^(Base|Head): /{next} {print}' "
+    )
+    stamp_cmd = (
+        f"cd {q(GIT_TOPLEVEL)} && "
+        f"test -s {q(REVIEW_MD)} || "
+        f'{{ echo "ERROR: review {n} wrote no review.md at {REVIEW_MD}" 1>&2; '
+        f'echo "The review must write that file; its first line is the verdict." 1>&2; '
+        f"exit 1; }} && "
+        f"BASE=$(cat {q(BASE_SHA)}) && "
+        f"HEAD_SHA=$(cat {q(paths['head'])}) && "
+        f"{{ head -1 {q(REVIEW_MD)}; "
+        f'echo "Base: $BASE"; '
+        f'echo "Head: $HEAD_SHA"; '
+        f"{_strip_old_header}{q(REVIEW_MD)}; }} > {q(stamped_tmp)} && "
+        # Copy rather than move: keeps review.md's identity and permissions,
+        # and the temp lives on another filesystem from the repo.
+        f"cat {q(stamped_tmp)} > {q(REVIEW_MD)} && rm -f {q(stamped_tmp)}"
+    )
+    pipeline.stage(
+        f"stamp review {n}",
+        RunCommand(cmd=stamp_cmd),
+        on_failure=fail,
+        when=when,
+    )
+
     # --- check review N ---
     # Exit 0 on NEEDS_FIXES (touch marker); exit 0 on PASS; exit 1 on
     # malformed artifact.  Comment: this stage must exit 0 on NEEDS_FIXES
     # because OnFailure has no "continue"; the marker is what routes the
     # fix round.
+    #
+    # Only the verdict is checked.  Lines 2-3 were written by `stamp review`
+    # one stage earlier, so re-validating them here would test norn against
+    # itself; `review passed` still checks them against the real HEAD at the
+    # end of the phase, which is where staleness would actually show up.
     check_cmd = (
         f"rm -f {q(paths['needs_fixes'])} && "
         f"LINE1=$(head -1 {q(REVIEW_MD)}) && "
         f'if [ "$LINE1" != "VERDICT: PASS" ] && [ "$LINE1" != "VERDICT: NEEDS_FIXES" ]; then '
         f'echo "ERROR: malformed review artifact — line 1 must be exactly '
         f"'VERDICT: PASS' or 'VERDICT: NEEDS_FIXES', got: $LINE1\" 1>&2; exit 1; fi && "
-        f"LINE2=$(sed -n 2p {q(REVIEW_MD)}) && "
-        f'EXPECTED_BASE="Base: $(cat {q(BASE_SHA)})" && '
-        f'if [ "$LINE2" != "$EXPECTED_BASE" ]; then '
-        f'echo "ERROR: review.md line 2 must be \'$EXPECTED_BASE\', got: $LINE2" 1>&2; exit 1; fi && '
-        f"LINE3=$(sed -n 3p {q(REVIEW_MD)}) && "
-        f'EXPECTED_HEAD="Head: $(git rev-parse HEAD)" && '
-        f'if [ "$LINE3" != "$EXPECTED_HEAD" ]; then '
-        f'echo "ERROR: review.md is stale — line 3 must be \'$EXPECTED_HEAD\', got: $LINE3" 1>&2; exit 1; fi && '
         f'if [ "$LINE1" = "VERDICT: NEEDS_FIXES" ]; then '
         f"touch {q(paths['needs_fixes'])}; fi && "
         f"exit 0"
@@ -2092,8 +2566,7 @@ def _add_review_fix_round(n: int) -> None:
         RunCommand(cmd=(
             f'cd {q(GIT_TOPLEVEL)} && '
             f'echo "=== index clean ===" && '
-            f'git diff --cached --quiet || '
-            f'{{ echo "ERROR: index is not clean after review fix commit {n}"; exit 1; }} && '
+            f'{_assert_index_clean(f"review fix commit {n}")} && '
             f'echo "=== head ===" && '
             f'CURRENT_HEAD=$(git rev-parse HEAD) && '
             f'FIX_HEAD=$(cat {q(paths["fix_head"])}) && '
@@ -2143,8 +2616,10 @@ _add_review_fix_round(2)
 _add_review_round(3, when=file_exists(_review_paths[2]["needs_fixes"]))
 
 # --- review passed ---
-# Comment: a stale review.md from a previous run cannot pass because its
-# Head: line no longer matches.
+# Comment: lines 2-3 are norn's own stamp, so this re-reads them against the
+# real HEAD at the end of the phase.  That is where staleness would actually
+# show up — a fix round committing after the last review round ran — and it no
+# longer depends on the agent having transcribed anything.
 _review_passed_cmd = (
     f"LINE1=$(head -1 {shlex.quote(REVIEW_MD)}) && "
     f'if [ "$LINE1" != "VERDICT: PASS" ]; then '
@@ -2339,7 +2814,9 @@ _review_ignore_flag_audit = (
 _handoff_ignore_flag_audit = (
     f" --ignore {shlex.quote(HANDOFF_MD_REL)}" if HANDOFF_MD_REL is not None else ""
 )
-_extra_ignore_flags = _review_ignore_flag_audit + _handoff_ignore_flag_audit
+_extra_ignore_flags = (
+    _review_ignore_flag_audit + _handoff_ignore_flag_audit + NORN_STATE_IGNORE_FLAGS
+)
 
 # One check per .changed file: skip if the file is absent or empty (step was
 # resume-skipped and its .changed file was not written in this run), fail if

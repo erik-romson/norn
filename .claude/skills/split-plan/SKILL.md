@@ -45,12 +45,24 @@ default any more; a missing or empty `test_cmd` halts the run.
 test_cmd: uv run python -m pytest tests/test_widget.py -v
 bats_cmd: bats bats/widget.bats          # optional, omit when not used
 model: deep                              # optional, omit on routine steps
+allow_noop: true                         # optional, verification-only steps only
 ---
 
 # Step title
 
 …
 ```
+
+Rules for `allow_noop`:
+
+- Set it **only** on a step whose whole job is to run a suite and confirm
+  nothing broke — a regression gate that is expected to produce no commit.
+- Leave it off everywhere else. The pipeline's default is to stop and ask
+  when a step changes nothing, which is what catches an agent that silently
+  did no work; `allow_noop: true` waives that check for one step.
+- A verification-only step without it aborts any run started with
+  `--non-interactive` (a child run under `fix_jira_issue`), because there is
+  no operator to accept the no-op.
 
 Rules for `test_cmd`:
 

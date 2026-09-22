@@ -197,17 +197,17 @@ The feature directory must contain:
 | File | Role |
 | --- | --- |
 | `index.md` | Shared context for every step; optional front-matter: `test_cmd`, `bats_cmd`, `test_timeout`, `bats_timeout`, `final_test_cmd` |
-| `step-NN-<name>.md` | One file per step, numbered from `01` and contiguous; optional front-matter: `test_cmd`, `bats_cmd`, `test_timeout`, `bats_timeout`, `model` (`sonnet`\|`opus`) |
+| `step-NN-<name>.md` | One file per step, numbered from `01` and contiguous; optional front-matter: `test_cmd`, `bats_cmd`, `test_timeout`, `bats_timeout`, `model` (`light`\|`standard`\|`deep`), `allow_noop` (`true` for a verification-only step that is expected to change nothing) |
 
 Optional `--arg` knobs (all have defaults; document them in plan files, not
 in pipeline invocations):
 
 | Knob | Default | Description |
 | --- | --- | --- |
-| `budget=<float>` | `30` | USD cost ceiling (unmeasured guess) |
-| `token_budget=<int>` | `500000` | Token ceiling (unmeasured guess) |
-| `review_model=<sonnet\|opus>` | `sonnet` | Model for review stages |
-| `aggregate_model=<sonnet\|opus>` | `sonnet` | Model for aggregate repair |
+| `budget=<float>` | `$4 × steps + $25` | USD cost ceiling; `--budget` and the TUI's budget field override it |
+| `token_budget=<int>` | `80k × steps + 200k` | Token ceiling; `--token-budget` and the TUI's token_budget field override it |
+| `review_model=<light\|standard\|deep>` | `standard` | Label for review stages |
+| `aggregate_model=<light\|standard\|deep>` | `standard` | Label for aggregate repair |
 | `max_retries=<int>` | `3` | Per-step validation attempts (≥ 1) |
 | `allow_dirty_index=1` | off | Skip the clean-index preflight check |
 | `allow_dirty_worktree=1` | off | Skip the clean-worktree preflight check |
@@ -216,7 +216,10 @@ The pipeline writes two report files into the feature directory:
 
 - `review.md` — structured review verdict written by the review agent; first
   three lines are `VERDICT: PASS`/`VERDICT: NEEDS_FIXES`, `Base: <sha>`,
-  `Head: <sha>`.
+  `Head: <sha>`. Findings sit under `## Blocking findings` (critical and major,
+  which hold the verdict and are what the fix round applies), `## Non-blocking`
+  (minor and nits, carried to the handoff) and `## For the human` (work outside
+  the run's own commits, which the fix round has no git commands to do).
 - `handoff.md` — narrative handoff document written from a pipeline-assembled
   manifest (commits, diff, stat, dependency changes) and the completed review.
 
