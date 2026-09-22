@@ -117,7 +117,16 @@ claiming a dead run is live.
 | `c` | cancel the run | cancels the active stage task immediately (see below) |
 | `a` | answer a waiting prompt | opens the `InputDecisionModal` (see below) |
 | `b` / `Esc` | back to launcher | cancels + awaits run teardown; exits in direct mode |
-| `q` | quit | cancels + awaits run teardown; exits the whole app |
+| `q` / `ctrl+q` | quit | cancels + awaits run teardown; exits the whole app |
+
+While a run is live, `c`, `b`/`Esc`, `q` and `ctrl+q` first open
+`ConfirmStopModal` (`norn/tui/modals.py`): `y` stops the run, `n`/`Esc` keeps
+it running. Textual's built-in `ctrl+q` would otherwise exit the app directly;
+both `NornApp` and `NornUIApp` override `action_quit` to route it through the
+run screen's Quit, so it asks and cancels the run the normal way. A run task
+cancelled from outside anyway (app teardown) is still recorded as cancelled,
+not successful: `run_pipeline` treats `asyncio.CancelledError` like a user
+cancel.
 
 The `RunScreen` renders these as a Textual `Footer` at the bottom of the run
 view (matching the launcher/history/args screens), so the controls are always

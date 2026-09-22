@@ -421,14 +421,66 @@ async def test_back_during_run_leaves_no_live_task():
         assert app._run_task is not None
         assert not app._run_task.done()
 
-        # Press Back — should cancel + await the run task.
+        # Press Back and confirm — should cancel + await the run task.
         await pilot.press("b")
+        await pilot.pause()
+        await pilot.press("y")
         await pilot.pause()
 
     # After the app has exited, the run task must be done.
     assert app._run_task is not None
     assert app._run_task.done()
     assert app.go_back is True
+
+
+class _Blocking(BaseStage):
+    async def run(self, ctx: PipelineContext, **kwargs) -> StageResult:
+        await asyncio.sleep(10)
+        return StageResult(name="", success=True, output="blocked")
+
+
+def _blocking_app() -> NornApp:
+    pipeline = Pipeline("confirm").stage("blocker", _Blocking())
+    return NornApp(pipeline="confirm", graph=build_graph(pipeline), vm=RunViewModel(), pipeline_obj=pipeline)
+
+
+async def _start(app: NornApp, pilot) -> None:
+    await pilot.pause()
+    await asyncio.sleep(0.05)
+    await pilot.pause()
+    assert app._run_task is not None and not app._run_task.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["q", "b", "escape", "c", "ctrl+q"])
+async def test_stopping_a_live_run_asks_first_and_n_keeps_it_running(key):
+    from norn.tui.modals import ConfirmStopModal
+
+    app = _blocking_app()
+    async with app.run_test() as pilot:
+        await _start(app, pilot)
+        await pilot.press(key)
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmStopModal)
+        await pilot.press("n")
+        await pilot.pause()
+        assert not isinstance(app.screen, ConfirmStopModal)
+        assert not app._run_task.done()
+        assert app.go_back is False
+        app._run_screen._cancel_active_run()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_q_confirmed_cancels_the_run_as_cancelled():
+    app = _blocking_app()
+    async with app.run_test() as pilot:
+        await _start(app, pilot)
+        await pilot.press("ctrl+q")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
+    assert app._run_task.done()
+    assert app.run_success is False
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +660,8 @@ async def test_worktree_run_cancelled_keeps_branch(monkeypatch):
         assert app._run_task is not None and not app._run_task.done()
 
         await pilot.press("b")
+        await pilot.pause()
+        await pilot.press("y")
         await pilot.pause()
 
     assert app.run_success is False

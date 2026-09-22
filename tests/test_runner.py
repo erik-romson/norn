@@ -764,6 +764,24 @@ async def test_loop_timeout_fires():
     assert "Timed out" in exc_info.value.result.error
 
 
+@pytest.mark.asyncio
+async def test_outer_cancellation_is_not_recorded_as_success():
+    """A run task cancelled from outside (app shutdown) must not finish as a success."""
+    from norn.event_sink import EventSink
+    from norn.events import RunCancelled, RunFinished
+
+    sink = EventSink()
+    p = Pipeline("test").stage("slow", SlowStage(delay=10))
+    task = asyncio.create_task(run_pipeline(p, event_sink=sink))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    events = sink.lossless_events
+    assert any(isinstance(e, RunCancelled) for e in events)
+    assert [e.success for e in events if isinstance(e, RunFinished)] == [False]
+
+
 # ---------------------------------------------------------------------------
 # Interactive stepping mode
 # ---------------------------------------------------------------------------

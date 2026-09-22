@@ -17,6 +17,8 @@ understands:
 * ``step``             → ``r`` (run), ``s`` (skip), ``a`` (abort)
 * anything else        → ``c`` (continue), ``a`` (abort)
 
+:class:`ConfirmStopModal` asks before a keypress stops a live run.
+
 It is ``textual``-only and imported lazily by the run screen, never at core
 import time.
 """
@@ -194,3 +196,70 @@ class InputDecisionModal(ModalScreen[str]):
             event.stop()
             # Prefer abort when offered; otherwise the last (safest) choice.
             self.dismiss("a" if "a" in self._valid else self._choices[-1][0])
+
+
+class ConfirmStopModal(ModalScreen[bool]):
+    """Asks before quitting, going back from, or cancelling a live run.
+
+    Every one of those cancels the run, and a stray keypress on a run that has
+    been going for hours throws the in-flight stage's work away.  Dismisses
+    with ``True`` to stop the run; ``n`` and Esc keep it running.
+    """
+
+    DEFAULT_CSS = """
+    ConfirmStopModal {
+        align: center middle;
+    }
+    ConfirmStopModal #dialog {
+        width: auto;
+        min-width: 56;
+        max-width: 90%;
+        height: auto;
+        border: thick $error;
+        background: $surface;
+        padding: 1 2;
+    }
+    ConfirmStopModal #title {
+        text-style: bold;
+        width: 100%;
+    }
+    ConfirmStopModal #hint {
+        color: $text-muted;
+        margin: 1 0;
+    }
+    ConfirmStopModal #buttons {
+        height: auto;
+        align-horizontal: center;
+    }
+    ConfirmStopModal Button {
+        margin: 0 1;
+        min-width: 10;
+    }
+    """
+
+    def __init__(self, question: str) -> None:
+        super().__init__()
+        self._question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._question, id="title", markup=False)
+            yield Label(
+                "The stage in progress is stopped. Completed stages stay in the "
+                "checkpoint, so the run can continue later with --resume.",
+                id="hint",
+            )
+            with Horizontal(id="buttons"):
+                yield Button("Stop run \\[y]", id="confirm-y", variant="error")
+                yield Button("Keep running \\[n]", id="confirm-n", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm-y")
+
+    def on_key(self, event: Any) -> None:
+        if event.key == "y":
+            event.stop()
+            self.dismiss(True)
+        elif event.key in ("n", "escape"):
+            event.stop()
+            self.dismiss(False)

@@ -1592,7 +1592,11 @@ async def run_pipeline(
                     if name in sub_ctx.results:
                         ctx.results[name] = sub_ctx.results[name]
 
-    except CancelledError as exc:
+    except (CancelledError, asyncio.CancelledError):
+        # asyncio.CancelledError is the run task being cancelled from outside
+        # (the TUI app shutting down, Ctrl-C). It is a BaseException, so
+        # without this clause it skips every handler and the `finally` below
+        # records the interrupted run as a success.
         _failed_stage = "cancelled"
         _cancelled = True
         ctx.event_sink.emit(RunCancelled(

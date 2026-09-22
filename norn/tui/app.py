@@ -172,6 +172,8 @@ class RunScreen(Screen):
         self._controller: Any | None = None
         # True while the input-decision modal is on screen (avoids double-push).
         self._modal_open: bool = False
+        # True while the stop-run confirmation is on screen (avoids double-push).
+        self._confirm_open: bool = False
 
     # ------------------------------------------------------------------
     # Layout
@@ -425,7 +427,32 @@ class RunScreen(Screen):
         ctrl = self._controller
         if ctrl is None or self.run_finished:
             return
-        ctrl.cancel()
+
+        async def _cancel() -> None:
+            self._cancel_active_run()
+
+        self._confirm_stop("Cancel the run?", _cancel)
+
+    @property
+    def run_live(self) -> bool:
+        """Whether a pipeline run is still in progress on this screen."""
+        return self._controller is not None and not self.run_finished
+
+    def _confirm_stop(self, question: str, then: Any) -> None:
+        """Ask before *then* (an async callable) stops the live run."""
+        if self._confirm_open:
+            return
+        from norn.tui.modals import ConfirmStopModal  # noqa: PLC0415
+
+        async def _answered(confirmed: bool | None) -> None:
+            self._confirm_open = False
+            # The run may have ended while the question was open; the action
+            # still goes ahead, there is just nothing left to cancel.
+            if confirmed:
+                await then()
+
+        self._confirm_open = True
+        self.app.push_screen(ConfirmStopModal(question), _answered)
 
     def action_answer_input(self) -> None:
         """Open the decision modal for the pending WaitingInput (if any)."""
@@ -474,16 +501,29 @@ class RunScreen(Screen):
     async def action_back(self) -> None:
         """Return to the launcher, cancelling any running pipeline first.
 
-        Awaits the run task after cancelling so the run finishes cleanly
-        before the screen is dismissed — without this, events would post to
-        a dismissed screen and a second run could start against the same repo.
+        Asks first while a run is live.  Awaits the run task after cancelling
+        so the run finishes cleanly before the screen is dismissed — without
+        this, events would post to a dismissed screen and a second run could
+        start against the same repo.
         """
+        if self.run_live:
+            self._confirm_stop("Stop the run and go back?", self._back)
+            return
+        await self._back()
+
+    async def action_quit_app(self) -> None:
+        """Quit, cancelling any running pipeline first (asks while it is live)."""
+        if self.run_live:
+            self._confirm_stop("Stop the run and quit?", self._quit)
+            return
+        await self._quit()
+
+    async def _back(self) -> None:
         await self._cancel_and_await()
         self.go_back = True
         self._leave("back")
 
-    async def action_quit_app(self) -> None:
-        """Quit, cancelling any running pipeline first."""
+    async def _quit(self) -> None:
         await self._cancel_and_await()
         self._leave("quit")
 
@@ -495,6 +535,21 @@ class RunScreen(Screen):
                 await self._run_task
             except (Exception, asyncio.CancelledError):  # noqa: BLE001
                 pass  # _drive_run handles all errors internally
+
+
+async def _quit_through_run_screen(app: App) -> None:
+    """Handle Textual's built-in ``ctrl+q`` quit.
+
+    The default ``App.action_quit`` exits at once, which cancels the run task
+    from outside: no confirmation, and the runner never sees a user cancel.
+    Route it through the run screen's own Quit so a live run asks first and
+    is cancelled the normal way.
+    """
+    for screen in reversed(app.screen_stack):
+        if isinstance(screen, RunScreen) and screen.run_live:
+            await screen.action_quit_app()
+            return
+    app.exit()
 
 
 class NornApp(App):
@@ -535,6 +590,9 @@ class NornApp(App):
         widgets (they live on the active screen) without an extra push.
         """
         return self._run_screen
+
+    async def action_quit(self) -> None:
+        await _quit_through_run_screen(self)
 
     # Delegating accessors so the existing NornApp API keeps working.
     def apply_event(self, event: object) -> None:
@@ -597,6 +655,9 @@ class NornUIApp(App):
         self._bundled = bundled or []
         self._discovered = discovered or []
         self._initial_pipeline = initial_pipeline
+
+    async def action_quit(self) -> None:
+        await _quit_through_run_screen(self)
 
     def on_mount(self) -> None:
         if self._initial_pipeline is not None:
