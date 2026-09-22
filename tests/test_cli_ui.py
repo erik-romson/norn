@@ -134,3 +134,43 @@ class TestExistingSubcommandsUnchanged:
         parser = _build_parser()
         ns, _ = parser.parse_known_args(argv)
         assert ns.command == expected_cmd
+
+
+# ---------------------------------------------------------------------------
+# Failure-prompt rendering: external text is not console markup
+# ---------------------------------------------------------------------------
+
+def test_ask_user_continue_does_not_eat_bracketed_text(monkeypatch) -> None:
+    """A stage error containing `[c]` renders literally instead of as a style tag.
+
+    Regression: implement_features_v2's no-op guidance prints
+    "[c]ontinue accepts this step as a no-op" and Rich swallowed the `[c]`,
+    leaving "ontinue accepts ..." on screen.
+    """
+    from norn import ui
+
+    error = "ERROR: changed nothing\n[c]ontinue accepts this as a no-op. [r]etry re-checks."
+    monkeypatch.setattr(ui.console, "input", lambda _prompt: "c")
+
+    with ui.console.capture() as cap:
+        choice = ui.ask_user_continue("assert owned diff step-20", error)
+
+    out = cap.get()
+    assert choice == "c"
+    assert "[c]ontinue" in out, f"`[c]` was swallowed as markup: {out!r}"
+    assert "[r]etry re-checks" in out, f"`[r]` was swallowed as markup: {out!r}"
+
+
+def test_ask_user_continue_survives_unbalanced_markup(monkeypatch) -> None:
+    """An unbalanced closing tag in stage output must not raise MarkupError."""
+    from norn import ui
+
+    monkeypatch.setattr(ui.console, "input", lambda _prompt: "a")
+
+    with ui.console.capture() as cap:
+        choice = ui.ask_user_continue("stage [/oops]", "pytest: assert x == [/y]")
+
+    out = cap.get()
+    assert choice == "a"
+    assert "[/y]" in out
+    assert "[/oops]" in out

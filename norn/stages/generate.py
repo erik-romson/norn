@@ -14,11 +14,22 @@ from norn.stages.base import BaseStage
 from norn.templates import PromptTemplate, load_template
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from norn.profiles import SessionProfile
 
 log = logging.getLogger(__name__)
 
 _STDERR_PLACEHOLDER = "Check stderr output for details"
+
+# Sent instead of the stage prompt when a retry resumes the session a timeout
+# cut off: the task is already in the conversation, and repeating it in full
+# reads to the agent as a new request rather than "carry on".
+TIMEOUT_CONTINUE_PROMPT = (
+    "You were stopped because this task ran past its time limit. Your work so far "
+    "is in the conversation above, and every file you changed is still on disk. "
+    "Check where you got to, then continue the same task from there and finish it."
+)
 
 
 def _normalize_error_text(text: str) -> str:
@@ -218,6 +229,11 @@ class Generate(BaseStage):
         # to the correct node.  The f"stage:{stage_name}" fallback is a
         # test-only path for Generate.run() called directly without a runner.
         node_id: str = kwargs.get("node_id", f"stage:{stage_name}")
+        # Called with the session id as soon as the provider reports it, so the
+        # runner still knows the session when it cancels this stage on timeout
+        # and the StageResult carrying the id is never returned.
+        on_session_id: Callable[[str], None] | None = kwargs.get("on_session_id")
+        resume_after_timeout: bool = kwargs.get("resume_after_timeout", False)
 
         # One effective working dir: explicit stage cwd wins, falls back to run working_dir.
         effective_cwd = self.cwd or ctx.working_dir
@@ -355,6 +371,9 @@ class Generate(BaseStage):
 
         output_format: dict | None = tmpl.output_format if (tmpl and tmpl.output_format) else None
 
+        if resume_after_timeout and session_id:
+            resolved_prompt = TIMEOUT_CONTINUE_PROMPT
+
         # Build env: merge pipeline-level env and stage-level env (with secret resolution)
         merged_env: dict[str, str] = {}
         if ctx.env:
@@ -459,6 +478,8 @@ class Generate(BaseStage):
                         log.debug("[generate] Captured session_id: %s", event.session_id)
                     else:
                         usage_record.session_id = event.session_id
+                    if on_session_id is not None:
+                        on_session_id(event.session_id)
 
                 if event.structured_output is not None:
                     structured_output = event.structured_output

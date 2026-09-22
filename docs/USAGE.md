@@ -421,7 +421,23 @@ The running total in terminal output shows budget progress:
 
 On exceed:
 - `fail` — raises `BudgetExceededError` immediately
-- `ask_user` — prompts with `[c]ontinue / [a]bort`
+- `ask_user` — prompts with `[c] +50% · [d] +100% · [u] no limit · [a] abort`
+
+Continuing **raises the limit** instead of waving one stage through, so the
+prompt does not come back after every remaining stage. The new limit is
+measured from what the run has already spent, not from the old limit: at
+`$2.00` spent against a `$1.00` ceiling, `c` sets the ceiling to `$3.00`, `d`
+sets it to `$4.00`, and `u` removes it for the rest of the run. A budget that
+sets both `max_cost_usd` and `max_tokens` has both raised together.
+
+Both limits can be overridden at launch without editing the pipeline:
+
+```bash
+norn run implement_features_v2 tmp/big-plan --budget 200 --token-budget 4000000
+```
+
+The TUI launcher asks for the same two values on the arguments screen; leaving
+them blank keeps whatever the pipeline declares.
 
 ---
 

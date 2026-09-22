@@ -37,7 +37,7 @@ class TUIResponder:
         future = ctrl.create_answer_future()
         return await future
 
-    async def ask_failure(self, name: str, error: str | None) -> str:
+    async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
         from norn.run_control import RunController  # noqa: PLC0415
 
         ctrl: RunController = self._controller  # type: ignore[assignment]
@@ -72,11 +72,13 @@ class InputResponder:
         """
         raise NotImplementedError
 
-    async def ask_failure(self, name: str, error: str | None) -> str:
+    async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
         """Prompt for a stage-failure or loop-exhaustion recovery decision.
 
         Returns ``'r'`` (retry the failed stage/loop), ``'c'`` (continue past
-        the failure) or ``'a'`` (abort the run).
+        the failure) or ``'a'`` (abort the run).  When *timed_out* is set the
+        answer may also be a :data:`norn.dsl.TIMEOUT_EXTENSIONS` code: retry
+        with the timed-out stage's timeout raised.
         """
         raise NotImplementedError
 
@@ -106,10 +108,10 @@ class CLIResponder(InputResponder):
 
         return ui.ask_budget_exceeded(tracker, budget)
 
-    async def ask_failure(self, name: str, error: str | None) -> str:
+    async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
         from norn import ui  # noqa: PLC0415
 
-        return ui.ask_user_continue(name, error)
+        return ui.ask_user_continue(name, error, timed_out=timed_out)
 
     async def ask_step(
         self,
@@ -130,7 +132,7 @@ class NonInteractiveResponder(InputResponder):
         log.info("non-interactive: aborting on budget exceeded")
         return "a"
 
-    async def ask_failure(self, name: str, error: str | None) -> str:
+    async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
         log.info("non-interactive: aborting on failure of stage %r", name)
         return "a"
 

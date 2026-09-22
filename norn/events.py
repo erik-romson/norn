@@ -176,7 +176,7 @@ class WaitingInput:
     """
 
     key: EventKey
-    kind: str  # agent | budget | step | failure_recovery
+    kind: str  # agent | budget | step | failure_recovery | timeout_recovery
     prompt_excerpt: str = ""
     delivery: Delivery = field(default=Delivery.LOSSLESS, repr=False)
 

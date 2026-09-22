@@ -526,6 +526,73 @@ async def test_budget_ask_user_continue():
 
 
 @pytest.mark.asyncio
+async def test_budget_ask_user_continue_extends_instead_of_reprompting():
+    """'c' raises the limit above what was spent, so later stages run unasked."""
+    p = (
+        Pipeline("test")
+        .budget(max_cost_usd=1.00, on_exceed=OnFailure.ASK_USER)
+        .stage("s1", CostStage(cost_usd=2.00))
+        .stage("s2", CostStage(cost_usd=0.50))
+        .stage("s3", CostStage(cost_usd=0.10))
+    )
+    with mock.patch("norn.ui.ask_budget_exceeded", return_value="c") as ask:
+        ctx = await run_pipeline(p)
+    assert ctx.get("s3") == "ok"
+    assert ask.call_count == 1
+    # 2.00 spent, +50% headroom.
+    assert p.budgets[0].max_cost_usd == 3.00
+
+
+@pytest.mark.asyncio
+async def test_budget_ask_user_prompts_again_once_the_new_limit_is_hit():
+    """Extending is headroom, not a blank cheque: the next overrun asks again."""
+    p = (
+        Pipeline("test")
+        .budget(max_cost_usd=1.00, on_exceed=OnFailure.ASK_USER)
+        .stage("s1", CostStage(cost_usd=2.00))
+        .stage("s2", CostStage(cost_usd=2.00))
+    )
+    with mock.patch("norn.ui.ask_budget_exceeded", return_value="c") as ask:
+        await run_pipeline(p)
+    assert ask.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_budget_ask_user_no_limit_never_asks_again():
+    """'u' lifts the limit for the rest of the run."""
+    p = (
+        Pipeline("test")
+        .budget(max_cost_usd=1.00, on_exceed=OnFailure.ASK_USER)
+        .stage("s1", CostStage(cost_usd=2.00))
+        .stage("s2", CostStage(cost_usd=50.00))
+    )
+    with mock.patch("norn.ui.ask_budget_exceeded", return_value="u") as ask:
+        await run_pipeline(p)
+    assert ask.call_count == 1
+    assert p.budgets[0].max_cost_usd is None
+
+
+@pytest.mark.asyncio
+async def test_budget_waiting_input_carries_the_overrun_detail():
+    """The TUI modal's excerpt comes from the event, so it must say the numbers."""
+    from norn.event_sink import EventSink
+
+    sink = EventSink()
+    p = (
+        Pipeline("test")
+        .budget(max_cost_usd=1.00, on_exceed=OnFailure.ASK_USER)
+        .stage("s1", CostStage(cost_usd=2.00))
+    )
+    with mock.patch("norn.ui.ask_budget_exceeded", return_value="c"):
+        await run_pipeline(p, event_sink=sink)
+    waiting = [
+        e for e in sink.lossless_events
+        if type(e).__name__ == "WaitingInput" and e.kind == "budget"
+    ]
+    assert waiting and waiting[0].prompt_excerpt == "$2.0000 > $1.00 limit"
+
+
+@pytest.mark.asyncio
 async def test_budget_ask_user_abort():
     """on_exceed=ASK_USER raises BudgetExceededError when user chooses 'a'."""
     p = (

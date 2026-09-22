@@ -373,7 +373,8 @@ arrives (and re-openable with `a`). The choices depend on `WaitingInput.kind`:
 | kind | choices |
 | --- | --- |
 | `failure_recovery` | **Retry** (`r`) · **Continue** past (`c`) · **Abort** (`a`) |
-| `budget` | **Continue** (`c`) · **Abort** (`a`) |
+| `timeout_recovery` | **Retry** (`r`) · **2× time** (`t`) · **No timeout** (`n`) · **Continue** past (`c`) · **Abort** (`a`) |
+| `budget` | **+50%** (`c`) · **+100%** (`d`) · **No limit** (`u`) · **Abort** (`a`) — each extends the limit |
 | `step` | **Run** (`r`) · **Skip** (`s`) · **Abort** (`a`) |
 
 Each choice is a button and a single keypress; `Esc` aborts. The chosen code
@@ -388,6 +389,38 @@ recurses, keeping the agent session). `c` proceeds past the failure; `a` raises.
 `CLIResponder`/`norn run` offer the same `[r]etry [c]ontinue [a]bort` prompt, so
 CLI and TUI behave identically. Retry only happens for stages/loops whose policy
 is `ASK_USER`; `FAIL` (the default) still fails fast.
+
+**A timed-out stage can be retried with more time.** When the runner's own
+`asyncio.wait_for` cancels a stage it marks the result `details["timed_out"]`,
+emits `WaitingInput(kind="timeout_recovery")` and calls
+`ask_failure(..., timed_out=True)`. Besides `r`/`c`/`a` the answer can be a
+`norn.dsl.TIMEOUT_EXTENSIONS` code: `t` retries with the timeout doubled (it
+doubles again on each further `t`), `n` retries with no timeout. The raised
+timeout applies to a copy of the stage for this run only; the pipeline
+definition is untouched. On an exhausted loop the code raises the timeout of
+the body stage that timed out and runs another round. Every retry after a
+timeout (`r`, `t` or `n`) resumes the agent session the stage was cut off in:
+`Generate` reports the session id to the runner through the `on_session_id`
+agent kwarg as soon as the provider sends it, and the runner puts it on the
+timeout result's `usage`, where the normal session hand-off picks it up. That
+usage record carries no tokens or cost, because the provider never sent a final
+usage report for the cancelled attempt. The resumed call does not repeat the stage prompt: the runner
+passes `resume_after_timeout`, and `Generate` sends the short
+`TIMEOUT_CONTINUE_PROMPT` telling the agent to pick up where it stopped. In a
+retried loop only the stage that timed out gets it, and only if no other agent
+stage has run in the session first; otherwise it gets its own prompt. `norn.dsl.failure_choices`
+is the one home of the codes and labels for both the CLI prompt and the modal.
+
+**A budget answer raises the limit.** The three continue codes are not "let this
+one stage through" — `runner._check_budget` calls `Budget.extend` with the
+headroom from `norn.dsl.BUDGET_EXTENSIONS` (`c` +50%, `d` +100%, `u` no limit),
+measured from what the run has already spent. Without that, a run that crossed
+its ceiling asked again after every remaining stage, which is what the modal
+looked like in practice. The budget meter reads the same `Budget` object, so it
+shows the raised ceiling immediately. The `WaitingInput` carries the overrun
+numbers as `prompt_excerpt`, which the modal shows above the buttons. The
+choices are built once in `norn/dsl.py` (`budget_choices`) and used by both the
+modal and the `norn run` prompt, so the two cannot drift.
 
 ## 8. Worktree isolation (v1)
 

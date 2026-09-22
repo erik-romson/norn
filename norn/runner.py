@@ -16,7 +16,21 @@ from typing import TYPE_CHECKING
 
 from norn.alerts import AlertEvent, AlertManager, AlertMessage
 from norn.checkpoint import Checkpoint, save_checkpoint, serialise_output
-from norn.dsl import Budget, ClearContext, ContextSpec, Include, Loop, OnFailure, Parallel, Pipeline, PipelineItem, Stage
+from norn.dsl import (
+    BUDGET_EXTENSIONS,
+    TIMEOUT_EXTENSIONS,
+    Budget,
+    ClearContext,
+    ContextSpec,
+    Include,
+    Loop,
+    OnFailure,
+    Parallel,
+    Pipeline,
+    PipelineItem,
+    Stage,
+    extend_timeout,
+)
 from norn.events import (
     CallingAgent,
     ClearContextNotice,
@@ -46,7 +60,7 @@ from norn.events import (
 )
 from norn.run_control import CancelledError, RunController
 from norn.loader import load_pipeline
-from norn.models import PipelineContext, StageLogEntry, StageResult, UsageTracker
+from norn.models import PipelineContext, StageLogEntry, StageResult, UsageRecord, UsageTracker
 from norn import ui
 
 if TYPE_CHECKING:
@@ -213,13 +227,18 @@ async def _check_budget(
     ctx: PipelineContext,
     ekey: EventKey,
 ) -> None:
-    """Check all budgets against current cumulative usage. Raises or prompts on excess."""
+    """Check all budgets against current cumulative usage. Raises or prompts on excess.
+
+    An ``ASK_USER`` budget that the user chooses to continue past is *extended*
+    in place (:meth:`Budget.extend`), so the prompt does not reappear after
+    every remaining stage — the next one only comes when the new limit is hit.
+    """
     for b in budgets:
         exceeded = False
         detail = ""
         if b.max_cost_usd is not None and tracker.total_cost_usd > b.max_cost_usd:
             exceeded = True
-            detail = f"${tracker.total_cost_usd:.4f} > ${b.max_cost_usd:.2f}"
+            detail = f"${tracker.total_cost_usd:.4f} > ${b.max_cost_usd:.2f} limit"
         elif b.max_tokens is not None and tracker.total_tokens > b.max_tokens:
             exceeded = True
             detail = f"{tracker.total_tokens:,} tokens > {b.max_tokens:,} limit"
@@ -230,10 +249,16 @@ async def _check_budget(
         if b.on_exceed == OnFailure.FAIL:
             raise BudgetExceededError(f"Budget exceeded: {detail}")
         if b.on_exceed == OnFailure.ASK_USER:
-            ctx.event_sink.emit(WaitingInput(key=ekey, kind="budget"))
+            ctx.event_sink.emit(WaitingInput(key=ekey, kind="budget", prompt_excerpt=detail))
             choice = await ctx.input_responder.ask_budget(tracker, b)
-            if choice == "a":
+            if choice not in BUDGET_EXTENSIONS:
                 raise BudgetExceededError(f"Budget exceeded: {detail}")
+            raised = b.extend(
+                BUDGET_EXTENSIONS[choice],
+                cost_used=tracker.total_cost_usd,
+                tokens_used=tracker.total_tokens,
+            )
+            log.info("Budget exceeded (%s) — extended to %s", detail, raised)
 
 
 def _append_stage_log(
@@ -313,8 +338,13 @@ async def _run_stage(
     budgets: list[Budget] | None = None,
     fork_session: bool = False,
     node_id: str | None = None,
+    resume_after_timeout: bool = False,
 ) -> StageResult:
     """Run a single stage and store the result in context.
+
+    *resume_after_timeout* tells an agent stage that *session_id* is the
+    session its previous attempt timed out in, so it sends a short
+    continue prompt instead of repeating the task.
 
     *node_id* is the fully-qualified graph node id used as the event
     ``stage_id`` so the TUI graph can attribute events to the right node.
@@ -327,6 +357,15 @@ async def _run_stage(
     stage_id = node_id or f"stage:{stage.name}"
     _ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=stage_id, attempt=attempt)
     ctx.event_sink.emit(StageStarted(key=_ekey, name=stage.name, attempt=attempt))
+
+    # The agent session this attempt is running in, reported by the stage while
+    # it runs.  A timeout cancels the stage before it returns its result, and
+    # this is the only place the session survives for the retry to resume.
+    live_session_id: str | None = None
+
+    def _record_session_id(sid: str) -> None:
+        nonlocal live_session_id
+        live_session_id = sid
 
     if stage.impl.needs_agent:
         log.debug(
@@ -342,6 +381,8 @@ async def _run_stage(
             # key their CallingAgent/TurnEvent/GotReply events consistently
             # with the StageStarted/StageFinished events emitted here.
             "node_id": stage_id,
+            "on_session_id": _record_session_id,
+            "resume_after_timeout": resume_after_timeout,
         }
         mcp_tools = getattr(stage.impl, "mcp_tools", None)
         if isinstance(mcp_tools, list) and mcp_tools:
@@ -431,7 +472,17 @@ async def _run_stage(
         raise
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - start
-        result = StageResult(name=stage.name, success=False, error=f"Timed out after {stage.timeout}s")
+        result = StageResult(
+            name=stage.name,
+            success=False,
+            error=f"Timed out after {stage.timeout:g}s",
+            details={"timed_out": True},
+            # Carries only the session, so a retry resumes the conversation the
+            # agent was cut off in instead of starting over; the attempt's cost
+            # is unknown because the provider never sent its final usage.
+            usage=UsageRecord(stage_name=stage.name, session_id=live_session_id, attempt=attempt)
+            if live_session_id else None,
+        )
         ctx.results[stage.name] = result
         _append_stage_log(
             ctx,
@@ -514,8 +565,10 @@ async def _handle_failure(
     """Handle a stage failure according to the configured policy.
 
     Returns ``"continue"`` to proceed past the failure (treat it as
-    non-fatal) or ``"retry"`` to re-run the failed stage.  Raises
-    :class:`PipelineError` on ``FAIL`` policy or when the user aborts.
+    non-fatal), ``"retry"`` to re-run the failed stage, or — when the stage
+    timed out — a :data:`~norn.dsl.TIMEOUT_EXTENSIONS` code to re-run it with
+    a raised timeout.  Raises :class:`PipelineError` on ``FAIL`` policy or when
+    the user aborts.
     """
     if on_failure == OnFailure.FAIL:
         raise PipelineError(name, result)
@@ -536,15 +589,34 @@ async def _handle_failure(
         _failure_ekey = EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id, stage_id=f"stage:{name}")
         ctx.event_sink.emit(WaitingInput(
             key=_failure_ekey,
-            kind="failure_recovery",
+            kind="timeout_recovery" if _timed_out(result) else "failure_recovery",
             prompt_excerpt=result.error or "",
         ))
-        choice = await ctx.input_responder.ask_failure(name, result.error)
+        choice = await ctx.input_responder.ask_failure(name, result.error, timed_out=_timed_out(result))
         if choice == "a":
             raise PipelineError(name, result)
         if choice == "r":
             return "retry"
+        if choice in TIMEOUT_EXTENSIONS and _timed_out(result):
+            return choice
     return "continue"
+
+
+def _timed_out(result: StageResult | None) -> bool:
+    """Whether *result* is the runner's own record of a stage timeout."""
+    return result is not None and bool(result.details.get("timed_out"))
+
+
+def _resumable_timeout(result: StageResult | None) -> bool:
+    """Whether *result* timed out inside an agent session a retry can resume."""
+    return _timed_out(result) and bool(result.usage and result.usage.session_id)
+
+
+def _with_extended_timeout(stage: Stage, code: str) -> Stage:
+    """Return a copy of *stage* whose timeout is raised for a retry."""
+    timeout = extend_timeout(stage.timeout, code)
+    log.info("[%s] Retrying with timeout %s", stage.name, f"{timeout:g}s" if timeout else "none")
+    return replace(stage, timeout=timeout)
 
 
 def _save_checkpoint_state(
@@ -576,11 +648,17 @@ async def _run_loop(
     completed_stages: list[str] | None = None,
     fork_session: bool = False,
     step_mode: bool = False,
+    resume_timed_out_stage: str | None = None,
 ) -> str | None:
     """Run a do-while loop: execute all stages, retry from top on failure.
 
     Agent-backed stages (Generate) within the same loop share a session so
     the agent remembers prior errors when retrying.
+
+    *resume_timed_out_stage* names the body stage whose timeout ended the
+    previous round.  It gets the continue prompt, but only while it is still
+    the next agent call in the session; once another agent stage has spoken,
+    the conversation has moved on and the stage's own prompt is sent.
 
     Returns the final session_id used (if any), so the caller can persist it.
     """
@@ -689,7 +767,10 @@ async def _run_loop(
             result = await _run_stage(
                 stage, ctx, session_id=session_id, attempt=attempt, budgets=budgets,
                 fork_session=_fork_pending, node_id=stage_node_id,
+                resume_after_timeout=stage.name == resume_timed_out_stage,
             )
+            if stage.impl.needs_agent:
+                resume_timed_out_stage = None
             last_result = result
 
             # Capture session_id from first Generate result for reuse; update on fork
@@ -760,12 +841,21 @@ async def _run_loop(
             )
         ctx.event_sink.emit(WaitingInput(
             key=_loop_ekey,
-            kind="failure_recovery",
+            kind="timeout_recovery" if _timed_out(last_result) else "failure_recovery",
             prompt_excerpt=last_result.error or "",
         ))
-        choice = await ctx.input_responder.ask_failure(loop.name, last_result.error)
+        choice = await ctx.input_responder.ask_failure(
+            loop.name, last_result.error, timed_out=_timed_out(last_result)
+        )
         if choice == "a":
             raise RetriesExhaustedError(loop.name, last_result)
+        if choice in TIMEOUT_EXTENSIONS and _timed_out(last_result):
+            # Raise the timeout of the body stage that timed out, then retry.
+            loop = replace(loop, stages=[
+                _with_extended_timeout(s, choice) if s.name == last_result.name else s
+                for s in loop.stages
+            ])
+            choice = "r"
         if choice == "r":
             # Re-run the whole loop (a fresh round of attempts), keeping the
             # current agent session so the body still remembers prior context.
@@ -781,6 +871,7 @@ async def _run_loop(
                 completed_stages=completed_stages,
                 fork_session=False,
                 step_mode=step_mode,
+                resume_timed_out_stage=last_result.name if _resumable_timeout(last_result) else None,
             )
     if loop.on_exhaust == OnFailure.DRAFT_PR:
         ctx.event_sink.emit(LoopDraftPR(
@@ -1343,8 +1434,9 @@ async def run_pipeline(
                 # that each run gets a distinct EventKey — matching how _run_loop
                 # passes attempt= so retry keys never collide with first-run keys.
                 attempt = 1
+                stage_to_run = item
                 result = await _run_stage(
-                    item, ctx, session_id=current_session, budgets=budgets,
+                    stage_to_run, ctx, session_id=current_session, budgets=budgets,
                     fork_session=_fork_pending, attempt=attempt,
                 )
                 if result.usage and result.usage.session_id:
@@ -1366,14 +1458,17 @@ async def run_pipeline(
                         pipeline_name=pipeline.name,
                         alert_manager=alert_manager,
                     )
-                    if decision != "retry":
+                    if decision == "continue":
                         break
+                    if decision in TIMEOUT_EXTENSIONS:
+                        stage_to_run = _with_extended_timeout(stage_to_run, decision)
                     attempt += 1
                     if pipeline.hooks:
                         await _fire_hooks("pre_stage", pipeline.hooks, ctx)
                     result = await _run_stage(
-                        item, ctx, session_id=current_session, budgets=budgets,
+                        stage_to_run, ctx, session_id=current_session, budgets=budgets,
                         fork_session=_fork_pending, attempt=attempt,
+                        resume_after_timeout=_resumable_timeout(result),
                     )
                     if result.usage and result.usage.session_id:
                         if _fork_pending:

@@ -5,7 +5,7 @@ from norn.agents.base import AgentError, AgentEvent, AgentRequest, AgentUsage
 from norn.agents import registry as agent_registry
 from norn.model_labels import ModelLabelError, resolve_label
 from norn.models import PipelineContext, StageResult
-from norn.stages.generate import Generate, MODEL_MAP
+from norn.stages.generate import TIMEOUT_CONTINUE_PROMPT, Generate
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +648,31 @@ async def test_session_id_from_event(fake_provider):
     result = await gen.run(_ctx_for_fake())
     assert result.usage is not None
     assert result.usage.session_id == "sess-abc"
+
+
+@pytest.mark.asyncio
+async def test_session_id_reported_while_running(fake_provider):
+    """The runner hears the session id as it arrives, before the stage returns."""
+    fake_provider.events = [AgentEvent(session_id="sess-abc")]
+    reported: list[str] = []
+    await Generate(prompt="hi").run(_ctx_for_fake(), on_session_id=reported.append)
+    assert reported == ["sess-abc"]
+
+
+@pytest.mark.asyncio
+async def test_resume_after_timeout_sends_continue_prompt(fake_provider):
+    gen = Generate(prompt="implement the whole feature")
+    await gen.run(_ctx_for_fake(), session_id="sess-1", resume_after_timeout=True)
+    request = fake_provider.requests[0]
+    assert request.prompt == TIMEOUT_CONTINUE_PROMPT
+    assert request.session_id == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_resume_after_timeout_without_session_sends_stage_prompt(fake_provider):
+    gen = Generate(prompt="implement the whole feature")
+    await gen.run(_ctx_for_fake(), resume_after_timeout=True)
+    assert fake_provider.requests[0].prompt == "implement the whole feature"
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,10 @@ The modal dismisses with the single-character code the runner's responder
 understands:
 
 * ``failure_recovery`` → ``r`` (retry), ``c`` (continue past), ``a`` (abort)
-* ``budget``           → ``c`` (continue), ``a`` (abort)
+* ``timeout_recovery`` → the same, plus ``t``/``n`` (retry with the timeout
+  raised — see ``norn.dsl.TIMEOUT_EXTENSIONS``)
+* ``budget``           → ``c``/``d``/``u`` (continue with the limit raised by
+  that much — see ``norn.dsl.BUDGET_EXTENSIONS``), ``a`` (abort)
 * ``step``             → ``r`` (run), ``s`` (skip), ``a`` (abort)
 * anything else        → ``c`` (continue), ``a`` (abort)
 
@@ -27,16 +30,20 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Static
 
+from norn.dsl import budget_choices, failure_choices
+
 # kind -> ordered list of (choice code, button label)
 _CHOICES: dict[str, list[tuple[str, str]]] = {
-    "failure_recovery": [("r", "Retry"), ("c", "Continue"), ("a", "Abort")],
-    "budget": [("c", "Continue"), ("a", "Abort")],
+    "failure_recovery": failure_choices(),
+    "timeout_recovery": failure_choices(timed_out=True),
+    "budget": budget_choices(),
     "step": [("r", "Run"), ("s", "Skip"), ("a", "Abort")],
 }
 _DEFAULT_CHOICES: list[tuple[str, str]] = [("c", "Continue"), ("a", "Abort")]
 
 _TITLES: dict[str, str] = {
     "failure_recovery": "Stage failed",
+    "timeout_recovery": "Stage timed out",
     "budget": "Budget exceeded",
     "step": "Next stage",
     "agent": "Agent is waiting for input",
@@ -44,9 +51,21 @@ _TITLES: dict[str, str] = {
 
 _BUTTON_VARIANTS: dict[str, str] = {
     "r": "primary",
+    "t": "primary",
+    "n": "default",
     "c": "warning",
+    "d": "warning",
+    "u": "default",
     "s": "default",
     "a": "error",
+}
+
+# Shown under a budget prompt so the choices read as "how much more room",
+# not "wave this one stage through".  Kept short enough to fit the dialog at
+# its narrowest, where a longer line is clipped rather than wrapped.
+_HINTS: dict[str, str] = {
+    "budget": "Raises the limit above what this run has spent.",
+    "timeout_recovery": "Retry as before, or with the stage's timeout raised.",
 }
 
 
@@ -80,7 +99,8 @@ class InputDecisionModal(ModalScreen[str]):
         align: center middle;
     }
     InputDecisionModal #dialog {
-        width: 64;
+        width: auto;
+        min-width: 56;
         max-width: 90%;
         height: auto;
         border: thick $primary;
@@ -107,6 +127,9 @@ class InputDecisionModal(ModalScreen[str]):
     }
     InputDecisionModal Button {
         margin: 0 1;
+        /* Textual's default 16-cell minimum makes four choices need a 78-column
+           terminal; the labels here are short, so let them size themselves. */
+        min-width: 10;
     }
     """
 
@@ -128,20 +151,29 @@ class InputDecisionModal(ModalScreen[str]):
         if self._stage_name:
             title = f"{title}: {self._stage_name}"
         with Vertical(id="dialog"):
-            yield Label(title, id="title")
+            # markup=False on the title and excerpt: both carry external text
+            # (a stage name, a stage's own error output).  Textual would read a
+            # bare `[c]` in them as a style tag and swallow it, and raise
+            # MarkupError on an unbalanced `[/x]`.  The hint is ours and uses
+            # `\[` escapes deliberately, so it keeps markup on.
+            yield Label(title, id="title", markup=False)
             if self._excerpt:
-                yield Static(self._excerpt, id="excerpt")
+                yield Static(self._excerpt, id="excerpt", markup=False)
             yield Label(self._hint(), id="hint")
             with Horizontal(id="buttons"):
                 for code, label in self._choices:
                     yield Button(
-                        f"{label} [{code}]",
+                        # Escaped: Textual reads `[c]` in a label as markup and
+                        # swallows it, which hid the key codes entirely.
+                        f"{label} \\[{code}]",
                         id=f"choice-{code}",
                         variant=_BUTTON_VARIANTS.get(code, "default"),
                     )
 
     def _hint(self) -> str:
-        return "   ".join(f"[{code}] {label}" for code, label in self._choices)
+        keys = "   ".join(f"\\[{code}] {label}" for code, label in self._choices)
+        note = _HINTS.get(self._kind)
+        return f"{note}\n{keys}" if note else keys
 
     # ------------------------------------------------------------------
     # Resolution

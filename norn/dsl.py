@@ -49,6 +49,97 @@ class Budget:
     max_tokens: int | None = None
     on_exceed: OnFailure = OnFailure.FAIL
 
+    def extend(self, factor: float | None, *, cost_used: float, tokens_used: int) -> str:
+        """Raise (or lift) this budget's limits and return a human summary.
+
+        Called when the user answers a budget-exceeded prompt with an extend
+        choice instead of abort.  *factor* is the headroom to grant as a
+        fraction of what has already been spent (``0.5`` = 50% more room than
+        the run has used so far); ``None`` lifts the limits for the rest of the
+        run.  The new limit is computed from ``max(limit, used)`` so a single
+        stage that blew far past the limit still gets real headroom — without
+        that, the next stage would prompt again immediately.
+
+        Only limits that are set are changed; a cost-only budget stays
+        cost-only.
+        """
+        parts: list[str] = []
+        if self.max_cost_usd is not None:
+            if factor is None:
+                self.max_cost_usd = None
+                parts.append("cost: no limit")
+            else:
+                self.max_cost_usd = round(max(self.max_cost_usd, cost_used) * (1 + factor), 2)
+                parts.append(f"cost: ${self.max_cost_usd:.2f}")
+        if self.max_tokens is not None:
+            if factor is None:
+                self.max_tokens = None
+                parts.append("tokens: no limit")
+            else:
+                self.max_tokens = int(max(self.max_tokens, tokens_used) * (1 + factor))
+                parts.append(f"tokens: {self.max_tokens:,}")
+        return ", ".join(parts)
+
+
+# Answers to a budget-exceeded prompt that continue the run, mapped to the
+# headroom each one grants (see :meth:`Budget.extend`; ``None`` = no limit).
+# Any other answer — ``"a"`` — aborts the run.
+BUDGET_EXTENSIONS: dict[str, float | None] = {"c": 0.5, "d": 1.0, "u": None}
+
+# Labels for answers that are not an extension; the extend codes label
+# themselves with the headroom they grant, which is the whole question being
+# asked and keeps the buttons narrow enough to fit a modest terminal.
+_BUDGET_LABELS: dict[str, str] = {"u": "No limit", "a": "Abort"}
+
+
+def budget_choices() -> list[tuple[str, str]]:
+    """Return the ordered ``(code, label)`` answers to a budget prompt.
+
+    The single source of truth for both the ``norn run`` prompt
+    (:func:`norn.ui.ask_budget_exceeded`) and the TUI decision modal, so the
+    two can never drift apart.
+    """
+    choices: list[tuple[str, str]] = []
+    for code, factor in BUDGET_EXTENSIONS.items():
+        if factor is not None:
+            choices.append((code, f"+{factor * 100:.0f}%"))
+    for code, label in _BUDGET_LABELS.items():
+        choices.append((code, label))
+    return choices
+
+
+# Extra answers to a failure prompt when the stage failed by timing out: retry
+# with the timeout raised by that fraction (``None`` = no timeout). A stage that
+# timed out has usually made real progress, and retrying under the same limit
+# just burns the same wall-clock and money to time out again.
+TIMEOUT_EXTENSIONS: dict[str, float | None] = {"t": 1.0, "n": None}
+
+_FAILURE_CHOICES: list[tuple[str, str]] = [("r", "Retry"), ("c", "Continue"), ("a", "Abort")]
+
+
+def failure_choices(*, timed_out: bool = False) -> list[tuple[str, str]]:
+    """Return the ordered ``(code, label)`` answers to a failure prompt.
+
+    The single source of truth for both the ``norn run`` prompt
+    (:func:`norn.ui.ask_user_continue`) and the TUI decision modal. A stage
+    that timed out also offers the retry-with-more-time codes from
+    :data:`TIMEOUT_EXTENSIONS`.
+    """
+    if not timed_out:
+        return list(_FAILURE_CHOICES)
+    extend = [
+        (code, f"{1 + factor:g}× time" if factor is not None else "No timeout")
+        for code, factor in TIMEOUT_EXTENSIONS.items()
+    ]
+    return [_FAILURE_CHOICES[0], *extend, *_FAILURE_CHOICES[1:]]
+
+
+def extend_timeout(timeout: float | None, code: str) -> float | None:
+    """Return the timeout a retry gets for a :data:`TIMEOUT_EXTENSIONS` *code*."""
+    factor = TIMEOUT_EXTENSIONS[code]
+    if factor is None or timeout is None:
+        return None
+    return timeout * (1 + factor)
 
 
 def apply_budget_overrides(

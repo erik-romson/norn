@@ -1,6 +1,7 @@
 import pytest
 
 from norn.dsl import (
+    BUDGET_EXTENSIONS,
     Budget,
     ClearContext,
     ContextSpec,
@@ -10,6 +11,7 @@ from norn.dsl import (
     Stage,
     apply_budget_overrides,
     ask_user,
+    budget_choices,
     fail,
 )
 from norn.stages.read_file import ReadFile
@@ -270,6 +272,53 @@ def test_derive_agent_provider_is_independent():
     derived.agent_provider("claude-code")
     assert base.agent_provider_name == "opencode"
     assert derived.agent_provider_name == "claude-code"
+
+
+# ---------------------------------------------------------------------------
+# Budget extension and launch-time overrides
+# ---------------------------------------------------------------------------
+
+
+def test_budget_extend_grants_headroom_above_what_was_spent():
+    """The new limit is measured from actual spend, not from the old limit.
+
+    A single stage can blow far past the limit; extending from the old limit
+    would leave the run over budget again and prompt on the very next stage.
+    """
+    b = Budget(max_cost_usd=30.0)
+    summary = b.extend(0.5, cost_used=80.0, tokens_used=0)
+    assert b.max_cost_usd == 120.0
+    assert summary == "cost: $120.00"
+
+
+def test_budget_extend_uses_the_limit_when_spend_is_below_it():
+    b = Budget(max_cost_usd=30.0)
+    b.extend(1.0, cost_used=10.0, tokens_used=0)
+    assert b.max_cost_usd == 60.0
+
+
+def test_budget_extend_touches_only_the_limits_that_are_set():
+    b = Budget(max_tokens=100_000)
+    summary = b.extend(0.5, cost_used=5.0, tokens_used=200_000)
+    assert b.max_cost_usd is None
+    assert b.max_tokens == 300_000
+    assert summary == "tokens: 300,000"
+
+
+def test_budget_extend_none_lifts_every_limit():
+    b = Budget(max_cost_usd=30.0, max_tokens=100)
+    summary = b.extend(None, cost_used=80.0, tokens_used=500)
+    assert b.max_cost_usd is None
+    assert b.max_tokens is None
+    assert summary == "cost: no limit, tokens: no limit"
+
+
+def test_budget_choices_codes_match_the_extension_table():
+    codes = [code for code, _ in budget_choices()]
+    assert codes == ["c", "d", "u", "a"]
+    assert set(BUDGET_EXTENSIONS) == {"c", "d", "u"}  # "a" aborts, never extends
+
+
 def test_apply_budget_overrides_replaces_declared_limits():
     p = Pipeline("test").budget(max_cost_usd=30.0, max_tokens=500_000, on_exceed=ask_user)
     apply_budget_overrides(p, max_cost_usd=200.0)

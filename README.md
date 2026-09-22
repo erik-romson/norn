@@ -110,6 +110,20 @@ A pipeline's `.budget(...)` limit is checked after every stage. When the limit i
 an `ask_user` one, crossing it stops the run and asks:
 
 ```
+⚠ Budget exceeded: $31.2043 exceeds limit $30.00
+  [c] +50%   [d] +100%   [u] No limit   [a] Abort
+```
+
+Continuing **raises the limit** rather than waving one stage through, measured
+from what the run has already spent — so the prompt does not reappear after
+every remaining stage. `u` drops the limit for the rest of the run; `a` aborts
+with `BudgetExceededError`.
+
+Set the ceiling before the run instead of negotiating with it mid-run: pass
+`--budget`/`--token-budget` to `norn run`, fill in the **budget** and
+**token_budget** fields on the TUI launcher's arguments screen (blank keeps the
+pipeline's own limit), or — for pipelines that declare them — use their
+`--arg budget=` knob.
 
 ### plan_with_review
 

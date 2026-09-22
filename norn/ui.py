@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from norn.dsl import Budget, ClearContext, Include, Loop, Parallel, Pipeline, Stage
+from norn.dsl import Budget, ClearContext, Include, Loop, Parallel, Pipeline, Stage, budget_choices, failure_choices
 from norn.models import PipelineContext, UsageTracker
 
 if TYPE_CHECKING:
@@ -86,40 +87,56 @@ def print_running_total(tracker: UsageTracker, budgets: list[Budget] | None = No
 
 
 def ask_budget_exceeded(tracker: UsageTracker, budget: Budget) -> str:
-    """Interactive budget-exceeded prompt. Returns 'c' (continue) or 'a' (abort)."""
+    """Interactive budget-exceeded prompt.
+
+    Returns an extend code from ``norn.dsl.BUDGET_EXTENSIONS`` (the run
+    continues with a raised limit) or ``'a'`` (abort). Continuing raises the
+    limit rather than waving the run past it once, so the prompt does not come
+    back after every remaining stage.
+    """
     if budget.max_cost_usd is not None:
         msg = f"${tracker.total_cost_usd:.4f} exceeds limit ${budget.max_cost_usd:.2f}"
     else:
         msg = f"{tracker.total_tokens:,} tokens exceeds limit {budget.max_tokens:,}"
+    choices = budget_choices()
+    codes = [code for code, _ in choices]
     console.print(f"\n  [bold yellow]⚠[/bold yellow] [yellow]Budget exceeded: {msg}[/yellow]")
+    console.print("  [dim]Continuing raises the limit above what this run has already spent.[/dim]")
     console.print()
-    console.print("  [bold]\\[c]ontinue  \\[a]bort[/bold]")
+    console.print("  [bold]" + "  ".join(f"\\[{code}] {label}" for code, label in choices) + "[/bold]")
     while True:
         choice = console.input("  > ").strip().lower()
-        if choice in ("c", "a"):
+        if choice in codes:
             return choice
-        console.print("  [dim]Please enter 'c' or 'a'[/dim]")
+        console.print(f"  [dim]Please enter one of: {', '.join(codes)}[/dim]")
 
 
-def ask_user_continue(name: str, error: str | None) -> str:
+def ask_user_continue(name: str, error: str | None, *, timed_out: bool = False) -> str:
     """Interactive failure recovery.
 
     Returns 'r' (retry the failed stage/loop), 'c' (continue past the
-    failure) or 'a' (abort the run).
+    failure) or 'a' (abort the run).  A stage that *timed_out* is also offered
+    the ``norn.dsl.TIMEOUT_EXTENSIONS`` codes, which retry with more time.
     """
-    console.print(f"\n  [bold red]✗[/bold red] [red]{name} failed[/red]")
+    # escape(): a stage's own output is external text, not console markup.
+    # Rich reads a bare `[c]` as a style tag and swallows it — which hid the
+    # key codes in this pipeline's own "[c]ontinue accepts..." guidance — and
+    # an unbalanced `[/x]` raises MarkupError, taking the prompt down with it.
+    console.print(f"\n  [bold red]✗[/bold red] [red]{escape(name)} failed[/red]")
     if error:
         lines = mask(error).strip().splitlines()
         tail = lines[-8:] if len(lines) > 8 else lines
         for line in tail:
-            console.print(f"    [dim]{line}[/dim]")
+            console.print(f"    [dim]{escape(line)}[/dim]")
     console.print()
-    console.print("  [bold]\\[r]etry  \\[c]ontinue  \\[a]bort[/bold]")
+    choices = failure_choices(timed_out=timed_out)
+    codes = [code for code, _ in choices]
+    console.print("  [bold]" + "  ".join(f"\\[{code}] {label}" for code, label in choices) + "[/bold]")
     while True:
         choice = console.input("  > ").strip().lower()
-        if choice in ("r", "c", "a"):
+        if choice in codes:
             return choice
-        console.print("  [dim]Please enter 'r', 'c', or 'a'[/dim]")
+        console.print(f"  [dim]Please enter one of: {', '.join(codes)}[/dim]")
 
 
 def ask_yes_no(question: str) -> bool:

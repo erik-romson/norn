@@ -6,6 +6,8 @@ exercised without blocking on a real terminal.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import unittest.mock as mock
 
@@ -75,7 +77,7 @@ class FakeResponder(InputResponder):
         self.calls.append(("budget",))
         return self._budget_choice
 
-    async def ask_failure(self, name: str, error: str | None) -> str:
+    async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
         self.calls.append(("failure", name))
         return self._failure_choice
 
@@ -187,6 +189,188 @@ async def test_failure_recovery_fake_responder_aborts():
         await run_pipeline(p, event_sink=sink, input_responder=responder)
     assert exc_info.value.stage_name == "s1"
     assert responder.calls == [("failure", "s1")]
+
+
+class _SlowOnceStage(BaseStage):
+    """Takes *delay* seconds; records how many times it ran."""
+
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+        self.runs = 0
+
+    async def run(self, ctx: PipelineContext) -> StageResult:
+        self.runs += 1
+        await asyncio.sleep(self._delay)
+        return StageResult(name="", success=True, output="done")
+
+
+class _ScriptedResponder(FakeResponder):
+    """Answers failure prompts from a list and records ``timed_out``."""
+
+    def __init__(self, answers: list[str]) -> None:
+        super().__init__()
+        self._answers = list(answers)
+        self.timed_out_flags: list[bool] = []
+
+    async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
+        self.timed_out_flags.append(timed_out)
+        return self._answers.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_timeout_prompt_is_marked_timed_out():
+    """A stage timeout emits kind='timeout_recovery' and tells the responder."""
+    responder = _ScriptedResponder(["c"])
+    sink = EventSink()
+    p = Pipeline("t").stage("slow", _SlowOnceStage(delay=1.0), timeout=0.05, on_failure=OnFailure.ASK_USER)
+    await run_pipeline(p, event_sink=sink, input_responder=responder)
+    assert [w.kind for w in _waiting_events(sink)] == ["timeout_recovery"]
+    assert responder.timed_out_flags == [True]
+
+
+@pytest.mark.asyncio
+async def test_plain_failure_prompt_is_not_timed_out():
+    responder = _ScriptedResponder(["c"])
+    p = Pipeline("t").stage("s1", _FailStage(), on_failure=OnFailure.ASK_USER)
+    await run_pipeline(p, input_responder=responder)
+    assert responder.timed_out_flags == [False]
+
+
+@pytest.mark.asyncio
+async def test_retry_with_extended_timeout_lets_stage_finish():
+    """'t' doubles the timeout on each retry until the stage fits."""
+    stage = _SlowOnceStage(delay=0.3)
+    responder = _ScriptedResponder(["t", "t", "t"])
+    p = Pipeline("t").stage("slow", stage, timeout=0.1, on_failure=OnFailure.ASK_USER)
+    ctx = await run_pipeline(p, input_responder=responder)
+    # 0.1s and 0.2s time out; 0.4s is enough.
+    assert ctx.get("slow") == "done"
+    assert stage.runs == 3
+    assert responder.timed_out_flags == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_retry_without_timeout_lets_stage_finish():
+    stage = _SlowOnceStage(delay=0.3)
+    responder = _ScriptedResponder(["n"])
+    p = Pipeline("t").stage("slow", stage, timeout=0.05, on_failure=OnFailure.ASK_USER)
+    ctx = await run_pipeline(p, input_responder=responder)
+    assert ctx.get("slow") == "done"
+    assert p.items[0].timeout == 0.05  # the pipeline definition is untouched
+
+
+@pytest.mark.asyncio
+async def test_plain_retry_keeps_the_timeout():
+    stage = _SlowOnceStage(delay=1.0)
+    responder = _ScriptedResponder(["r", "a"])
+    p = Pipeline("t").stage("slow", stage, timeout=0.05, on_failure=OnFailure.ASK_USER)
+    with pytest.raises(PipelineError):
+        await run_pipeline(p, input_responder=responder)
+    assert stage.runs == 2
+
+
+class _SessionAgentStage(BaseStage):
+    """Agent stage that starts session 'sess-1' and hangs on its first run only."""
+
+    needs_agent = True
+
+    def __init__(self, hang: float) -> None:
+        self._hang = hang
+        self.sessions: list[str | None] = []
+        self.resumes: list[bool] = []
+
+    async def run(self, ctx: PipelineContext, **kwargs) -> StageResult:
+        self.sessions.append(kwargs.get("session_id"))
+        self.resumes.append(kwargs.get("resume_after_timeout"))
+        if len(self.sessions) == 1:
+            kwargs["on_session_id"]("sess-1")
+            await asyncio.sleep(self._hang)
+        return StageResult(name="", success=True, output="done")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["r", "t", "n"])
+async def test_timeout_retry_resumes_the_cut_off_session(answer):
+    stage = _SessionAgentStage(hang=1.0)
+    responder = _ScriptedResponder([answer])
+    p = Pipeline("t").stage("agent", stage, timeout=0.05, on_failure=OnFailure.ASK_USER)
+    ctx = await run_pipeline(p, input_responder=responder)
+    assert ctx.get("agent") == "done"
+    assert stage.sessions == [None, "sess-1"]
+    assert stage.resumes == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_loop_retry_resumes_the_cut_off_session():
+    stage = _SessionAgentStage(hang=1.0)
+    responder = _ScriptedResponder(["t"])
+    p = Pipeline("t").loop(
+        "lp",
+        max_retries=1,
+        on_exhaust=OnFailure.ASK_USER,
+        stages=[Stage("agent", stage, timeout=0.05)],
+    )
+    await run_pipeline(p, input_responder=responder)
+    assert stage.sessions == [None, "sess-1"]
+    assert stage.resumes == [False, True]
+
+
+class _AgentProbeStage(BaseStage):
+    needs_agent = True
+
+    def __init__(self) -> None:
+        self.resumes: list[bool] = []
+
+    async def run(self, ctx: PipelineContext, **kwargs) -> StageResult:
+        self.resumes.append(kwargs.get("resume_after_timeout"))
+        return StageResult(name="", success=True)
+
+
+@pytest.mark.asyncio
+async def test_loop_continue_prompt_skipped_once_another_agent_spoke():
+    """An earlier agent stage in the retried round moves the conversation on."""
+    first = _AgentProbeStage()
+    slow = _SessionAgentStage(hang=1.0)
+    responder = _ScriptedResponder(["n"])
+    p = Pipeline("t").loop(
+        "lp",
+        max_retries=1,
+        on_exhaust=OnFailure.ASK_USER,
+        stages=[Stage("first", first), Stage("agent", slow, timeout=0.05)],
+    )
+    await run_pipeline(p, input_responder=responder)
+    assert first.resumes == [False, False]
+    assert slow.resumes == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_plain_failure_sends_the_stage_prompt():
+    responder = _ScriptedResponder(["r"])
+
+    class _FailOnce(_AgentProbeStage):
+        async def run(self, ctx, **kwargs):
+            await super().run(ctx, **kwargs)
+            return StageResult(name="", success=len(self.resumes) > 1, error="boom")
+
+    stage = _FailOnce()
+    p = Pipeline("t").stage("agent", stage, on_failure=OnFailure.ASK_USER)
+    await run_pipeline(p, input_responder=responder)
+    assert stage.resumes == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_loop_retry_extends_timed_out_stage():
+    stage = _SlowOnceStage(delay=0.3)
+    responder = _ScriptedResponder(["n"])
+    p = Pipeline("t").loop(
+        "lp",
+        max_retries=1,
+        on_exhaust=OnFailure.ASK_USER,
+        stages=[Stage("slow", stage, timeout=0.05)],
+    )
+    ctx = await run_pipeline(p, input_responder=responder)
+    assert ctx.get("slow") == "done"
+    assert responder.timed_out_flags == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +503,7 @@ async def test_cli_responder_failure_delegates_to_ui(monkeypatch):
     """CLIResponder.ask_failure() drives the same outcome as patching norn.ui."""
     import norn.ui as ui_mod
 
-    monkeypatch.setattr(ui_mod, "ask_user_continue", lambda name, error: "c")
+    monkeypatch.setattr(ui_mod, "ask_user_continue", lambda name, error, timed_out=False: "c")
     p = Pipeline("t").stage("s1", _FailStage(), on_failure=OnFailure.ASK_USER)
     ctx = await run_pipeline(p)
     # Stage failed but user continued — result stored in ctx

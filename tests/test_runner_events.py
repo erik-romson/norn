@@ -545,7 +545,7 @@ async def test_user_driven_retry_increments_attempt(fake_provider):
         def __init__(self) -> None:
             self._calls = 0
 
-        async def ask_failure(self, name: str, error: str | None) -> str:
+        async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
             self._calls += 1
             # First failure → retry; subsequent failures → continue.
             return "r" if self._calls == 1 else "c"
