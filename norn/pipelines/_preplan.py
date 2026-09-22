@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 # Flags that consume the following token as their value.
-_VALUE_FLAGS = {"--arg", "--skip", "--org", "--agent-provider"}
+_VALUE_FLAGS = {"--arg", "--skip", "--org", "--agent-provider", "--budget", "--token-budget"}
 
 
 def parse_arg_flags(argv: list[str]) -> dict[str, str]:
@@ -30,7 +30,7 @@ def resolve_preplan(argv: list[str], repo_dir: str) -> str:
     """Return the absolute path to the pre-plan file named in *argv*.
 
     Filters *argv* rather than indexing it so that both the ``norn run`` shape
-    (``["run", "plan_with_review", "tmp/x-preplan.md", "--arg", "model=sonnet"]``)
+    (``["run", "plan_with_review", "tmp/x-preplan.md", "--arg", "model=standard"]``)
     and the TUI shape (``["tmp/x-preplan.md"]``) work correctly.
 
     Raises ``ValueError`` (never ``SystemExit``) when zero or multiple candidates

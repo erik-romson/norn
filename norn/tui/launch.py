@@ -14,6 +14,7 @@ from typing import Any
 
 from norn.agents import resolve_agent_provider
 from norn.catalog import _extract_metadata, get_pipeline_info, load_bundled_pipeline
+from norn.dsl import apply_budget_overrides
 from norn.graph import build_graph
 from norn.loader import load_pipeline as _load_pipeline_from_file
 from norn.state import (
@@ -22,6 +23,15 @@ from norn.state import (
     _primary_state_key,
     publish_state_key,
 )
+
+
+# Param keys the launcher's args screen uses for launch-time budget limits.
+# Defined here (not in the textual-only args screen) because this module is the
+# one that consumes them, and it must stay importable without textual.  The
+# names are reserved (double-underscored) so they can never be confused with a
+# pipeline's own declared arg of the same idea.
+BUDGET_PARAM = "__budget__"
+TOKEN_BUDGET_PARAM = "__token_budget__"
 
 
 def _bundled_dir() -> Path:
@@ -91,6 +101,26 @@ def load_pipeline_with_args(pipeline_ref: str, *, is_bundled: bool, params: dict
         sys.argv = saved
 
 
+def apply_budget_params(pipeline_obj: Any, params: dict[str, str]) -> dict[str, str]:
+    """Apply the args screen's budget overrides and return the remaining params.
+
+    The launcher collects ``budget`` / ``token_budget`` (see
+    :mod:`norn.tui.args_prompt`) alongside a pipeline's declared args.  They are
+    launch-time limits, not pipeline parameters, so they are consumed here
+    rather than travelling on into ``{param.*}`` substitution.
+    """
+    cost = params.get(BUDGET_PARAM)
+    tokens = params.get(TOKEN_BUDGET_PARAM)
+    if cost is None and tokens is None:
+        return params
+    apply_budget_overrides(
+        pipeline_obj,
+        max_cost_usd=float(cost) if cost else None,
+        max_tokens=int(float(tokens)) if tokens else None,
+    )
+    return {k: v for k, v in params.items() if k not in (BUDGET_PARAM, TOKEN_BUDGET_PARAM)}
+
+
 def build_run_setup(
     pipeline_obj: Any, params: dict[str, str], *, ref: str
 ) -> tuple[Any, Any, dict[str, Any]]:
@@ -100,7 +130,11 @@ def build_run_setup(
     history view, or direct mode — writes history and checkpoints to the same
     state key that ``norn run`` and ``norn history`` use for *ref*.  The resume
     branch in ``_start_run`` only needs to add ``resume_checkpoint`` on top.
+
+    Budget overrides typed on the args screen are applied to *pipeline_obj*
+    here, before the graph and the run screen's budget meter are built from it.
     """
+    params = apply_budget_params(pipeline_obj, params)
     graph = build_graph(pipeline_obj)
     budget = (pipeline_obj.budgets or [None])[0]
 

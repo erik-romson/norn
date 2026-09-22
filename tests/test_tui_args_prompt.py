@@ -18,6 +18,7 @@ from norn.tui.args_prompt import (
     is_path_arg,
     run_fzf,
 )
+from norn.tui.launch import BUDGET_PARAM, TOKEN_BUDGET_PARAM
 from textual.widgets import Input
 
 
@@ -177,3 +178,71 @@ async def test_args_prompt_multiple_args() -> None:
         await pilot.press("ctrl+s")
         await pilot.pause()
     assert app.params == {"args": "do the thing", "issue": "CBS-123"}
+
+
+# ---------------------------------------------------------------------------
+# Budget fields (launch-time limits, collected next to the declared args)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_args_prompt_collects_budget_overrides() -> None:
+    """Filled budget fields come back under the budget param keys."""
+    app = ArgsPromptApp("implement_features_v2", {"args": "Path to directory of step files"})
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = app.screen
+        screen.query_one("#arg-args", Input).value = "tmp/big-plan"
+        screen.query_one("#budget-usd", Input).value = "200"
+        screen.query_one("#budget-tokens", Input).value = "4000000"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+    assert app.params == {
+        "args": "tmp/big-plan",
+        BUDGET_PARAM: "200",
+        TOKEN_BUDGET_PARAM: "4000000",
+    }
+
+
+@pytest.mark.asyncio
+async def test_args_prompt_blank_budget_is_omitted() -> None:
+    """Leaving the budget blank keeps the pipeline's own limit — no param at all."""
+    app = ArgsPromptApp("p", {"args": "Path to a folder"})
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#arg-args", Input).value = "some/dir"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+    assert app.params == {"args": "some/dir"}
+
+
+@pytest.mark.asyncio
+async def test_args_prompt_rejects_a_non_numeric_budget() -> None:
+    """A bad budget keeps the form open rather than being silently dropped."""
+    app = ArgsPromptApp("p", {"args": "Path to a folder"})
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = app.screen
+        screen.query_one("#arg-args", Input).value = "some/dir"
+        screen.query_one("#budget-usd", Input).value = "lots"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, ArgsPromptScreen)  # still open
+        screen.query_one("#budget-usd", Input).value = "40"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+    assert app.params == {"args": "some/dir", BUDGET_PARAM: "40"}
+
+
+@pytest.mark.asyncio
+async def test_args_prompt_declared_arg_wins_over_the_budget_field() -> None:
+    """A pipeline that declares its own `budget` arg owns the question."""
+    app = ArgsPromptApp("p", {"budget": "How much to spend"})
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = app.screen
+        assert not screen.query("#budget-usd")  # no second, competing field
+        screen.query_one("#arg-budget", Input).value = "17"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+    assert app.params == {"budget": "17"}

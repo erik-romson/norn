@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 # Flags that consume the following token as their value (mirrors _preplan.py).
-_VALUE_FLAGS = {"--arg", "--skip", "--org", "--agent-provider"}
+_VALUE_FLAGS = {"--arg", "--skip", "--org", "--agent-provider", "--budget", "--token-budget"}
 
 # Regex that matches a Jira issue key, e.g. CBS-2249 or PROJ-1.
 _KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")

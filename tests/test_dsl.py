@@ -1,6 +1,17 @@
 import pytest
 
-from norn.dsl import ClearContext, ContextSpec, Loop, OnFailure, Pipeline, Stage, ask_user, fail
+from norn.dsl import (
+    Budget,
+    ClearContext,
+    ContextSpec,
+    Loop,
+    OnFailure,
+    Pipeline,
+    Stage,
+    apply_budget_overrides,
+    ask_user,
+    fail,
+)
 from norn.stages.read_file import ReadFile
 from norn.stages.run_command import RunCommand
 
@@ -259,3 +270,24 @@ def test_derive_agent_provider_is_independent():
     derived.agent_provider("claude-code")
     assert base.agent_provider_name == "opencode"
     assert derived.agent_provider_name == "claude-code"
+def test_apply_budget_overrides_replaces_declared_limits():
+    p = Pipeline("test").budget(max_cost_usd=30.0, max_tokens=500_000, on_exceed=ask_user)
+    apply_budget_overrides(p, max_cost_usd=200.0)
+    assert p.budgets[0].max_cost_usd == 200.0
+    assert p.budgets[0].max_tokens == 500_000  # untouched dimension survives
+    assert p.budgets[0].on_exceed == OnFailure.ASK_USER
+
+
+def test_apply_budget_overrides_adds_a_budget_when_the_pipeline_has_none():
+    p = Pipeline("test")
+    apply_budget_overrides(p, max_cost_usd=50.0)
+    assert len(p.budgets) == 1
+    assert p.budgets[0].max_cost_usd == 50.0
+    # A limit supplied at launch pauses the run; it does not kill it.
+    assert p.budgets[0].on_exceed == OnFailure.ASK_USER
+
+
+def test_apply_budget_overrides_without_values_is_a_noop():
+    p = Pipeline("test").budget(max_cost_usd=30.0)
+    apply_budget_overrides(p)
+    assert p.budgets[0].max_cost_usd == 30.0

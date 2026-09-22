@@ -99,6 +99,16 @@ uv run python -m norn run pipeline.py --skip "test python"
 
 # Show pipeline structure without executing
 uv run python -m norn run pipeline.py --dry-run
+
+# Raise the run's ceilings before it starts (any pipeline, overrides its own)
+uv run python -m norn run pipeline.py --budget 200 --token-budget 4000000
+```
+
+### Budgets
+
+A pipeline's `.budget(...)` limit is checked after every stage. When the limit is
+an `ask_user` one, crossing it stops the run and asks:
+
 ```
 
 ### plan_with_review
@@ -145,6 +155,9 @@ positional args):
 --arg codex_model=gpt-5-codex # model passed to `codex exec -m`
 --arg budget=10               # cost ceiling in USD before the run pauses
 ```
+
+(`--budget`/`--token-budget` and the TUI launcher's budget fields set the same
+ceilings without the pipeline knob, and work under `norn ui`.)
 
 `codex` must be on `PATH` (`brew install codex`) — the `preflight` stage checks
 this before any tokens are spent. The split stage uses the `split-plan` skill:

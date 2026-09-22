@@ -377,6 +377,33 @@ def test_build_run_setup_sets_config_path_for_file_ref(tmp_path: Path) -> None:
     assert run_kwargs["config_path"] == history_config_key(ref)
 
 
+def test_build_run_setup_applies_budget_params_and_drops_them() -> None:
+    """Budget fields from the args screen become limits, not pipeline params."""
+    from norn.tui.launch import build_run_setup
+
+    from norn.tui.launch import BUDGET_PARAM, TOKEN_BUDGET_PARAM
+
+    pipeline = Pipeline("mypipe").budget(max_cost_usd=30.0, max_tokens=500_000).stage("s", _NoOp())
+    params = {"args": "tmp/plan", BUDGET_PARAM: "200", TOKEN_BUDGET_PARAM: "4000000"}
+    _, budget, run_kwargs = build_run_setup(pipeline, params, ref="hello")
+
+    assert budget.max_cost_usd == 200.0
+    assert budget.max_tokens == 4_000_000
+    # The meter and the runner must see the same object.
+    assert budget is pipeline.budgets[0]
+    assert run_kwargs["params"] == {"args": "tmp/plan"}
+
+
+def test_build_run_setup_without_budget_params_keeps_the_pipeline_limit() -> None:
+    """Blank budget fields are absent from params, so the pipeline's own limit stands."""
+    from norn.tui.launch import build_run_setup
+
+    pipeline = Pipeline("mypipe").budget(max_cost_usd=30.0).stage("s", _NoOp())
+    _, budget, run_kwargs = build_run_setup(pipeline, {"args": "tmp/plan"}, ref="hello")
+    assert budget.max_cost_usd == 30.0
+    assert run_kwargs["params"] == {"args": "tmp/plan"}
+
+
 def test_build_run_setup_does_not_set_resume_checkpoint() -> None:
     """build_run_setup never injects resume_checkpoint — that is the resume branch's job."""
     from norn.tui.launch import build_run_setup

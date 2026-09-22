@@ -50,6 +50,34 @@ class Budget:
     on_exceed: OnFailure = OnFailure.FAIL
 
 
+
+def apply_budget_overrides(
+    pipeline: Pipeline,
+    *,
+    max_cost_usd: float | None = None,
+    max_tokens: int | None = None,
+) -> None:
+    """Override a loaded pipeline's budget limits with start-of-run values.
+
+    Backs ``norn run --budget/--token-budget`` and the TUI launcher's budget
+    fields: the pipeline's own limit is the default, and a caller who knows the
+    task is a big one raises it before the run starts.  Each given limit
+    replaces that dimension on every budget the pipeline declares; a pipeline
+    with no budget at all gets one that asks rather than fails, since a limit
+    supplied at launch is a checkpoint, not a kill switch.
+    """
+    if max_cost_usd is None and max_tokens is None:
+        return
+    if not pipeline.budgets:
+        pipeline.budget(max_cost_usd=max_cost_usd, max_tokens=max_tokens, on_exceed=OnFailure.ASK_USER)
+        return
+    for b in pipeline.budgets:
+        if max_cost_usd is not None:
+            b.max_cost_usd = max_cost_usd
+        if max_tokens is not None:
+            b.max_tokens = max_tokens
+
+
 class ClearContext:
     """Marker that tells the runner to discard the current agent session.
 

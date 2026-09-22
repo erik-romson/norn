@@ -12,7 +12,7 @@ from norn.alerts import AlertManager
 from norn.catalog import get_pipeline_info, list_pipelines, load_bundled_pipeline
 from norn.envfile import apply_env_files
 from norn.checkpoint import Checkpoint, load_checkpoint
-from norn.dsl import Pipeline
+from norn.dsl import Pipeline, apply_budget_overrides
 from norn.history import load_history
 from norn.loader import (
     find_org_for_project,
@@ -187,6 +187,21 @@ def main() -> None:
         "--non-interactive",
         action="store_true",
         help="abort on every prompt; for child processes",
+    )
+    run_parser.add_argument(
+        "--budget",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Cost ceiling for this run, overriding the pipeline's own limit",
+    )
+    run_parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        dest="token_budget",
+        help="Token ceiling for this run, overriding the pipeline's own limit",
     )
     run_parser.add_argument(
         "--evaluate",
@@ -671,6 +686,12 @@ def main() -> None:
         pipeline = _load_pipeline(args.config)
         config_path_for_checkpoint = _primary_state_key(args.config)
         pipeline_source = str(Path(args.config).resolve())
+
+    apply_budget_overrides(
+        pipeline,
+        max_cost_usd=args.budget,
+        max_tokens=args.token_budget,
+    )
 
     if args.dry_run:
         from norn.ui import print_dry_run

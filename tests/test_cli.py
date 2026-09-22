@@ -441,6 +441,41 @@ def test_non_interactive_passes_responder_to_run_pipeline():
     assert isinstance(call_kwargs["input_responder"], NonInteractiveResponder)
 
 
+# --- --budget / --token-budget flags ---
+
+
+def test_budget_flags_override_the_pipeline_limit():
+    """--budget/--token-budget raise the loaded pipeline's limits before the run."""
+    mock_run = AsyncMock(return_value=None)
+    with patch("norn.cli.run_pipeline", mock_run):
+        with patch(
+            "sys.argv",
+            ["norn", "run", "hello", "--budget", "250", "--token-budget", "4000000"],
+        ):
+            main()
+
+    pipeline = mock_run.call_args.args[0]
+    assert pipeline.budgets[0].max_cost_usd == 250.0
+    assert pipeline.budgets[0].max_tokens == 4_000_000
+
+
+def test_without_budget_flags_the_pipeline_keeps_its_own_limits():
+    """No flags means no budget is invented for a pipeline that declares none."""
+    import importlib
+
+    import norn.pipelines.hello
+
+    # A bundled pipeline object is module-level and lives as long as the
+    # process; reload it so an earlier test's override cannot leak in here.
+    importlib.reload(norn.pipelines.hello)
+    mock_run = AsyncMock(return_value=None)
+    with patch("norn.cli.run_pipeline", mock_run):
+        with patch("sys.argv", ["norn", "run", "hello"]):
+            main()
+
+    assert mock_run.call_args.args[0].budgets == []
+
+
 def test_step_and_non_interactive_are_mutually_exclusive():
     """--step --non-interactive must exit non-zero."""
     with patch("sys.argv", ["norn", "run", "hello", "--step", "--non-interactive"]):

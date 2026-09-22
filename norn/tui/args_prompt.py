@@ -7,6 +7,11 @@ files).  This module renders one input per declared arg and, for args whose
 description looks like a filesystem path, offers an ``fzf`` picker
 (``ctrl+o``) so the user can fuzzy-find a file or folder instead of typing it.
 
+The screen also collects the run's cost and token ceilings (:data:`BUDGET_PARAM`
+and :data:`TOKEN_BUDGET_PARAM`).  Both are optional — blank keeps whatever the
+pipeline declares — and exist so a run known to be a big one starts with room
+instead of stopping at the pipeline's default a third of the way through.
+
 This module imports textual and must only be imported lazily from within
 ``norn/tui/`` (never at core ``norn.*`` import time).  The pure helpers
 (:func:`is_path_arg`, :func:`run_fzf`) are import-safe and unit-tested
@@ -23,6 +28,27 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Label, Static
+
+# The param keys carrying these values back to the caller live in `launch.py`
+# (textual-free), which turns them into `Budget` limits for the run.
+from norn.tui.launch import BUDGET_PARAM, TOKEN_BUDGET_PARAM
+
+_BUDGET_FIELDS: dict[str, tuple[str, str, str, str]] = {
+    # param key -> (name a pipeline could declare for the same idea, input id,
+    #               label, placeholder)
+    BUDGET_PARAM: (
+        "budget",
+        "budget-usd",
+        "budget: cost ceiling in USD before the run pauses",
+        "blank = the pipeline's own limit",
+    ),
+    TOKEN_BUDGET_PARAM: (
+        "token_budget",
+        "budget-tokens",
+        "token_budget: token ceiling before the run pauses",
+        "blank = the pipeline's own limit",
+    ),
+}
 
 # Keywords in an arg's description that mark it as a filesystem path.
 _PATH_HINTS = ("path", "file", "folder", "directory", "dir")
@@ -102,6 +128,15 @@ def run_fzf(start_dir: str = ".", *, dirs_only: bool = False) -> str | None:
     return out or None
 
 
+def _is_number(raw: str) -> bool:
+    """Return whether *raw* parses as a number (used to validate budget input)."""
+    try:
+        float(raw)
+    except ValueError:
+        return False
+    return True
+
+
 def _input_id(name: str) -> str:
     """Map an arg name to a CSS-safe widget id."""
     return "arg-" + re.sub(r"\W", "_", name)
@@ -144,6 +179,13 @@ class ArgsPromptScreen(Screen):
         self._args_meta = dict(args_meta)
         self._id_to_name: dict[str, str] = {_input_id(n): n for n in self._args_meta}
         self._path_args = {n for n, d in self._args_meta.items() if is_path_arg(d)}
+        # A pipeline that declares an arg of the same name owns that name; the
+        # launch-time override field is dropped rather than shadowing it.
+        self._budget_fields = {
+            key: field
+            for key, field in _BUDGET_FIELDS.items()
+            if field[0] not in self._args_meta
+        }
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -153,6 +195,9 @@ class ArgsPromptScreen(Screen):
                 hint = " — ctrl+o to browse" if name in self._path_args else ""
                 yield Label(f"{name}: {desc}{hint}")
                 yield Input(id=_input_id(name), placeholder=desc)
+            for _declared_name, input_id, label, placeholder in self._budget_fields.values():
+                yield Label(label)
+                yield Input(id=input_id, placeholder=placeholder)
         yield Static(
             "ctrl+s / Enter: run   ·   ctrl+o: fzf picker (path args)   ·   Esc: back",
             id="args-hint",
@@ -177,6 +222,18 @@ class ArgsPromptScreen(Screen):
             for name in self._args_meta
         }
 
+    def get_budget_values(self) -> dict[str, str]:
+        """Return the filled-in budget overrides, keyed by param name.
+
+        Blank fields are left out entirely so the pipeline's own limit stands.
+        """
+        values: dict[str, str] = {}
+        for key, (_declared_name, input_id, _label, _placeholder) in self._budget_fields.items():
+            raw = self.query_one(f"#{input_id}", Input).value.strip()
+            if raw:
+                values[key] = raw
+        return values
+
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
@@ -186,8 +243,19 @@ class ArgsPromptScreen(Screen):
         self.action_submit()
 
     def action_submit(self) -> None:
-        """Dismiss with the collected values."""
-        self.dismiss(self.get_values())
+        """Dismiss with the collected values (declared args plus budget overrides).
+
+        A budget field that is not a number keeps the form open with a notice:
+        the value has to be fixed here, and starting the run with it silently
+        dropped would be the fallback this codebase refuses.
+        """
+        budget = self.get_budget_values()
+        for key, raw in budget.items():
+            if not _is_number(raw):
+                name = self._budget_fields[key][0]
+                self.notify(f"{name}: expected a number, got {raw!r}", severity="error")
+                return
+        self.dismiss({**self.get_values(), **budget})
 
     def action_cancel(self) -> None:
         """Dismiss with ``None`` — caller treats this as 'back to launcher'."""

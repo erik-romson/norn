@@ -64,6 +64,14 @@ Launcher ──select──▶ [Args prompt, if the pipeline declares args] ─�
   `args` in its `metadata`. One input per arg. Path-like args (description
   mentions path/file/folder/dir) can be filled with **`ctrl+o`** → fzf.
   Submit with **`ctrl+s`** or **Enter**; **Esc** cancels back to the launcher.
+  The screen also collects the run's **budget** and **token_budget** ceilings —
+  optional, blank keeps the pipeline's own limit — so a run known to be a big
+  one starts with room instead of stopping a third of the way through. They come
+  back in `params` under the reserved keys `__budget__`/`__token_budget__`,
+  which `build_run_setup` turns into `Budget` limits via
+  `norn.dsl.apply_budget_overrides` and then drops, so they never reach
+  `{param.*}` substitution. A pipeline that declares an arg named `budget` or
+  `token_budget` owns that question and the matching field is not rendered.
 - **Run** (`RunScreen`) — the live run. **`b`**/**Esc** returns to the
   launcher; **`q`** quits.
 
@@ -155,9 +163,9 @@ second run can start against the same repo while the first is still live.
 | `widgets.py` | `NornHeader`, `NornGraph` (Textual `Tree`), `Transcript` (`RichLog`), `StageDetail`, `BudgetMeter`. Thin; read the ViewModel. `NornHeader` owns its own 1s redraw timer so the elapsed clock ticks between events (§1). `Transcript.refresh_vm()` **appends** only blocks not yet on screen (full redraw on stage switch or a shrinking spool) — the app refreshes on every event, so redrawing the whole log each time is quadratic under streamed command output. |
 | `app.py` | `RunScreen` (run UI + drives `run_pipeline` in-process), `NornApp` (thin host of one `RunScreen` for direct/object runs + tests), `NornUIApp` (the unified Launcher→Args→Run navigation app). |
 | `screens.py` | `LauncherScreen`/`LauncherApp`, `HistoryBrowserScreen`/`HistoryBrowserApp`, `LaunchRequest`, the `OPEN_FILE` sentinel. |
-| `args_prompt.py` | `ArgsPromptScreen`/`ArgsPromptApp`, `is_path_arg`/`is_dir_arg`, `run_fzf`. |
+| `args_prompt.py` | `ArgsPromptScreen`/`ArgsPromptApp`, `is_path_arg`/`is_dir_arg`, `run_fzf`, the budget fields (keys imported from `launch.py`). |
 | `modals.py` | `InputDecisionModal` — the in-run retry/continue/abort modal shown when the runner blocks on a `WaitingInput`. Textual-only, imported lazily by the run screen. |
-| `launch.py` | Textual-free loading helpers: `pipeline_args_meta`, `resolve_ref`, `load_pipeline_with_args` (sets `sys.argv` + reloads dynamic bundled modules), `build_run_setup` (builds graph/budget/run_kwargs and sets `config_path` so every TUI run persists history and checkpoints), and history helpers (`load_run_history`, `history_config_key`, `load_run_checkpoint`). |
+| `launch.py` | Textual-free loading helpers: `pipeline_args_meta`, `resolve_ref`, `load_pipeline_with_args` (publishes `NORN_STATE_KEY`, sets `sys.argv` + reloads dynamic bundled modules), `build_run_setup` (builds graph/budget/run_kwargs and sets `config_path` so every TUI run persists history and checkpoints), `apply_budget_params` + the `BUDGET_PARAM`/`TOKEN_BUDGET_PARAM` keys (launch-time budget overrides), and history helpers (`load_run_history`, `history_config_key`, `load_run_checkpoint`). |
 
 ---
 
