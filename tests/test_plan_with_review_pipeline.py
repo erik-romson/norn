@@ -14,6 +14,7 @@ import pytest
 
 from norn.dsl import ClearContext, Loop, OnFailure, Pipeline, Stage
 from norn.event_sink import EventSink
+from norn.graph import build_graph
 from norn.models import PipelineContext, StageResult
 from norn.pipelines._plan_gates import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate
 from norn.responder import InputResponder
@@ -94,7 +95,7 @@ class FakeResponder(InputResponder):
         self.calls.append(("budget",))
         return self._budget_choice
 
-    async def ask_failure(self, name: str, error: str | None) -> str:
+    async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
         self.calls.append(("failure", name))
         return self._failure_choice
 
@@ -131,16 +132,22 @@ def test_top_level_item_names():
         "draft plan",
         "resolve open questions",
         "open questions resolved",
-        "codex review",
-        "check review shape",
+        "review plan",
+        "review shape ok",
         "ClearContext",
         "apply review",
         "dispositions recorded",
         "ClearContext",
         "split plan",
         "step files written",
-        "summary",
+        "plan summary",
     ]
+
+
+def test_graph_builds():
+    """Sibling node ids must be unique, or the TUI cannot launch the run."""
+    mod = _import_plan_with_review()
+    build_graph(mod.config)
 
 
 def test_open_questions_resolved_is_hard_gate():
@@ -403,7 +410,7 @@ async def test_retry_with_fixed_file_passes_hard_gate(tmp_path):
         async def ask_budget(self, tracker, budget) -> str:
             return "c"
 
-        async def ask_failure(self, name: str, error: str | None) -> str:
+        async def ask_failure(self, name: str, error: str | None, *, timed_out: bool = False) -> str:
             self.calls.append(("failure", name))
             if not self._fixed:
                 self._fixed = True

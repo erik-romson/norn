@@ -165,9 +165,9 @@ CLI-only knobs (not available under `norn ui`, because the TUI reconstructs only
 positional args):
 
 ```bash
---arg model=sonnet            # Claude model for draft/revise/apply (default: opus)
---arg codex_model=gpt-5-codex # model passed to `codex exec -m`
---arg budget=10               # cost ceiling in USD before the run pauses
+--arg model=standard          # intent label for draft/revise/apply (default: deep)
+--arg codex_label=review      # label for the codex plan-review pass (default: review)
+--arg budget=50               # cost ceiling in USD before the run pauses
 ```
 
 (`--budget`/`--token-budget` and the TUI launcher's budget fields set the same

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from norn.dsl import Pipeline, Stage, ask_user, fail, stage_failed
+from norn.model_labels import resolve_label
 from norn.models import PipelineContext, StageResult
 from norn.pipelines._plan_gates import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate
 from norn.skills import Skill, resolve_skill_content
@@ -125,11 +126,24 @@ The human has filled in some or all `**Answer:**` slots.
 
 
 def review_prompt(*, plan: str, preplan: str, review: str) -> str:
+    """Build the codex review prompt.
+
+    Codex runs under ``--sandbox read-only`` and norn captures its **last
+    message** to *review* via ``codex exec -o``.  So the prompt must not ask
+    codex to write the file: an earlier version did, and codex spent its final
+    message apologising that "the workspace is mounted read-only" — which ``-o``
+    then wrote to the review path, failing the ``## Verdict``/``## Findings``
+    shape gate with the plan unreviewed.
+    """
     return (
         f"Review the plan at {plan} against the pre-plan at {preplan}. "
-        f"Write your review to {review} with sections `## Verdict` and "
-        f"`## Findings`. Each finding is `### F<n> — title [severity]` with "
-        f"`**Where:**`, `**Problem:**`, and `**Suggested change:**` sub-fields."
+        "Your final message IS the review: emit the review document and "
+        f"nothing else — norn captures that message verbatim to {review}. "
+        "Do not create or edit any file. This session is sandboxed read-only, "
+        "so the write is rejected and the rejection notice becomes the review. "
+        "Open with `## Verdict`, then `## Findings`. Each finding is "
+        "`### F<n> — title [severity]` with `**Where:**`, `**Problem:**`, and "
+        "`**Suggested change:**` sub-fields."
     )
 
 
@@ -204,7 +218,7 @@ def add_plan_review_stages(
     steps_dir: str,
     repo_dir: str,
     model: str,
-    codex_model: str | None = None,
+    codex_label: str = "review",
     split_skill: str | Skill,
     pause_for_approval: bool = False,
 ) -> Pipeline:
@@ -233,9 +247,10 @@ def add_plan_review_stages(
     repo_dir:
         Absolute repo root passed to ``codex exec -C``.
     model:
-        Claude model shorthand for Generate stages.
-    codex_model:
-        Model passed to ``codex exec -m``; ``None`` omits the flag.
+        Intent label for Generate stages (e.g. ``"deep"``, ``"standard"``).
+    codex_label:
+        Intent label for the codex review stage (default ``"review"``).
+        Resolved against the ``codex`` provider in ``norn/model_labels.toml``.
     split_skill:
         Resolved skill object (or bare name) for the split-plan stage.
     pause_for_approval:
@@ -249,10 +264,12 @@ def add_plan_review_stages(
     _apply_p = apply_prompt(plan=plan, review=review, response=response)
     _split_p = split_prompt(plan=plan, steps_dir=steps_dir)
 
-    codex_model_flag = f"-m {shlex.quote(codex_model)} " if codex_model else ""
+    _codex_resolved = resolve_label("codex", codex_label)
+    _effort_token = shlex.quote(f'model_reasoning_effort="{_codex_resolved.effort}"')
     codex_cmd = (
         "codex exec --sandbox read-only --skip-git-repo-check "
-        + codex_model_flag
+        + f"-m {shlex.quote(_codex_resolved.model)} "
+        + f"-c {_effort_token} "
         + f"-C {shlex.quote(repo_dir)} -o {shlex.quote(review)} "
         + shlex.quote(_review_p)
     )
@@ -317,18 +334,35 @@ def add_plan_review_stages(
         )
 
     # 3. Codex reviews the plan (read-only).
-    pipeline.stage(
-        "codex review",
-        RunCommand(cmd=codex_cmd, timeout=1800),
-        on_failure=ask_user,
+    #
+    # The shape check sits inside the loop so a malformed review re-runs codex
+    # rather than ending the run: `-o` captures codex's last message verbatim,
+    # so anything that displaces the review document (a refusal, a summary, a
+    # question) lands in the file and fails the gate.  Re-running is the only
+    # repair — the file itself carries no recoverable content.
+    _review_checks = [
+        FileExists(review),
+        Contains(review, patterns=["## Verdict", "## Findings"]),
+    ]
+    pipeline.loop(
+        "review plan",
+        max_retries=2,
+        on_exhaust=ask_user,
+        stages=[
+            Stage(
+                "codex review",
+                RunCommand(cmd=codex_cmd, timeout=1800),
+            ),
+            Stage("check review shape", Validate(checks=_review_checks)),
+        ],
     )
 
+    # 3b. Hard gate: `c` at an exhausted loop is treated as success by the
+    # runner, so the mandatory check is repeated at the top level under a
+    # different name (ctx.results is keyed by stage name).
     pipeline.stage(
-        "check review shape",
-        Validate(checks=[
-            FileExists(review),
-            Contains(review, patterns=["## Verdict", "## Findings"]),
-        ]),
+        "review shape ok",
+        Validate(checks=_review_checks),
         on_failure=fail,
     )
 
@@ -392,8 +426,11 @@ def add_plan_review_stages(
         on_failure=fail,
     )
 
+    # Named for the plan, not the run: a host pipeline that continues past the
+    # builder (fix_jira_issue implements the steps) adds a summary of its own,
+    # and sibling node ids must stay unique.
     pipeline.stage(
-        "summary",
+        "plan summary",
         RunCommand(cmd=(
             f"ls -l {shlex.quote(plan)} {shlex.quote(review)} {shlex.quote(response)}; "
             f"ls -l {shlex.quote(steps_dir)}"

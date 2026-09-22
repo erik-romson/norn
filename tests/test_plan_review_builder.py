@@ -34,11 +34,17 @@ def _build(pause_for_approval: bool = False) -> Pipeline:
         response=_RESPONSE,
         steps_dir=_STEPS_DIR,
         repo_dir=_REPO_DIR,
-        model="opus",
-        codex_model=None,
+        model="deep",
+        codex_label="review",
         split_skill=_SPLIT_SKILL,
         pause_for_approval=pause_for_approval,
     )
+
+
+def _codex_stage(pipeline: Pipeline) -> Stage:
+    """Return the codex review stage from inside the `review plan` loop."""
+    loop = next(i for i in pipeline.items if isinstance(i, Loop) and i.name == "review plan")
+    return next(s for s in loop.stages if s.name == "codex review")
 
 
 def _item_names(pipeline: Pipeline) -> list[str]:
@@ -63,15 +69,15 @@ def test_stage_names_without_approval_pause():
         "draft plan",
         "resolve open questions",
         "open questions resolved",
-        "codex review",
-        "check review shape",
+        "review plan",
+        "review shape ok",
         "ClearContext",
         "apply review",
         "dispositions recorded",
         "ClearContext",
         "split plan",
         "step files written",
-        "summary",
+        "plan summary",
     ]
 
 
@@ -83,15 +89,15 @@ def test_stage_names_with_approval_pause():
         "resolve open questions",
         "open questions resolved",
         "wait for plan approval",
-        "codex review",
-        "check review shape",
+        "review plan",
+        "review shape ok",
         "ClearContext",
         "apply review",
         "dispositions recorded",
         "ClearContext",
         "split plan",
         "step files written",
-        "summary",
+        "plan summary",
     ]
 
 
@@ -112,6 +118,83 @@ def test_no_approval_stage_when_pause_for_approval_false():
     p = _build(pause_for_approval=False)
     names = [item.name for item in p.items if isinstance(item, Stage)]
     assert "wait for plan approval" not in names
+
+
+# ---------------------------------------------------------------------------
+# Review prompt: codex is read-only, `-o` writes the file
+# ---------------------------------------------------------------------------
+
+
+def test_review_prompt_does_not_ask_codex_to_write_the_file():
+    """Regression: codex ran out of turns apologising that it could not write.
+
+    The command is `codex exec --sandbox read-only ... -o <review>`, so codex's
+    last message IS the review.  Telling it to write the file made it attempt a
+    rejected patch and emit "the workspace is mounted read-only" as its final
+    message — which `-o` then wrote to the review path, failing the shape gate.
+    """
+    from norn.pipelines._plan_review import review_prompt
+
+    prompt = review_prompt(plan=_PLAN, preplan=_PREPLAN, review=_REVIEW)
+    assert "Write your review to" not in prompt
+    assert "Do not create or edit any file" in prompt
+    assert "final message IS the review" in prompt
+    # The shape the gate checks must still be stated.
+    assert "## Verdict" in prompt
+    assert "## Findings" in prompt
+
+
+def test_codex_command_is_read_only_and_captures_last_message():
+    """The prompt's claims about the sandbox and `-o` must match the command."""
+    cmd = _codex_stage(_build()).impl.cmd
+    assert "--sandbox read-only" in cmd
+    assert f"-o {_REVIEW}" in cmd
+
+
+# ---------------------------------------------------------------------------
+# Review retry loop
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_review_reruns_codex():
+    """The shape check sits inside the loop so a bad review re-runs codex."""
+    p = _build()
+    loop = next(i for i in p.items if isinstance(i, Loop) and i.name == "review plan")
+    assert [s.name for s in loop.stages] == ["codex review", "check review shape"]
+    assert loop.max_retries == 2
+    assert loop.on_exhaust is OnFailure.ASK_USER
+
+
+def test_review_shape_is_re_gated_after_the_loop():
+    """`[c]` on an exhausted loop counts as success, so the gate is repeated."""
+    p = _build()
+    gate = next(i for i in p.items if isinstance(i, Stage) and i.name == "review shape ok")
+    assert gate.on_failure is OnFailure.FAIL
+    # A different name from the in-loop stage: ctx.results is keyed by name.
+    assert gate.name != "check review shape"
+
+
+# ---------------------------------------------------------------------------
+# Codex command structure
+# ---------------------------------------------------------------------------
+
+
+def test_codex_review_command_contains_m_flag():
+    """The codex command must always include -m <model>."""
+    assert "-m " in _codex_stage(_build()).impl.cmd
+
+
+def test_codex_review_command_contains_effort_flag():
+    """The codex command must always include -c model_reasoning_effort=..."""
+    assert "model_reasoning_effort=" in _codex_stage(_build()).impl.cmd
+
+
+def test_codex_label_default_is_review():
+    """Default codex_label resolves to the 'review' entry in model_labels.toml."""
+    from norn.model_labels import resolve_label
+    resolved = resolve_label("codex", "review")
+    assert resolved.label == "review"
+    assert resolved.effort is not None
 
 
 # ---------------------------------------------------------------------------
