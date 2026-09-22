@@ -343,7 +343,7 @@ def test_history_compare_shows_per_stage_table(capsys, tmp_path):
             cache_read_tokens=0, cache_hit_ratio=0.0, turns=3,
             wall_ms=5000, api_ms=3000, tool_time_ms=2000,
             agent_stage_count=1, command_stage_count=0,
-            failed_attempts=0, failed_attempt_cost_usd=0.0, retries=0,
+            failed_attempts=0, failed_attempt_cost_usd=0.0, timed_out_attempts=0, retries=0,
             budget_max_cost_usd=None, budget_used_pct=None,
             waiting_input={}, top_cost_stages=["gen"],
             quota=None, codex_cost_usd_estimate=None, stages=[sm],

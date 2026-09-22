@@ -15,8 +15,9 @@ from norn.transcripts import (
     read_assistant_calls,
     transcript_path,
 )
+from norn.model_labels import resolve_label
 from norn.metrics import (
-    CONTEXT_BLOAT_TOKENS,
+    CONTEXT_BLOAT_WINDOW_FRACTION,
     MODEL_MIX_SURPRISE_OUTPUT_PCT,
     Finding,
     StageMetrics,
@@ -100,7 +101,7 @@ def _make_stage_sm(**kwargs: Any) -> StageMetrics:
         system_prompt_chars=0,
         unresolved_placeholders=[],
         duration_ms=1000,
-        model="sonnet",
+        model="standard",
         model_id="claude-sonnet-4-6",
         result_subtype="success",
         stop_reason=None,
@@ -133,6 +134,7 @@ def _run_metrics_with_stage(sm: StageMetrics) -> Any:
         command_stage_count=0,
         failed_attempts=0,
         failed_attempt_cost_usd=0.0,
+        timed_out_attempts=0,
         retries=0,
         budget_max_cost_usd=None,
         budget_used_pct=None,
@@ -404,21 +406,34 @@ class TestMissingTranscript:
 # ---------------------------------------------------------------------------
 
 
+# The fixture stage runs on the "standard" label, whose window model_labels.toml
+# declares; the rule fires on a fraction of that window.
+_STANDARD_WINDOW = resolve_label("claude-code", "standard").context_window
+_BLOAT_LIMIT = int(_STANDARD_WINDOW * CONTEXT_BLOAT_WINDOW_FRACTION)
+
+
 class TestContextBloatRule:
     def test_fires_when_peak_exceeds_threshold(self):
-        sm = _make_stage_sm(context_peak_tokens=CONTEXT_BLOAT_TOKENS + 1)
+        sm = _make_stage_sm(context_peak_tokens=_BLOAT_LIMIT + 1)
         m = _run_metrics_with_stage(sm)
         findings = find_issues(m)
         assert any(f.rule == "context-bloat" for f in findings)
 
-    def test_fires_at_threshold_plus_one(self):
-        sm = _make_stage_sm(context_peak_tokens=150_001)
-        m = _run_metrics_with_stage(sm)
-        findings = find_issues(m)
-        assert any(f.rule == "context-bloat" and f.stage == "gen" for f in findings)
+    def test_evidence_names_the_window(self):
+        sm = _make_stage_sm(context_peak_tokens=_BLOAT_LIMIT + 1)
+        findings = find_issues(_run_metrics_with_stage(sm))
+        evidence = next(f.evidence for f in findings if f.rule == "context-bloat")
+        assert f"{_STANDARD_WINDOW:,}-token window" in evidence
 
     def test_does_not_fire_at_threshold(self):
-        sm = _make_stage_sm(context_peak_tokens=CONTEXT_BLOAT_TOKENS)
+        sm = _make_stage_sm(context_peak_tokens=_BLOAT_LIMIT)
+        m = _run_metrics_with_stage(sm)
+        findings = find_issues(m)
+        assert not any(f.rule == "context-bloat" for f in findings)
+
+    def test_does_not_fire_for_a_label_without_a_window(self):
+        """No declared window means no scale to judge the peak against."""
+        sm = _make_stage_sm(model="no-such-label", context_peak_tokens=10_000_000)
         m = _run_metrics_with_stage(sm)
         findings = find_issues(m)
         assert not any(f.rule == "context-bloat" for f in findings)

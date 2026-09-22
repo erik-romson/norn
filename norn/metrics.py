@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from norn.model_labels import ModelLabelError, resolve_label
+
 log = logging.getLogger(__name__)
 
 
@@ -25,18 +27,24 @@ log = logging.getLogger(__name__)
 
 RETRY_WASTE_COST_PCT = 15
 TOOL_ERROR_RATE_THRESHOLD = 0.2
-TOOL_ERROR_MIN_USES = 5
+# A handful of calls is too small a sample to call a rate: 3 of 6 is noise.
+TOOL_ERROR_MIN_USES = 20
 LOW_CACHE_RATIO = 0.5
 LOW_CACHE_MIN_TURNS = 5
 OVERSIZED_PROMPT_CHARS = 200_000
-SLOW_COMMAND_MS = 600_000
+# A project's own test suite runs for ten minutes and must run to completion;
+# this rule is for a command that has plausibly wedged, not for a slow suite.
+SLOW_COMMAND_MS = 1_800_000
 BUDGET_HEADROOM_PCT = 80
 COST_SHARE_SINGLE_PCT = 20
 COST_SHARE_TOP3_PCT = 40
 REGRESSION_FACTOR = 1.5
 QUOTA_PRESSURE_PCT = 80
 PRIOR_RUNS_LIMIT = 5
-CONTEXT_BLOAT_TOKENS = 150_000
+# Context bloat is measured against the model's own window (from
+# ``model_labels.toml``), because a fixed token count calls every substantial
+# stage bloated on a 1M-token model and misses a cramped 200k one.
+CONTEXT_BLOAT_WINDOW_FRACTION = 0.6
 MODEL_MIX_SURPRISE_OUTPUT_PCT = 30
 
 # Placeholder syntax, kept identical to the renderer in
@@ -75,6 +83,8 @@ class StageMetrics:
     result_subtype: str | None
     stop_reason: str | None
     nonfatal_error: bool
+    # True when the runner cancelled this attempt for exceeding its timeout.
+    timed_out: bool = False
     # Transcript-derived fields (optional; None when transcripts unavailable)
     model_mix: dict | None = None
     context_peak_tokens: int | None = None
@@ -114,6 +124,9 @@ class RunMetrics:
     command_stage_count: int
     failed_attempts: int
     failed_attempt_cost_usd: float
+    # Timed-out attempts are counted but not costed: the provider is killed
+    # before it reports usage, so their spend is missing from the line above.
+    timed_out_attempts: int
     retries: int
     budget_max_cost_usd: float | None
     budget_used_pct: float | None
@@ -254,6 +267,21 @@ def _stage_kind(record: dict) -> str:
     return "other"
 
 
+def _context_window(provider: str, label: str | None) -> int | None:
+    """Return the context window for a stage's model label, or ``None``.
+
+    ``None`` means the label declares no window in ``model_labels.toml`` (or
+    names no label at all, as command stages do), so window-relative rules
+    have nothing to measure against and skip the stage.
+    """
+    if not label:
+        return None
+    try:
+        return resolve_label(provider, label).context_window
+    except ModelLabelError:
+        return None
+
+
 def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator > 0 else 0.0
 
@@ -287,7 +315,6 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
     total_billed_input = 0
     total_output = 0
     total_cache_read = 0
-    total_input = 0
     total_turns = 0
     total_api_ms = 0
     total_tool_time_ms = 0
@@ -295,6 +322,7 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
     command_count = 0
     failed_attempts = 0
     failed_attempt_cost = 0.0
+    timed_out_attempts = 0
 
     stage_metrics_list: list[StageMetrics] = []
 
@@ -333,6 +361,7 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
         rec_success = rec.get("success", True)
         error = rec.get("error")
         nonfatal = rec_success and bool(error)
+        timed_out = bool(details.get("timed_out"))
 
         if kind == "agent":
             agent_count += 1
@@ -347,12 +376,13 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
         total_billed_input += billed_input
         total_output += output_tokens
         total_cache_read += cache_read
-        total_input += input_tokens
         total_turns += turns
 
         if not rec_success:
             failed_attempts += 1
             failed_attempt_cost += cost
+            if timed_out:
+                timed_out_attempts += 1
 
         stage_metrics_list.append(StageMetrics(
             name=rec.get("node_id", ""),
@@ -365,7 +395,10 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
             cost_share=0.0,  # filled below
             billed_input_tokens=billed_input,
             output_tokens=output_tokens,
-            cache_hit_ratio=_safe_ratio(cache_read, input_tokens),
+            # Share of the billed input that came from cache. The denominator
+            # is everything billed as input, not the uncached remainder, which
+            # made the ratio run into the thousands.
+            cache_hit_ratio=_safe_ratio(cache_read, billed_input),
             turns=turns,
             tokens_per_turn=_safe_ratio(input_tokens + output_tokens, turns),
             tool_uses=tool_uses,
@@ -379,6 +412,7 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
             result_subtype=usage.get("result_subtype") or details.get("result_subtype"),
             stop_reason=usage.get("stop_reason") or details.get("stop_reason"),
             nonfatal_error=nonfatal,
+            timed_out=timed_out,
         ))
 
     # Integrate transcript data for claude-code runs
@@ -393,7 +427,7 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
     sorted_by_cost = sorted(stage_metrics_list, key=lambda s: s.cost_usd, reverse=True)
     top_cost_stages = [s.name for s in sorted_by_cost[:3] if s.cost_usd > 0]
 
-    cache_hit_ratio = _safe_ratio(total_cache_read, total_input)
+    cache_hit_ratio = _safe_ratio(total_cache_read, total_billed_input)
     budget_used_pct = (total_cost / budget_max_cost_usd * 100.0) if budget_max_cost_usd else None
 
     # Quota
@@ -422,6 +456,7 @@ def compute_metrics(run_dir: Path) -> RunMetrics:
         command_stage_count=command_count,
         failed_attempts=failed_attempts,
         failed_attempt_cost_usd=failed_attempt_cost,
+        timed_out_attempts=timed_out_attempts,
         retries=retries,
         budget_max_cost_usd=budget_max_cost_usd,
         budget_used_pct=budget_used_pct,
@@ -619,13 +654,39 @@ def find_issues(metrics: RunMetrics, prior: list[RunMetrics] | None = None) -> l
                 evidence=f"result_subtype={sm.result_subtype}",
                 suggestion="Check the agent error and fix the prompt or configuration.",
             ))
-        elif sm.kind == "agent" and not sm.success and not sm.result_subtype:
+        elif sm.kind == "agent" and not sm.success and not sm.result_subtype and not sm.timed_out:
             findings.append(Finding(
                 rule="agent-error",
                 severity="high",
                 stage=sm.name,
                 evidence="stage failed without result_subtype",
                 suggestion="Check the agent error and fix the prompt or configuration.",
+            ))
+
+        # stage-timeout
+        if sm.timed_out:
+            recovered = any(
+                other.node_id == sm.node_id and other.attempt > sm.attempt and other.success
+                for other in metrics.stages
+            )
+            findings.append(Finding(
+                rule="stage-timeout",
+                severity="info" if recovered else "high",
+                stage=sm.name,
+                evidence=(
+                    f"attempt {sm.attempt} hit its timeout after "
+                    f"{sm.duration_ms / 1000:.0f}s"
+                    + (
+                        "; a later attempt passed" if recovered
+                        else "; the stage did not pass"
+                    )
+                    + " (the killed attempt's cost is not recorded)"
+                ),
+                suggestion=(
+                    "Raise this stage's timeout so the work fits in one attempt."
+                    if recovered
+                    else "Raise this stage's timeout, or split the work it is given."
+                ),
             ))
 
         # unresolved-placeholder
@@ -685,7 +746,7 @@ def find_issues(metrics: RunMetrics, prior: list[RunMetrics] | None = None) -> l
                 severity="warn",
                 stage=sm.name,
                 evidence=f"duration={sm.duration_ms / 1000:.0f}s",
-                suggestion="Consider splitting long-running commands or adding a timeout.",
+                suggestion="Check whether the command is making progress or has wedged.",
             ))
 
         # cost-share
@@ -698,15 +759,24 @@ def find_issues(metrics: RunMetrics, prior: list[RunMetrics] | None = None) -> l
                 suggestion="Consider whether this stage can be made cheaper or split.",
             ))
 
-        # context-bloat
-        if sm.context_peak_tokens is not None and sm.context_peak_tokens > CONTEXT_BLOAT_TOKENS:
-            findings.append(Finding(
-                rule="context-bloat",
-                severity="warn",
-                stage=sm.name,
-                evidence=f"context_peak_tokens={sm.context_peak_tokens:,}",
-                suggestion="Context is near the model window; every later turn pays to re-read everything.",
-            ))
+        # context-bloat — measured against this stage's own model window. A
+        # stage whose label declares no window is skipped: the rule has no
+        # scale to judge it against.
+        window = _context_window(metrics.provider, sm.model)
+        if sm.context_peak_tokens is not None and window is not None:
+            limit = window * CONTEXT_BLOAT_WINDOW_FRACTION
+            if sm.context_peak_tokens > limit:
+                findings.append(Finding(
+                    rule="context-bloat",
+                    severity="warn",
+                    stage=sm.name,
+                    evidence=(
+                        f"context_peak_tokens={sm.context_peak_tokens:,} "
+                        f"({sm.context_peak_tokens / window * 100:.0f}% of the "
+                        f"{window:,}-token window)"
+                    ),
+                    suggestion="Context is near the model window; every later turn pays to re-read everything.",
+                ))
 
         # model-mix-surprise
         if sm.kind == "agent" and sm.model_mix is not None and len(sm.model_mix) > 1:

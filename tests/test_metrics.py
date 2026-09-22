@@ -8,9 +8,10 @@ from typing import Any
 
 import pytest
 
+from norn.model_labels import resolve_label
 from norn.metrics import (
     BUDGET_HEADROOM_PCT,
-    CONTEXT_BLOAT_TOKENS,
+    CONTEXT_BLOAT_WINDOW_FRACTION,
     COST_SHARE_SINGLE_PCT,
     COST_SHARE_TOP3_PCT,
     LOW_CACHE_MIN_TURNS,
@@ -147,6 +148,7 @@ def _make_run_metrics(**overrides: Any) -> RunMetrics:
         command_stage_count=0,
         failed_attempts=0,
         failed_attempt_cost_usd=0.0,
+        timed_out_attempts=0,
         retries=0,
         budget_max_cost_usd=None,
         budget_used_pct=None,
@@ -314,6 +316,7 @@ class TestRetryWaste:
         m = _make_run_metrics(
             cost_usd=1.0,
             failed_attempt_cost_usd=0.20,
+            timed_out_attempts=0,
         )
         findings = find_issues(m)
         assert any(f.rule == "retry-waste" for f in findings)
@@ -322,9 +325,48 @@ class TestRetryWaste:
         m = _make_run_metrics(
             cost_usd=1.0,
             failed_attempt_cost_usd=0.05,
+            timed_out_attempts=0,
         )
         findings = find_issues(m)
         assert not any(f.rule == "retry-waste" for f in findings)
+
+
+class TestStageTimeout:
+    def _timed_out(self, **overrides):
+        return _make_stage_sm(
+            status="failed", success=False, result_subtype=None,
+            duration_ms=1_800_000, timed_out=True, **overrides,
+        )
+
+    def test_fires_high_when_the_stage_never_passed(self):
+        m = _make_run_metrics(stages=[self._timed_out()])
+        findings = find_issues(m)
+        timeout = next(f for f in findings if f.rule == "stage-timeout")
+        assert timeout.severity == "high"
+        assert "1800s" in timeout.evidence
+
+    def test_is_informational_when_a_later_attempt_passed(self):
+        m = _make_run_metrics(stages=[
+            self._timed_out(),
+            _make_stage_sm(attempt=2),
+        ])
+        findings = find_issues(m)
+        timeout = next(f for f in findings if f.rule == "stage-timeout")
+        assert timeout.severity == "info"
+        assert "a later attempt passed" in timeout.evidence
+
+    def test_replaces_the_generic_agent_error(self):
+        """A timeout is a timeout, not an unexplained agent failure."""
+        m = _make_run_metrics(stages=[self._timed_out()])
+        findings = find_issues(m)
+        assert not any(f.rule == "agent-error" for f in findings)
+
+    def test_does_not_fire_for_an_ordinary_failure(self):
+        m = _make_run_metrics(stages=[
+            _make_stage_sm(status="failed", success=False, result_subtype=None),
+        ])
+        findings = find_issues(m)
+        assert not any(f.rule == "stage-timeout" for f in findings)
 
 
 class TestToolErrorRate:
@@ -334,7 +376,7 @@ class TestToolErrorRate:
                 name="gen", node_id="gen", attempt=1, kind="agent", status="passed",
                 success=True, cost_usd=0.05, cost_share=100.0, billed_input_tokens=1000,
                 output_tokens=500, cache_hit_ratio=0.0, turns=3, tokens_per_turn=500.0,
-                tool_uses=10, tool_errors=5, prompt_chars=100, system_prompt_chars=0,
+                tool_uses=40, tool_errors=20, prompt_chars=100, system_prompt_chars=0,
                 unresolved_placeholders=[], duration_ms=1000,
                 model="sonnet", model_id="claude-sonnet-4-6",
                 result_subtype="success", stop_reason=None, nonfatal_error=False,
@@ -349,7 +391,7 @@ class TestToolErrorRate:
                 name="gen", node_id="gen", attempt=1, kind="agent", status="passed",
                 success=True, cost_usd=0.05, cost_share=100.0, billed_input_tokens=1000,
                 output_tokens=500, cache_hit_ratio=0.0, turns=3, tokens_per_turn=500.0,
-                tool_uses=10, tool_errors=1, prompt_chars=100, system_prompt_chars=0,
+                tool_uses=40, tool_errors=4, prompt_chars=100, system_prompt_chars=0,
                 unresolved_placeholders=[], duration_ms=1000,
                 model="sonnet", model_id="claude-sonnet-4-6",
                 result_subtype="success", stop_reason=None, nonfatal_error=False,
@@ -432,7 +474,7 @@ class TestSlowCommand:
                 success=True, cost_usd=0.0, cost_share=0.0, billed_input_tokens=0,
                 output_tokens=0, cache_hit_ratio=0.0, turns=0, tokens_per_turn=0.0,
                 tool_uses=0, tool_errors=0, prompt_chars=0, system_prompt_chars=0,
-                unresolved_placeholders=[], duration_ms=700_000,
+                unresolved_placeholders=[], duration_ms=SLOW_COMMAND_MS + 1,
                 model=None, model_id=None, result_subtype=None,
                 stop_reason=None, nonfatal_error=False,
             )
@@ -692,6 +734,40 @@ class TestComputeMetrics:
         assert m.failed_attempts == 1
         assert m.failed_attempt_cost_usd == pytest.approx(0.03)
 
+    def test_timed_out_attempts_counted_but_not_costed(self, tmp_path):
+        """A killed attempt reports no usage, so its spend cannot be counted."""
+        rd = make_run_dir(tmp_path, stages=[
+            _make_stage_record(
+                node_id="gen", attempt=1, success=False,
+                details={"timed_out": True},
+            ),
+            _make_stage_record(
+                node_id="gen", attempt=2, success=True,
+                usage=_agent_usage(total_cost_usd=0.05),
+            ),
+        ])
+        m = compute_metrics(rd)
+        assert m.timed_out_attempts == 1
+        assert m.stages[0].timed_out is True
+        assert m.stages[1].timed_out is False
+        assert m.failed_attempt_cost_usd == pytest.approx(0.0)
+
+    def test_cache_hit_ratio_is_a_share_of_billed_input(self, tmp_path):
+        rd = make_run_dir(tmp_path, stages=[
+            _make_stage_record(
+                node_id="gen",
+                usage=_agent_usage(
+                    input_tokens=1_000,
+                    cache_creation_input_tokens=1_000,
+                    cache_read_input_tokens=8_000,
+                    output_tokens=100,
+                ),
+            ),
+        ])
+        m = compute_metrics(rd)
+        assert m.cache_hit_ratio == pytest.approx(0.8)
+        assert m.stages[0].cache_hit_ratio == pytest.approx(0.8)
+
 
 # ---------------------------------------------------------------------------
 # QuotaMetrics from run.json
@@ -862,7 +938,7 @@ def _make_stage_sm(**overrides: Any) -> StageMetrics:
         success=True, cost_usd=0.05, cost_share=100.0, billed_input_tokens=1000,
         output_tokens=500, cache_hit_ratio=0.0, turns=3, tokens_per_turn=500.0,
         tool_uses=2, tool_errors=0, prompt_chars=100, system_prompt_chars=0,
-        unresolved_placeholders=[], duration_ms=1000, model="sonnet",
+        unresolved_placeholders=[], duration_ms=1000, model="standard",
         model_id="claude-sonnet-4-6", result_subtype="success",
         stop_reason=None, nonfatal_error=False,
     )
@@ -870,17 +946,24 @@ def _make_stage_sm(**overrides: Any) -> StageMetrics:
     return StageMetrics(**base)
 
 
+# The fixture stage runs on the "standard" label; the rule fires on a fraction
+# of the window model_labels.toml declares for it.
+_BLOAT_LIMIT = int(
+    resolve_label("claude-code", "standard").context_window * CONTEXT_BLOAT_WINDOW_FRACTION
+)
+
+
 class TestContextBloat:
     def test_fires_above_threshold(self):
         m = _make_run_metrics(stages=[
-            _make_stage_sm(context_peak_tokens=CONTEXT_BLOAT_TOKENS + 1),
+            _make_stage_sm(context_peak_tokens=_BLOAT_LIMIT + 1),
         ])
         findings = find_issues(m)
         assert any(f.rule == "context-bloat" for f in findings)
 
     def test_does_not_fire_at_or_below_threshold(self):
         m = _make_run_metrics(stages=[
-            _make_stage_sm(context_peak_tokens=CONTEXT_BLOAT_TOKENS),
+            _make_stage_sm(context_peak_tokens=_BLOAT_LIMIT),
         ])
         findings = find_issues(m)
         assert not any(f.rule == "context-bloat" for f in findings)
