@@ -176,7 +176,7 @@ async def _amain(argv: list[str]) -> int:
         help="with --surefire: skip Haiku if the extract is below this size (default: 500)",
     )
     parser.add_argument(
-        "--haiku-model", default="haiku",
+        "--haiku-model", default="light",
         help="with --surefire: model shorthand passed to claude-agent-sdk (default: haiku)",
     )
     parser.add_argument(

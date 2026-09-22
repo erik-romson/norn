@@ -19,7 +19,7 @@ metadata = {
 }
 
 config = (
-    Pipeline("vanilla_change")
+    Pipeline("vanilla_change", default_model="standard")
 
     # Step 1: implement the change (runs once)
     .stage("implement", Generate(

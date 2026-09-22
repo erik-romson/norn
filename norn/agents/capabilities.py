@@ -97,8 +97,8 @@ class AgentCapabilities:
             without restarting the session.
 
         model_alias_table:
-            Key into ``norn.agents.models.MODEL_ALIASES`` that maps friendly
-            shorthand names (e.g. ``"sonnet"``) to provider-specific model IDs.
+            Provider name used to look up labels in ``norn/model_labels.toml``
+            (e.g. ``"claude-code"`` or ``"opencode"``).
 
         can_list_models:
             ``True`` when the provider exposes a way to enumerate available

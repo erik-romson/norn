@@ -44,7 +44,7 @@ default any more; a missing or empty `test_cmd` halts the run.
 ---
 test_cmd: uv run python -m pytest tests/test_widget.py -v
 bats_cmd: bats bats/widget.bats          # optional, omit when not used
-model: opus                              # optional, omit on routine steps
+model: deep                              # optional, omit on routine steps
 ---
 
 # Step title
@@ -98,18 +98,18 @@ Rules for `test_cmd`:
 Optional `model:` override:
 
 - Default: omit the field. The pipeline runs the step on its
-  configured default (sonnet), which is fast and cheap.
-- Set `model: opus` only when the step genuinely needs heavier
+  configured default (`standard`), which is fast and cheap.
+- Set `model: deep` only when the step genuinely needs heavier
   reasoning — e.g. designing a non-trivial algorithm, untangling a
   subtle cross-module change, or producing code where prior runs of
-  similar work on sonnet have failed. Routine refactors,
+  similar work on `standard` have failed. Routine refactors,
   rename/move/extract steps, and mechanical edits should NOT set
   this field.
-- Do not default to opus across a whole plan. Opus is roughly 5×
-  the cost of sonnet; setting it everywhere defeats the per-step
-  selection.
-- Accepted values are the same shorthands `Generate(model=...)`
-  accepts: `opus`, `sonnet`, `haiku`, or a full model ID.
+- Do not default to `deep` across a whole plan. `deep` is several
+  times the cost of `standard`; setting it everywhere defeats the
+  per-step selection.
+- Accepted values are the labels in `norn/model_labels.toml`:
+  `light`, `standard`, `deep`.
 
 If the plan does not give you enough information to pick a real
 `test_cmd` for a step, ASK before generating the file rather than

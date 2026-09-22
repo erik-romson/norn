@@ -238,6 +238,11 @@ def main() -> None:
 
     sub.add_parser("list", help="List all bundled pipelines")
 
+    sub.add_parser(
+        "models",
+        help="List all model labels and their pinned model IDs (see norn models for available labels)",
+    )
+
     describe_parser = sub.add_parser("describe", help="Describe a bundled pipeline")
     describe_parser.add_argument("name", help="Name of the bundled pipeline")
 
@@ -282,13 +287,13 @@ def main() -> None:
         "--model",
         default=None,
         metavar="MODEL",
-        help="Feedback model shorthand (default: sonnet)",
+        help="Feedback model label (default: standard). See `norn models`.",
     )
     evaluate_parser.add_argument(
         "--judge-model",
         default=None,
         metavar="MODEL",
-        help="Judge model shorthand (default: haiku)",
+        help="Judge model label (default: light). See `norn models`.",
     )
     evaluate_parser.add_argument(
         "--no-judge",
@@ -376,6 +381,32 @@ def main() -> None:
         console.print(table)
         return
 
+    if args.command == "models":
+        from norn.ui import console
+        from norn.model_labels import labels_path, load_labels
+        from rich.table import Table
+
+        _labels = load_labels()
+        _table = Table(show_header=True, show_edge=False, pad_edge=False)
+        _table.add_column("Provider")
+        _table.add_column("Label")
+        _table.add_column("Model")
+        _table.add_column("Effort")
+        _table.add_column("Since")
+        for _provider in sorted(_labels):
+            for _label in sorted(_labels[_provider]):
+                _rm = _labels[_provider][_label]
+                _table.add_row(
+                    _provider,
+                    _label,
+                    _rm.model,
+                    _rm.effort or "-",
+                    _rm.since or "-",
+                )
+        console.print(_table)
+        console.print(f"\n  {labels_path()}")
+        return
+
     if args.command == "describe":
         from norn.ui import console
 
@@ -404,6 +435,41 @@ def main() -> None:
             usage += " " + " ".join(f"<{a}>" for a in info.args)
         console.print(usage)
         console.print()
+        # Model labels: load the actual pipeline and walk Generate stages
+        try:
+            from norn.dsl import Loop, Parallel, Stage
+            from norn.model_labels import ModelLabelError, resolve_label
+
+            _desc_pipeline = load_bundled_pipeline(args.name)
+            _provider = _desc_pipeline.agent_provider_name or "claude-code"
+            _default_model = _desc_pipeline.default_model
+
+            def _collect_labels(items, dflt):
+                rows = []
+                for _it in items:
+                    if isinstance(_it, Stage) and hasattr(_it.impl, "model"):
+                        _lbl = _it.impl.model or dflt
+                        if _lbl:
+                            try:
+                                _rm = resolve_label(_provider, _lbl)
+                                _effort = f" ({_rm.effort})" if _rm.effort else ""
+                                rows.append((_it.name, _lbl, _rm.model, _effort))
+                            except ModelLabelError:
+                                rows.append((_it.name, _lbl, "?", ""))
+                    elif isinstance(_it, Loop):
+                        rows.extend(_collect_labels(_it.stages, dflt))
+                    elif isinstance(_it, Parallel):
+                        rows.extend(_collect_labels(_it.stages, dflt))
+                return rows
+
+            _label_rows = _collect_labels(_desc_pipeline.items, _default_model)
+            if _label_rows:
+                console.print(f"  [bold]Models ({_provider}):[/bold]")
+                for _sname, _lbl, _mdl, _eff in _label_rows:
+                    console.print(f"    {_sname}: {_lbl} -> {_mdl}{_eff}")
+                console.print()
+        except Exception:
+            pass  # best-effort; don't crash describe if pipeline can't be loaded
         return
 
     if args.command == "diagram":
@@ -540,8 +606,8 @@ def main() -> None:
                 _eval_run_id,
                 provider_name=args.agent_provider,
                 judge=not args.no_judge,
-                judge_model=args.judge_model or "haiku",
-                feedback_model=args.model or "sonnet",
+                judge_model=args.judge_model or "light",
+                feedback_model=args.model or "standard",
                 stage_glob=args.stages,
                 max_cost_usd=args.max_cost,
             ))

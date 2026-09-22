@@ -6,6 +6,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from norn import ui
+from norn.model_labels import ModelLabelError, resolve_label
 from norn.models import PipelineContext, StageResult, UsageRecord
 from norn.runner import resolve_run_path
 from norn.secrets import resolve_env
@@ -16,12 +17,6 @@ if TYPE_CHECKING:
     from norn.profiles import SessionProfile
 
 log = logging.getLogger(__name__)
-
-MODEL_MAP: dict[str, str] = {
-    "opus": "claude-opus-4-6",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
-}
 
 _STDERR_PLACEHOLDER = "Check stderr output for details"
 
@@ -97,8 +92,9 @@ class Generate(BaseStage):
         input: Input value for template placeholders (``{input}``).
         output_file: Write extracted code to this path (only when the agent
             has no file-writing tools).
-        model: Model shorthand (``"opus"``, ``"sonnet"``, ``"haiku"``) or
-            full model ID. Falls back to ``Pipeline.default_model``.
+        model: Label from ``norn/model_labels.toml``
+            (e.g. ``"light"``, ``"standard"``, ``"deep"``). Falls back to
+            ``Pipeline.default_model``.
         thinking: Thinking budget config, e.g.
             ``{"type": "enabled", "budget_tokens": 10000}``.
         permission_mode: Agent permission level — ``"default"``,
@@ -125,7 +121,7 @@ class Generate(BaseStage):
 
         Stage("implement", Generate(
             prompt="Implement this feature: {param.args}",
-            model="sonnet",
+            model="standard",
             permission_mode="acceptEdits",
             allowed_tools=["Read", "Write", "Edit", "Bash"],
             setting_sources=["project"],
@@ -245,6 +241,14 @@ class Generate(BaseStage):
             )
 
         resolved_model = self.model or ctx.params.get("default_model")
+
+        # Best-effort label resolution for _details (journal/observability only)
+        _resolved_label = None
+        if resolved_model is not None:
+            try:
+                _resolved_label = resolve_label(ctx.agent_provider, resolved_model)
+            except ModelLabelError:
+                pass
 
         # Resolve effective settings: stage-level overrides pipeline-level profile
         _pp = ctx.pipeline_profile
@@ -394,6 +398,9 @@ class Generate(BaseStage):
             "system_prompt": system_prompt,
             "model": self.model,
             "resolved_model": resolved_model,
+            "model_label": _resolved_label.label if _resolved_label else None,
+            "pinned_model": _resolved_label.model if _resolved_label else None,
+            "effort": _resolved_label.effort if _resolved_label else None,
             "permission_mode": effective_permission_mode,
             "allowed_tools": effective_allowed_tools,
             "effective_max_turns": effective_max_turns,

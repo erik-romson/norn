@@ -759,3 +759,172 @@ async def test_step_mode_skip_in_loop():
     result = ctx.results["s1"]
     assert result.success
     assert result.output is None
+
+
+# ---------------------------------------------------------------------------
+# Preflight: _check_model_labels
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preflight_missing_label_raises():
+    """Preflight raises ModelLabelError when a Generate stage has no model and no default_model."""
+    from norn.model_labels import ModelLabelError
+    from norn.stages.generate import Generate
+
+    p = Pipeline("test").stage("gen", Generate(prompt="hello"))
+    with pytest.raises(ModelLabelError, match="has no model label"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_unknown_label_raises():
+    """Preflight raises ModelLabelError when the model label is not defined for the provider."""
+    from norn.model_labels import ModelLabelError
+    from norn.stages.generate import Generate
+
+    p = Pipeline("test").stage("gen", Generate(prompt="hello", model="nonexistent-label"))
+    with pytest.raises(ModelLabelError, match="unknown label"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_valid_label_passes():
+    """Preflight passes (no error) for a known label; only the stage impl is not executed here
+    since the stage has no agent — non-Generate stages are unaffected by the preflight."""
+    # Use a SuccessStage (no model attr) so the pipeline runs without agent calls.
+    p = Pipeline("test").stage("s1", SuccessStage("ok"))
+    ctx = await run_pipeline(p, agent_provider="claude-code")
+    assert ctx.get("s1") == "ok"
+
+
+def test_preflight_default_model_satisfies_missing_stage_model():
+    """A pipeline with default_model covers Generate stages that don't set model explicitly."""
+    from norn.stages.generate import Generate
+    from norn.runner import _check_model_labels
+
+    p = Pipeline("test", default_model="standard").stage("gen", Generate(prompt="hello"))
+    # Should not raise any exception — "standard" is a known label for claude-code.
+    _check_model_labels(p, "claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_walks_loop():
+    """Preflight recurses into Loop stages and catches a missing model."""
+    from norn.model_labels import ModelLabelError
+    from norn.stages.generate import Generate
+
+    loop = Loop("myloop", stages=[Stage("gen", Generate(prompt="hello"))])
+    p = Pipeline("test")
+    p.items.append(loop)
+    with pytest.raises(ModelLabelError, match="has no model label"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_walks_parallel():
+    """Preflight recurses into Parallel stages and catches an unknown label."""
+    from norn.model_labels import ModelLabelError
+    from norn.stages.generate import Generate
+
+    par = Parallel("mypar", stages=[Stage("gen", Generate(prompt="hello", model="bad-label"))])
+    p = Pipeline("test")
+    p.items.append(par)
+    with pytest.raises(ModelLabelError, match="unknown label"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_walks_include(tmp_path):
+    """Preflight recurses into Include items (loads sub-pipeline) and catches a missing label."""
+    from norn.model_labels import ModelLabelError
+
+    sub_file = tmp_path / "sub.py"
+    sub_file.write_text(
+        "from norn.dsl import Pipeline\n"
+        "from norn.stages.generate import Generate\n"
+        "config = Pipeline('sub').stage('gen', Generate(prompt='hello'))\n"
+    )
+    from norn.dsl import Include
+
+    p = Pipeline("test")
+    p.items.append(Include(path=str(sub_file)))
+    with pytest.raises(ModelLabelError, match="has no model label"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_effort_env_process(monkeypatch):
+    """Preflight rejects CLAUDE_CODE_EFFORT_LEVEL set in process env."""
+    from norn.model_labels import ModelLabelError
+    from norn.stages.generate import Generate
+
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "high")
+    p = Pipeline("test").stage("gen", Generate(prompt="hello", model="standard"))
+    with pytest.raises(ModelLabelError, match="CLAUDE_CODE_EFFORT_LEVEL"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_effort_env_pipeline():
+    """Preflight rejects CLAUDE_CODE_EFFORT_LEVEL set in pipeline env_vars."""
+    from norn.model_labels import ModelLabelError
+    from norn.stages.generate import Generate
+
+    p = (
+        Pipeline("test")
+        .env("CLAUDE_CODE_EFFORT_LEVEL", "medium")
+        .stage("gen", Generate(prompt="hello", model="standard"))
+    )
+    with pytest.raises(ModelLabelError, match="CLAUDE_CODE_EFFORT_LEVEL"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_effort_env_stage():
+    """Preflight rejects CLAUDE_CODE_EFFORT_LEVEL set in a Generate stage's env."""
+    from norn.model_labels import ModelLabelError
+    from norn.stages.generate import Generate
+
+    p = Pipeline("test").stage(
+        "gen",
+        Generate(prompt="hello", model="standard", env={"CLAUDE_CODE_EFFORT_LEVEL": "low"}),
+    )
+    with pytest.raises(ModelLabelError, match="CLAUDE_CODE_EFFORT_LEVEL"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_effort_env_profile():
+    """Preflight rejects CLAUDE_CODE_EFFORT_LEVEL set in the pipeline session profile."""
+    from norn.model_labels import ModelLabelError
+    from norn.profiles import SessionProfile
+    from norn.stages.generate import Generate
+
+    profile = SessionProfile(
+        name="test-profile",
+        permission_mode="plan",
+        env={"CLAUDE_CODE_EFFORT_LEVEL": "high"},
+    )
+    p = (
+        Pipeline("test")
+        .session_profile(profile)
+        .stage("gen", Generate(prompt="hello", model="standard"))
+    )
+    with pytest.raises(ModelLabelError, match="CLAUDE_CODE_EFFORT_LEVEL"):
+        await run_pipeline(p, agent_provider="claude-code")
+
+
+def test_preflight_effort_env_ignored_for_opencode():
+    """CLAUDE_CODE_EFFORT_LEVEL in pipeline env is NOT flagged for opencode (it's claude-code only)."""
+    from norn.stages.generate import Generate
+    from norn.runner import _check_model_labels
+
+    p = (
+        Pipeline("test")
+        .env("CLAUDE_CODE_EFFORT_LEVEL", "high")
+        .stage("gen", Generate(prompt="hello", model="standard"))
+    )
+    # For opencode the effort env check is skipped; only the label check runs.
+    # "standard" is known for opencode so the preflight should pass without raising.
+    _check_model_labels(p, "opencode")

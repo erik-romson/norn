@@ -184,7 +184,7 @@ class CompressTestLog(BaseStage):
             lets the model infer.
         summarize_with_haiku: Disable to skip the LLM compression pass.
             Defaults to ``True``.
-        haiku_model: Model shorthand. Defaults to ``"haiku"``.
+        haiku_model: Intent label. Defaults to ``"light"``.
         haiku_min_chars: Skip Haiku when the deterministic surefire
             extract is below this. Defaults to 4000.
         haiku_max_input_chars: Hard cap on input handed to Haiku — head
@@ -207,7 +207,7 @@ class CompressTestLog(BaseStage):
         source_stage: str,
         app_packages: list[str] | str | None = None,
         summarize_with_haiku: bool = True,
-        haiku_model: str = "haiku",
+        haiku_model: str = "light",
         haiku_min_chars: int = 4000,
         haiku_max_input_chars: int = 30000,
         fallback_head_chars: int = 4000,

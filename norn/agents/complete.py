@@ -11,6 +11,7 @@ import logging
 
 from norn.agents.base import AgentError, AgentRequest
 from norn.agents.registry import get_provider
+from norn.model_labels import resolve_label
 
 log = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ async def complete_text(
     prompt: str,
     *,
     provider: str = "claude-code",
-    model: str = "haiku",
+    model: str = "light",
     system_prompt: str | None = None,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
@@ -32,14 +33,19 @@ async def complete_text(
     Returns the concatenated text output, or ``None`` if the provider
     raises an error or returns empty output.
 
+    Raises ``ModelLabelError`` (from ``norn.model_labels``) when *model*
+    is not a recognised intent label for *provider*.
+
     Args:
         prompt: The user prompt text.
         provider: Provider name (e.g. ``"claude-code"`` or ``"opencode"``).
-        model: Model alias or full ID (e.g. ``"haiku"``).
+        model: Intent label (e.g. ``"light"``). Raw model IDs raise
+            ``ModelLabelError``.
         system_prompt: Optional system prompt prepended by the provider.
         cwd: Working directory for the provider process.
         env: Environment variables for the provider process.
     """
+    resolve_label(provider, model)  # raises ModelLabelError for unknown labels
     adapter = get_provider(provider)
 
     request = AgentRequest(

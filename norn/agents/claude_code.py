@@ -14,7 +14,7 @@ from norn.agents.base import (
     ToolUseBlock,
 )
 from norn.agents.capabilities import AgentCapabilities, CostMode
-from norn.agents.models import resolve_model
+from norn.model_labels import resolve_label
 
 log = logging.getLogger(__name__)
 
@@ -114,9 +114,6 @@ class ClaudeCodeProvider:
                 "claude-agent-sdk is not installed. Install with: uv add claude-agent-sdk"
             ) from exc
 
-        # Resolve model alias to provider-facing ID
-        resolved_model = resolve_model("claude-code", request.model)
-
         # Artifact tracking state (shared with the hook closure)
         artifacts: list[str] = []
         stderr_lines: list[str] = []
@@ -146,8 +143,10 @@ class ClaudeCodeProvider:
             opt_kwargs["setting_sources"] = request.setting_sources
         if request.add_dirs:
             opt_kwargs["add_dirs"] = request.add_dirs
-        if resolved_model:
-            opt_kwargs["model"] = resolved_model
+        if request.model:
+            r = resolve_label("claude-code", request.model)
+            opt_kwargs["model"] = r.model
+            opt_kwargs["effort"] = r.effort   # always present for claude-code
         if request.thinking:
             opt_kwargs["thinking"] = request.thinking
         if request.system_prompt:

@@ -101,7 +101,7 @@ class CompressSurefireLog(BaseStage):
             prompt as ``APP_PACKAGES``. ``None`` lets the model infer.
         summarize_with_haiku: Disable to get only the deterministic
             extract (no LLM call). Defaults to ``True``.
-        haiku_model: Model shorthand. Defaults to ``"haiku"``.
+        haiku_model: Intent label. Defaults to ``"light"``.
         haiku_min_chars: Skip Haiku when the deterministic extract is
             below this. Defaults to 500.
         haiku_max_input_chars: Hard cap on input handed to Haiku — head
@@ -120,7 +120,7 @@ class CompressSurefireLog(BaseStage):
         source_stage: str,
         app_packages: list[str] | str | None = None,
         summarize_with_haiku: bool = True,
-        haiku_model: str = "haiku",
+        haiku_model: str = "light",
         haiku_min_chars: int = 500,
         haiku_max_input_chars: int = 30000,
         passthrough_on_empty_extract: bool = True,

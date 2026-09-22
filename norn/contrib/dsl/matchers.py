@@ -23,5 +23,5 @@ def keyword() -> KeywordMatcher:
     return KeywordMatcher()
 
 
-def llm(model: str = "claude-sonnet-4-6") -> LLMMatcher:
+def llm(model: str = "standard") -> LLMMatcher:
     return LLMMatcher(model)

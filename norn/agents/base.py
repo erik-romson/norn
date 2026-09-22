@@ -37,7 +37,7 @@ class AgentRequest:
     prompt: str
     stage_name: str
     provider: str
-    model: str | None = None
+    model: str | None = None  # label from norn/model_labels.toml; resolved by each adapter
     session_id: str | None = None
     fork_session: bool = False
     allowed_tools: list[str] | None = None

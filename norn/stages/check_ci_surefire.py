@@ -358,7 +358,7 @@ def _format_app_packages(app_packages: list[str] | str | None) -> str:
 async def _haiku_summarize(
     text: str,
     *,
-    model: str = "haiku",
+    model: str = "light",
     app_packages: list[str] | str | None = None,
     provider: str = "claude-code",
 ) -> str | None:
@@ -369,7 +369,7 @@ async def _haiku_summarize(
 
     Args:
         text: The extracted Surefire failure block.
-        model: Model alias or full ID. Defaults to ``"haiku"``.
+        model: Model label. Defaults to ``"light"``.
         app_packages: Application package globs (e.g.
             ``["com.e4marine.*"]``). Frames matching these are always kept by
             the prompt. ``None`` tells the model to infer from the trace.
@@ -403,8 +403,7 @@ class CheckCISurefire(BaseStage):
     Args:
         summarize_with_haiku: When ``True`` (default) the extracted failure
             block is compressed further by Haiku. Disable for offline use.
-        haiku_model: Model shorthand passed to ``claude-agent-sdk``.
-            Defaults to ``"haiku"``.
+        haiku_model: Intent label. Defaults to ``"light"``.
         haiku_min_chars: Minimum length of the extracted text before Haiku
             is invoked. Below this, the deterministic extract is already
             small enough to use directly. Defaults to 4000.
@@ -429,7 +428,7 @@ class CheckCISurefire(BaseStage):
         poll_interval: int = 30,
         timeout_minutes: int = 30,
         summarize_with_haiku: bool = True,
-        haiku_model: str = "haiku",
+        haiku_model: str = "light",
         haiku_min_chars: int = 500,
         haiku_max_input_chars: int = 30000,
         app_packages: list[str] | str | None = None,

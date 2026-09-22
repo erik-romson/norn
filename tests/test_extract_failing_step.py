@@ -405,10 +405,10 @@ async def test_haiku_compress_delegates_to_complete_text():
         return "result"
 
     with patch("norn.agents.complete.complete_text", new=fake_complete):
-        result = await _haiku_compress("some log", model="haiku", provider="opencode")
+        result = await _haiku_compress("some log", model="light", provider="opencode")
 
     assert result == "result"
     assert captured["provider"] == "opencode"
-    assert captured["model"] == "haiku"
+    assert captured["model"] == "light"
     assert captured["system_prompt"] is not None
     assert "some log" in captured["prompt"]

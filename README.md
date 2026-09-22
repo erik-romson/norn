@@ -51,7 +51,7 @@ opencode models | grep -E 'claude|gpt'
 
 Credentials are stored in `~/.local/share/opencode/auth.json` and refreshed automatically. Norn does not pass tokens to the subprocess; the `opencode run` child process reads `auth.json` directly.
 
-The bundled opencode model aliases (`opus`, `sonnet`, `haiku`) map to `github-copilot/claude-*` IDs in `norn/agents/models.py`. If your opencode is authenticated against a different provider (e.g. Anthropic direct), edit `MODEL_ALIASES["opencode"]` to point at the IDs `opencode models` lists.
+Model IDs and reasoning-effort levels are pinned in `norn/model_labels.toml`. If your opencode is authenticated against a different provider (e.g. Anthropic direct), edit the `[opencode]` section of that file to use the IDs `opencode models` lists.
 
 ## Configuration
 
@@ -77,11 +77,12 @@ uv run python -m norn run examples/derived.py
 bin/norn examples/derived.py
 ```
 
-Discover bundled pipelines:
+Discover bundled pipelines and inspect available model labels:
 
 ```bash
 uv run python -m norn list
 uv run python -m norn describe hello
+uv run python -m norn models
 ```
 
 Useful run flags:
@@ -222,7 +223,7 @@ uv run python -m norn run fix_jira_issue CBS-2249
 | `issue.json` | fetch — raw Jira API response |
 | `issue.md` | fetch — Markdown rendition of the issue |
 | `attachments/` | fetch — downloaded issue attachments |
-| `<KEY>-preplan.md` | Claude (haiku) — structured brief |
+| `<KEY>-preplan.md` | Claude (light) — structured brief |
 | `<KEY>-plan-questions.md` | Claude — open questions for you to answer |
 | `<KEY>-final-plan.md` | Claude — deliverable plan |
 | `<KEY>-plan-review.md` | codex — review of the plan |
@@ -400,7 +401,7 @@ uv run python -m norn history pipeline.py --run 3
 uv run python -m norn history pipeline.py --compare 2 3
 ```
 
-Default models: **haiku** for the stage judge, **sonnet** for the narrative feedback pass. Use `--model opus` to upgrade both. `--max-cost` defaults to `5.0` USD; the command exits with an error if the running evaluation spend would exceed it.
+Default labels: **light** for the stage judge, **standard** for the narrative feedback pass. Use `--model deep` to upgrade both. `--max-cost` defaults to `5.0` USD; the command exits with an error if the running evaluation spend would exceed it.
 
 Evaluation cost is reported separately and never added to the pipeline's history totals.
 

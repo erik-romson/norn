@@ -12,6 +12,7 @@ This is the canonical repo instruction file for agents. Keep user-facing setup a
 - Run a focused test: `uv run python -m pytest tests/test_runner.py::test_loop_retries -v`.
 - There is no configured lint, formatter, or typecheck step in `pyproject.toml` or CI; do not invent one as required verification.
 - Run a bundled pipeline: `uv run python -m norn run hello`; list and inspect them with `uv run python -m norn list` and `uv run python -m norn describe hello`.
+- `uv run python -m norn models` prints every label with its pinned model, effort and `since` date, and the file path.
 - Run an external config: `uv run python -m norn run examples/derived.py`; `bin/norn examples/derived.py` only auto-prepends `run` when the first arg is a file.
 - The package is installed editable, so edits to `norn/pipelines/*.py` take effect on the next run; never reinstall or `uv sync` just to pick up a pipeline change.
 - To drive a pipeline against another repo, `cd` there first: pipelines that pin `PROJECT_DIR = os.getcwd()` read it at import time, and `--project <norn checkout>` selects the environment without changing cwd.
@@ -25,6 +26,7 @@ This is the canonical repo instruction file for agents. Keep user-facing setup a
 - External pipeline files outside the workspace write new state beside a same-named file in the current working directory, with the external path only used as a read fallback.
 - Positional args after the config are joined into `{param.args}`; `--arg KEY=VALUE` becomes `{param.KEY}`; `--skip` must match the exact human stage name, including spaces.
 - Every key in `metadata["args"]` is rendered as a required positional by `norn describe` (`norn/cli.py:293-302`) and prompted for by the TUI launcher (`norn/tui/launch.py:33-46`); optional `--arg` knobs belong in the module docstring instead.
+- `--arg model=`, `review_model=`, `aggregate_model=` and `codex_label=` are validated against `norn/model_labels.toml` at import; an unknown label fails the load, not the stage.
 
 ## Architecture
 - `norn/` is the generic core and must not import from `norn.contrib`; contrib/domain code can import core.
@@ -58,6 +60,11 @@ This is the canonical repo instruction file for agents. Keep user-facing setup a
 - `StageResult.details` — free-form dict attached by stages that want to persist structured data beyond the plain `output`; serialised by the run journal (`norn/journal.py`); not stored in the checkpoint and not forwarded to `StageLogEntry`.
 - The `plan` permission mode + `max_turns=1` no-write-tools idiom is now used in norn core (`norn/evaluate.py`) for LLM judging: the agent sees the journal but cannot modify files, so the judge is a pure reader.
 - Evaluation cost is tracked separately in `evaluate_run` (not added to `UsageTracker`, `.history`, or any pipeline budget) and reported after the run.
+- `norn/model_labels.toml` is the ONE home for every model id and reasoning effort; `norn/model_labels.py` loads and validates it. A guard test in `tests/test_model_labels.py` scans `norn/**/*.py`, `bin/`, and `examples/` and fails if any file outside the loader contains a raw model id or the transitional shorthands `haiku`/`sonnet`/`opus`.
+- **Effort is mandatory and explicit.** Every `claude-code` call sends `--effort <value>` and every `codex` call sends `-c model_reasoning_effort=<value>`, both derived from the label. `opencode` forbids effort (no `--variant` verified). `CLAUDE_CODE_EFFORT_LEVEL` in any env source is rejected — effort comes from the label, not from env.
+- Codex is not an `AgentProvider`; pipelines that use codex (`plan_with_review`, `_plan_review.py`) drive it through `RunCommand` and always pass `-m <model>` and `-c model_reasoning_effort=<effort>` resolved from the label. There is no codex provider path.
+- `implement_features_v2` rejects `effort:` in step front-matter; the label is the tuning unit. `implement_features.py` (v1) is frozen except for the one permitted post-freeze edit: the `--root` filter in `_snapshot_diff.py` that prevents a single gitignored path from aborting the commit stage.
+- `run_pipeline` preflights every `Generate` stage's label before the first stage runs. A missing label combined with a missing `default_model` is a hard error that surfaces before any agent token is spent.
 
 ## UI And Event Seam
 - The terminal UI (`norn ui`), the typed run-event seam (`norn/events.py`, `norn/event_sink.py`), and the Textual code under `norn/tui/` are documented in `docs/norn-ui.md`; read it before touching any of them.
@@ -84,7 +91,7 @@ This is the canonical repo instruction file for agents. Keep user-facing setup a
 - If `permission_mode` or `allowed_tools` is set, the agent writes files through tools and `Generate.output_file` is ignored.
 - Use absolute paths in prompts for agent-backed file edits; bundled pipelines do this because the bundled CLI may resolve its project root differently.
 - Use `setting_sources=["project"]` when a Generate stage should load repo guidance such as `AGENTS.md` or `CLAUDE.md`.
-- Model shorthands are repo-defined in `norn/stages/generate.py`: `opus`, `sonnet`, and `haiku` map to provider-specific model IDs.
+- `Generate(model=...)`, `Pipeline(default_model=...)`, every `--arg *model*` knob, and step front-matter `model:` take a **label** from `norn/model_labels.toml` (`light`, `standard`, `deep`; `review` for codex). Raw model ids are rejected. `norn models` prints the current mapping.
 
 ## Config And Secrets
 - The CLI loads env files automatically in this order: `~/.norn/env`, then `.norn.env`; explicit process env vars win.

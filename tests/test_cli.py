@@ -439,3 +439,50 @@ def test_run_external_config_writes_state_in_cwd(tmp_path, monkeypatch):
     assert (workspace / "pipeline.history").exists()
     assert (workspace / "pipeline.checkpoint").exists()
     assert not (shared / "pipeline.history").exists()
+
+
+# ---------------------------------------------------------------------------
+# norn models subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_models_subcommand_shows_all_intent_labels(capsys):
+    """norn models prints every intent label (light, standard, deep, review)."""
+    with patch("sys.argv", ["norn", "models"]):
+        main()
+    captured = capsys.readouterr()
+    for label in ("light", "standard", "deep"):
+        assert label in captured.out, f"Expected label {label!r} in norn models output"
+    assert "review" in captured.out, "Expected 'review' (codex) label in norn models output"
+
+
+def test_models_subcommand_shows_providers(capsys):
+    """norn models table includes all three provider names."""
+    with patch("sys.argv", ["norn", "models"]):
+        main()
+    captured = capsys.readouterr()
+    for provider in ("claude-code", "codex", "opencode"):
+        assert provider in captured.out, f"Expected provider {provider!r} in norn models output"
+
+
+def test_models_subcommand_shows_file_path(capsys):
+    """norn models prints the path to model_labels.toml."""
+    with patch("sys.argv", ["norn", "models"]):
+        main()
+    captured = capsys.readouterr()
+    assert "model_labels.toml" in captured.out
+
+
+def test_models_subcommand_shows_effort_values(capsys):
+    """norn models shows the effort each claude-code label resolves to."""
+    from norn.model_labels import labels_for, resolve_label
+
+    with patch("sys.argv", ["norn", "models"]):
+        main()
+    captured = capsys.readouterr()
+    # Read the expected efforts from the TOML rather than pinning literals here,
+    # so adopting a new model stays a one-file change.
+    for label in labels_for("claude-code"):
+        effort = resolve_label("claude-code", label).effort
+        assert effort is not None, f"claude-code label {label!r} has no effort"
+        assert effort in captured.out, f"Expected effort {effort!r} in norn models output"

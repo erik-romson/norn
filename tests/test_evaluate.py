@@ -270,7 +270,7 @@ async def test_eval_json_written_from_structured_output(tmp_path):
         "usage": {"num_turns": 5, "total_cost_usd": 0.10, "tool_uses": 3, "tool_errors": 0},
     }
 
-    result, usage = await judge_stage(provider, record, "digest", model="haiku")
+    result, usage = await judge_stage(provider, record, "digest", model="light")
 
     assert result == canned
     assert result["score"] == 4
@@ -300,7 +300,7 @@ async def test_no_structured_output_raises():
     }
 
     with pytest.raises(EvaluationError, match="--no-judge"):
-        await judge_stage(provider, record, "", model="haiku")
+        await judge_stage(provider, record, "", model="light")
 
 
 # ---------------------------------------------------------------------------
@@ -392,8 +392,8 @@ async def test_feedback_writes_files(tmp_path):
         result = await evaluate_run(
             state_key, 1,
             provider_name="fake",
-            judge_model="haiku",
-            feedback_model="sonnet",
+            judge_model="light",
+            feedback_model="standard",
         )
 
         assert result.score == 7
@@ -647,3 +647,38 @@ def test_valid_header_score_10():
     text = "RUN: 1\nSCORE: 10\nPIPELINE: test.py\n\nPerfect."
     score = validate_feedback_header(text, 1, "test.py")
     assert score == 10
+
+
+# ---------------------------------------------------------------------------
+# complete_text raises ModelLabelError for stale / raw model IDs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_complete_text_raises_for_stale_model_id():
+    """complete_text raises ModelLabelError when given a raw model ID instead of an intent label."""
+    from norn.agents.complete import complete_text
+    from norn.model_labels import ModelLabelError
+
+    with pytest.raises(ModelLabelError):
+        await complete_text("hello", provider="claude-code", model="claude-haiku-4-5-20251001")
+
+
+@pytest.mark.asyncio
+async def test_complete_text_raises_for_unknown_label():
+    """complete_text raises ModelLabelError for an unrecognised label."""
+    from norn.agents.complete import complete_text
+    from norn.model_labels import ModelLabelError
+
+    with pytest.raises(ModelLabelError):
+        await complete_text("hello", provider="claude-code", model="turbo")
+
+
+def test_evaluate_run_defaults_are_light_and_standard():
+    """evaluate_run signature defaults: judge_model='light', feedback_model='standard'."""
+    import inspect
+    from norn.evaluate import evaluate_run
+
+    sig = inspect.signature(evaluate_run)
+    assert sig.parameters["judge_model"].default == "light"
+    assert sig.parameters["feedback_model"].default == "standard"

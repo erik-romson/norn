@@ -126,7 +126,7 @@ timeout_minutes = int(_args.get("timeout", "30"))
 
 
 config = (
-    Pipeline("check_ci_demo")
+    Pipeline("check_ci_demo", default_model="standard")
     .stage(
         "show config",
         RunCommand(cmd=(

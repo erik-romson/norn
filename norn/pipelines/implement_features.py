@@ -376,7 +376,7 @@ for sf in step_files:
 # --- build pipeline --------------------------------------------------------
 
 pipeline = (
-    Pipeline("implement_features", default_model="sonnet")
+    Pipeline("implement_features", default_model="standard")
     .alert(MacOSChannel())
 )
 
@@ -425,8 +425,8 @@ for step_file in step_files:
     )
 
     # Per-step model override. Steps that need heavier reasoning can opt in
-    # to opus via `model: opus` in their front-matter; everything else falls
-    # back to the pipeline default (sonnet).
+    # to deep via `model: deep` in their front-matter; everything else falls
+    # back to the pipeline default (standard).
     step_model = step_fm.get("model") or None
 
     # Commit subject: first H1 from the step body, falling back to the stem.
@@ -462,8 +462,8 @@ for step_file in step_files:
         )
 
     # Step 1: implement the step.
-    # Defaults to the pipeline-level model (sonnet). Steps that need heavier
-    # reasoning can opt into opus via `model: opus` in their front-matter —
+    # Defaults to the pipeline-level model (standard). Steps that need heavier
+    # reasoning can opt into deep via `model: deep` in their front-matter —
     # see .claude/skills/split-plan/SKILL.md for the convention.
     pipeline.stage(
         f"implement {name}",
@@ -677,7 +677,7 @@ for step_file in step_files:
                 "- Important details the next step's implementer should know\n\n"
                 "Output ONLY the bullet points, no preamble.\n"
             ),
-            model="haiku",
+            model="light",
             allowed_tools=["Read", "Glob", "Grep", "Bash"],
             permission_mode="acceptEdits",
             setting_sources=["project"],
@@ -761,7 +761,7 @@ pipeline.stage(
             "Read the actual changed files to understand what was built — "
             "don't just summarize the plan, summarize the implementation.\n"
         ),
-        model="haiku",
+        model="light",
         allowed_tools=["Read", "Glob", "Grep", "Bash"],
         permission_mode="acceptEdits",
         setting_sources=["project"],

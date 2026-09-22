@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from norn.agents.base import AgentError, AgentEvent, AgentRequest, AgentUsage
 from norn.agents import registry as agent_registry
-from norn.agents.models import MODEL_ALIASES, resolve_model
+from norn.model_labels import ModelLabelError, resolve_label
 from norn.models import PipelineContext, StageResult
 from norn.stages.generate import Generate, MODEL_MAP
 
@@ -114,10 +114,49 @@ def test_generate_stores_model_and_thinking():
     assert gen.thinking == {"type": "enabled", "budget_tokens": 5000}
 
 
-def test_model_map_short_names():
-    assert MODEL_MAP["opus"] == "claude-opus-4-6"
-    assert MODEL_MAP["sonnet"] == "claude-sonnet-4-6"
-    assert MODEL_MAP["haiku"] == "claude-haiku-4-5-20251001"
+@pytest.mark.asyncio
+async def test_details_carries_model_label_pinned_model_effort(fake_provider):
+    """_details always contains model_label, pinned_model, effort keys."""
+    gen = Generate(prompt="hi")  # no model → all three None
+    result = await gen.run(_ctx_for_fake())
+    assert result.details is not None
+    assert "model_label" in result.details
+    assert "pinned_model" in result.details
+    assert "effort" in result.details
+    assert result.details["model_label"] is None
+    assert result.details["pinned_model"] is None
+    assert result.details["effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_details_model_label_resolved_for_known_provider():
+    """_details.model_label, pinned_model, effort are filled when provider+label are known."""
+    class _FakeClaude:
+        name = "claude-code"
+        requests: list = []
+
+        async def run(self, request):
+            _FakeClaude.requests.append(request)
+            return
+            yield
+
+    original = agent_registry._registry.get("claude-code")
+    agent_registry.register(_FakeClaude())
+    _FakeClaude.requests.clear()
+    try:
+        gen = Generate(prompt="hi", model="light")
+        ctx = PipelineContext()
+        ctx.agent_provider = "claude-code"
+        result = await gen.run(ctx)
+        assert result.details is not None
+        assert result.details["model_label"] == "light"
+        assert result.details["pinned_model"] == "claude-haiku-4-5-20251001"
+        assert result.details["effort"] == "low"
+    finally:
+        if original:
+            agent_registry.register(original)
+        else:
+            agent_registry._registry.pop("claude-code", None)
 
 
 # ---------------------------------------------------------------------------
@@ -711,52 +750,39 @@ async def test_generate_uses_claude_code_provider_by_default():
 
 
 # ---------------------------------------------------------------------------
-# norn.agents.models – resolve_model
+# norn.model_labels – resolve_label
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_model_none_returns_none():
-    assert resolve_model("claude-code", None) is None
-    assert resolve_model("opencode", None) is None
+def test_resolve_label_claude_code_intent_labels():
+    """Intent labels light/standard/deep resolve and carry effort."""
+    for label in ("light", "standard", "deep"):
+        r = resolve_label("claude-code", label)
+        assert r.model
+        assert r.effort is not None
+        assert r.provider == "claude-code"
+        assert r.label == label
 
 
-def test_resolve_model_claude_code_aliases():
-    assert resolve_model("claude-code", "opus") == MODEL_MAP["opus"]
-    assert resolve_model("claude-code", "sonnet") == MODEL_MAP["sonnet"]
-    assert resolve_model("claude-code", "haiku") == MODEL_MAP["haiku"]
+def test_resolve_label_opencode_intent_labels():
+    """Intent labels light/standard/deep resolve for opencode with no effort."""
+    for label in ("light", "standard", "deep"):
+        r = resolve_label("opencode", label)
+        assert r.model
+        assert r.effort is None
+        assert r.provider == "opencode"
 
 
-def test_resolve_model_claude_code_full_id_passthrough():
-    assert resolve_model("claude-code", "claude-sonnet-4-6") == "claude-sonnet-4-6"
-    assert resolve_model("claude-code", "claude-opus-4-6") == "claude-opus-4-6"
+def test_resolve_label_unknown_label_raises():
+    """Unknown label raises ModelLabelError naming the provider and label."""
+    with pytest.raises(ModelLabelError, match="claude-code"):
+        resolve_label("claude-code", "nonexistent-label")
 
 
-def test_resolve_model_opencode_aliases():
-    assert resolve_model("opencode", "opus") == "github-copilot/claude-opus-4.7"
-    assert resolve_model("opencode", "sonnet") == "github-copilot/claude-sonnet-4.6"
-    assert resolve_model("opencode", "haiku") == "github-copilot/claude-sonnet-4.6"
-
-
-def test_resolve_model_opencode_normalises_claude_prefix():
-    assert resolve_model("opencode", "claude-sonnet-4-6") == "anthropic/claude-sonnet-4-6"
-    assert resolve_model("opencode", "claude-opus-4-6") == "anthropic/claude-opus-4-6"
-
-
-def test_resolve_model_opencode_anthropic_prefixed_passthrough():
-    assert resolve_model("opencode", "anthropic/claude-sonnet-4-6") == "anthropic/claude-sonnet-4-6"
-
-
-def test_resolve_model_opencode_unknown_id_passthrough():
-    assert resolve_model("opencode", "gpt-4o") == "gpt-4o"
-
-
-def test_resolve_model_unknown_provider_passthrough():
-    assert resolve_model("some-future-provider", "sonnet") == "sonnet"
-    assert resolve_model("some-future-provider", "my-custom-model") == "my-custom-model"
-
-
-def test_model_aliases_claude_code_consistent_with_model_map():
-    assert MODEL_ALIASES["claude-code"] == MODEL_MAP
+def test_resolve_label_unknown_provider_raises():
+    """Unknown provider raises ModelLabelError."""
+    with pytest.raises(ModelLabelError, match="some-future-provider"):
+        resolve_label("some-future-provider", "sonnet")
 
 
 # ---------------------------------------------------------------------------
@@ -1540,8 +1566,8 @@ async def test_opencode_cwd_passed_to_cli():
 
 
 @pytest.mark.asyncio
-async def test_opencode_alias_model_resolution():
-    """Model alias 'sonnet' resolves to github-copilot/claude-sonnet-4.6."""
+async def test_opencode_label_model_resolution():
+    """Intent label 'standard' resolves to github-copilot/claude-sonnet-4.6."""
     events = [_step_finish_event()]
     captured_cmd: list = []
 
@@ -1551,32 +1577,12 @@ async def test_opencode_alias_model_resolution():
 
     with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec), _patch_which():
         provider = OpenCodeProvider()
-        request = _opencode_request(model="sonnet")
+        request = _opencode_request(model="standard")
         _ = [e async for e in provider.run(request)]
 
     assert "-m" in captured_cmd
     idx = captured_cmd.index("-m")
     assert captured_cmd[idx + 1] == "github-copilot/claude-sonnet-4.6"
-
-
-@pytest.mark.asyncio
-async def test_opencode_claude_id_normalization():
-    """Bare claude-* IDs are normalized to anthropic/ prefix."""
-    events = [_step_finish_event()]
-    captured_cmd: list = []
-
-    async def _capture_exec(*args, **kwargs):
-        captured_cmd.extend(args)
-        return _FakeProcess(events)
-
-    with patch("asyncio.create_subprocess_exec", side_effect=_capture_exec), _patch_which():
-        provider = OpenCodeProvider()
-        request = _opencode_request(model="claude-opus-4-6")
-        _ = [e async for e in provider.run(request)]
-
-    assert "-m" in captured_cmd
-    idx = captured_cmd.index("-m")
-    assert captured_cmd[idx + 1] == "anthropic/claude-opus-4-6"
 
 
 # -- Permission mapping --
@@ -1771,14 +1777,14 @@ async def test_opencode_usage_mapped():
     sub_patch, _ = _patch_subprocess(events)
     with sub_patch, _patch_which():
         provider = OpenCodeProvider()
-        request = _opencode_request(model="sonnet")
+        request = _opencode_request(model="standard")
         collected = [e async for e in provider.run(request)]
 
     usage_events = [e for e in collected if e.usage is not None]
     assert len(usage_events) == 1
     usage = usage_events[0].usage
     assert usage.provider == "opencode"
-    assert usage.model == "sonnet"
+    assert usage.model == "standard"
     assert usage.input_tokens == 400
     assert usage.output_tokens == 100
     assert usage.cache_read_input_tokens == 50

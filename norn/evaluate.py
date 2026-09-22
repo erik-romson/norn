@@ -2,9 +2,9 @@
 
 Two LLM passes fed from the run journal, billed separately from the pipeline:
 
-1. **Judge** (haiku, per agent stage): scores each stage 1-5 on waste,
+1. **Judge** (light, per agent stage): scores each stage 1-5 on waste,
    prompt quality, and task adherence.
-2. **Feedback** (sonnet, whole run): reads metrics, findings, stage scores,
+2. **Feedback** (standard, whole run): reads metrics, findings, stage scores,
    prior runs, and optionally the pipeline source to produce actionable
    improvement suggestions.
 
@@ -247,9 +247,7 @@ async def judge_stage(
         )
 
     from norn.agents.base import AgentRequest
-    from norn.agents.models import resolve_model
 
-    resolved_model = resolve_model(provider.name, model)
     node_id = record.get("node_id", "unknown")
 
     prompt = build_judge_prompt(record, digest)
@@ -257,7 +255,7 @@ async def judge_stage(
         prompt=prompt,
         stage_name=f"judge:{node_id}",
         provider=provider.name,
-        model=resolved_model,
+        model=model,
         permission_mode="plan",
         max_turns=1,
         output_format=JUDGE_SCHEMA,
@@ -374,14 +372,12 @@ async def run_feedback(
 ) -> tuple[str, Any]:
     """Run the feedback LLM pass. Returns ``(text, usage)``."""
     from norn.agents.base import AgentRequest
-    from norn.agents.models import resolve_model
 
-    resolved_model = resolve_model(provider.name, model)
     request = AgentRequest(
         prompt=prompt,
         stage_name="feedback",
         provider=provider.name,
-        model=resolved_model,
+        model=model,
         permission_mode="plan",
         allowed_tools=["Read", "Grep", "Glob"],
         max_turns=40,
@@ -455,8 +451,8 @@ async def evaluate_run(
     *,
     provider_name: str | None = None,
     judge: bool = True,
-    judge_model: str = "haiku",
-    feedback_model: str = "sonnet",
+    judge_model: str = "light",
+    feedback_model: str = "standard",
     stage_glob: str | None = None,
     max_cost_usd: float = 5.0,
 ) -> EvaluationResult:
@@ -467,8 +463,8 @@ async def evaluate_run(
         run_id: Numeric run ID.
         provider_name: Agent provider name (defaults to run.json's provider).
         judge: Whether to run per-stage judge pass.
-        judge_model: Model shorthand for judge (default ``"haiku"``).
-        feedback_model: Model shorthand for feedback (default ``"sonnet"``).
+        judge_model: Intent label for judge (default ``"light"``).
+        feedback_model: Intent label for feedback (default ``"standard"``).
         stage_glob: Optional fnmatch pattern to filter stages for judging.
         max_cost_usd: Maximum evaluation cost before aborting.
 

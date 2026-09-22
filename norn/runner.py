@@ -930,6 +930,97 @@ def _write_run_metrics(ctx: PipelineContext) -> None:
         ctx.findings = []
 
 
+def _check_model_labels(pipeline: Pipeline, provider: str) -> None:
+    """Preflight: validate every Generate stage's model label before the run starts.
+
+    Walks ``pipeline.items`` recursively (Stage→impl, Loop→stages,
+    Parallel→stages, Include→loaded sub-pipeline items).  For every stage
+    whose implementation has a ``model`` attribute (i.e. a ``Generate``
+    stage), resolves ``stage.model or pipeline.default_model`` against
+    *provider*.
+
+    For ``claude-code`` runs also checks that ``CLAUDE_CODE_EFFORT_LEVEL``
+    is not set in any env source (process env, pipeline env_vars, stage env,
+    pipeline session-profile env) — effort is owned by the label, not by an
+    env var.
+
+    Raises
+    ------
+    ModelLabelError
+        All violations are collected and reported in one message.
+    """
+    from norn.model_labels import (
+        ModelLabelError,
+        _KNOWN_PROVIDERS,
+        labels_for,
+        resolve_label,
+    )
+
+    # Skip preflight for providers not in the TOML (e.g. test-only fake providers).
+    if provider not in _KNOWN_PROVIDERS:
+        return
+
+    _EFFORT_VAR = "CLAUDE_CODE_EFFORT_LEVEL"
+    errors: list[str] = []
+
+    def _check_effort(env: dict | None) -> None:
+        if not env or not isinstance(env, dict):
+            return
+        val = env.get(_EFFORT_VAR)
+        if val is not None:
+            msg = (
+                f"{_EFFORT_VAR} is set (={val}); unset it -- effort comes from"
+                " the label in norn/model_labels.toml"
+            )
+            if msg not in errors:
+                errors.append(msg)
+
+    if provider == "claude-code":
+        _check_effort(dict(os.environ))
+        _check_effort(pipeline.env_vars)
+        if pipeline._session_profile is not None:
+            _check_effort(pipeline._session_profile.env)
+
+    def _walk(items: list, default_model: str | None) -> None:
+        from norn.stages.generate import Generate as _Generate
+        for item in items:
+            if isinstance(item, Stage):
+                impl = item.impl
+                if not isinstance(impl, _Generate):
+                    continue
+                if provider == "claude-code":
+                    _check_effort(getattr(impl, "env", None))
+                label = impl.model or default_model
+                if label is None:
+                    errors.append(
+                        f"stage {item.name!r} has no model label and the pipeline sets no default_model"
+                    )
+                else:
+                    try:
+                        resolve_label(provider, label)
+                    except ModelLabelError:
+                        valid = ", ".join(labels_for(provider))
+                        errors.append(
+                            f"stage {item.name!r}: unknown label {label!r} for provider"
+                            f" {provider!r}; labels: {valid}"
+                        )
+            elif isinstance(item, Loop):
+                _walk(item.stages, default_model)
+            elif isinstance(item, Parallel):
+                _walk(item.stages, default_model)
+            elif isinstance(item, Include):
+                try:
+                    sub = load_pipeline(item.path)
+                    _walk(sub.items, sub.default_model or default_model)
+                except Exception as exc:
+                    log.debug("preflight: could not load Include %r: %s", item.path, exc)
+
+    _walk(pipeline.items, pipeline.default_model)
+
+    if errors:
+        raise ModelLabelError("\n".join(errors))
+
+
 async def run_pipeline(
     pipeline: Pipeline,
     params: dict[str, str] | None = None,
@@ -993,6 +1084,7 @@ async def run_pipeline(
         ctx.run_controller = run_controller
     ctx.run_id = run_id if run_id is not None else str(uuid.uuid4())
     ctx.unit_id = "unit-0"
+    _check_model_labels(pipeline, agent_provider)
     ctx.event_sink.emit(RunStarted(
         key=EventKey(run_id=ctx.run_id, unit_id=ctx.unit_id),
         pipeline_name=pipeline.name,

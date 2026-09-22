@@ -13,7 +13,7 @@ metadata = {
 }
 
 config = (
-    Pipeline("hello")
+    Pipeline("hello", default_model="standard")
     .stage(
         "read_spec",
         ReadFile(path="examples/spec.txt"),

@@ -259,7 +259,7 @@ Generate(
     prompt="...",                    # The prompt (supports {stage.output} and {param.key} placeholders)
     template="name",                 # OR use a named template (see Templates section)
     input="{prior_stage.output}",    # Input for template placeholders
-    model="sonnet",                  # Model: "opus", "sonnet", "haiku", or full model ID
+    model="standard",                # Intent label: "light", "standard", "deep" (see `norn models`)
     thinking={"type": "enabled", "budget_tokens": 10000},  # Thinking budget
     permission_mode="acceptEdits",   # "default", "acceptEdits", "plan", "bypassPermissions"
     allowed_tools=["Read", "Edit", "Bash"],  # Pre-approved tools
@@ -279,12 +279,17 @@ Generate(
 - `{param.key}` — pipeline parameter from `--arg` or positional args
 - Unresolved placeholders are left as-is (not an error)
 
-**Model shortcuts:**
-| Short name | Model ID |
-|------------|----------|
-| `opus` | `claude-opus-4-6` |
-| `sonnet` | `claude-sonnet-4-6` |
-| `haiku` | `claude-haiku-4-5-20251001` |
+**Intent labels** (model IDs and effort levels are pinned in `norn/model_labels.toml`):
+
+```bash
+uv run python -m norn models
+```
+
+| Label | Intent |
+|-------|--------|
+| `light` | Fast and cheap: briefs, judging, log compression |
+| `standard` | Default: implementation steps, reviews, CI fixes |
+| `deep` | Heavy reasoning: plan drafting, hard bugs |
 
 **Artifact tracking:** When the agent uses Write/Edit tools, the file paths are
 captured automatically via a PostToolUse hook and displayed after the stage.
@@ -621,10 +626,10 @@ Skills are injected into the agent's `system_prompt`.
 Choose different models per stage for cost optimization.
 
 ```python
-Pipeline("smart-build", default_model="sonnet")
-    .stage("plan", Generate(prompt="Plan: {param.args}", model="opus"))
-    .stage("implement", Generate(prompt="Implement: {plan.output}"))  # uses sonnet
-    .stage("review", Generate(prompt="Quick check", model="haiku"))
+Pipeline("smart-build", default_model="standard")
+    .stage("plan", Generate(prompt="Plan: {param.args}", model="deep"))
+    .stage("implement", Generate(prompt="Implement: {plan.output}"))  # uses standard
+    .stage("review", Generate(prompt="Quick check", model="light"))
 ```
 
 The usage report shows which model was used per stage.
@@ -633,7 +638,7 @@ Thinking budget control:
 ```python
 Generate(
     prompt="Complex reasoning task...",
-    model="opus",
+    model="deep",
     thinking={"type": "enabled", "budget_tokens": 10000},
 )
 ```

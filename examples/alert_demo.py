@@ -10,7 +10,7 @@ from norn.stages.run_command import RunCommand
 ALERT_FILE = "tmp/alert_demo/alerts.jsonl"
 
 config = (
-    Pipeline("alert_demo")
+    Pipeline("alert_demo", default_model="standard")
     .alert(FileChannel(path=ALERT_FILE))
     .stage("greet", RunCommand(cmd="echo 'Hello from alert_demo pipeline'"), on_failure=fail)
 )

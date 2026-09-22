@@ -168,9 +168,9 @@ SKIP_LOCAL = _args.get("skip_local", "false").lower() in ("1", "true", "yes")
 # trace and produce edits across multiple files, so Sonnet is the right
 # tier (Haiku is too weak to reliably trace multi-file failures; Opus is
 # expensive overkill for typical pytest / CI errors). Override per call
-# with --arg local_fix_model=opus when stuck on a hard bug.
-LOCAL_FIX_MODEL = _args.get("local_fix_model", "sonnet")
-CI_FIX_MODEL = _args.get("ci_fix_model", "sonnet")
+# with --arg local_fix_model=deep when stuck on a hard bug.
+LOCAL_FIX_MODEL = _args.get("local_fix_model", "standard")
+CI_FIX_MODEL = _args.get("ci_fix_model", "standard")
 
 print(f"[check_and_fix_ci] test_cmd       = {LOCAL_TEST_CMD}", file=sys.stderr)
 print(f"[check_and_fix_ci] local_fix_model = {LOCAL_FIX_MODEL}", file=sys.stderr)
@@ -442,7 +442,7 @@ class AssertUsefulLogs(BaseStage):
 # --- pipeline -------------------------------------------------------------
 
 pipeline = (
-    Pipeline("check_and_fix_ci", default_model="sonnet")
+    Pipeline("check_and_fix_ci", default_model="standard")
     .alert(MacOSChannel())
 )
 

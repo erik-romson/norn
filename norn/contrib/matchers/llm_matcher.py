@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 
 class LLMMatcher(RepoMatcher):
-    def __init__(self, model: str = "sonnet") -> None:
+    def __init__(self, model: str = "standard") -> None:
         self._model = model
 
     async def match(self, issue: IssueContext, ctx: PipelineContext) -> MatchResult | None:

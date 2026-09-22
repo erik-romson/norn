@@ -20,7 +20,7 @@ from typing import Any, AsyncIterator
 
 from norn.agents.base import AgentError, AgentEvent, AgentRequest, AgentUsage
 from norn.agents.capabilities import AgentCapabilities, CostMode
-from norn.agents.models import resolve_model
+from norn.model_labels import resolve_label
 
 log = logging.getLogger(__name__)
 
@@ -130,9 +130,10 @@ class OpenCodeProvider:
         """Build the ``opencode run`` command-line arguments."""
         cmd = ["opencode", "run", "--format", "json"]
 
-        resolved_model = resolve_model("opencode", request.model)
-        if resolved_model:
-            cmd.extend(["-m", resolved_model])
+        if request.model:
+            r = resolve_label("opencode", request.model)
+            assert r.effort is None
+            cmd.extend(["-m", r.model])
 
         if request.session_id:
             cmd.extend(["--session", request.session_id])

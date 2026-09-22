@@ -241,7 +241,7 @@ class ExtractFailingStep(BaseStage):
     Args:
         source_stage: Upstream stage name whose output (or error) holds
             the raw job log.
-        model: ``claude-agent-sdk`` shorthand. Defaults to ``"haiku"``.
+        model: Intent label. Defaults to ``"light"``.
         summarize_with_haiku: Disable to keep only the Python slice
             (useful for offline / no-network test runs). Defaults to
             ``True``.
@@ -263,7 +263,7 @@ class ExtractFailingStep(BaseStage):
         self,
         *,
         source_stage: str,
-        model: str = "haiku",
+        model: str = "light",
         summarize_with_haiku: bool = True,
         min_chars_for_haiku: int = 2000,
         max_haiku_input_chars: int = 120_000,

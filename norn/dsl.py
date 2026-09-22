@@ -205,7 +205,7 @@ class Pipeline:
         contexts: Files/commands to inject into Generate prompts.
         env_vars: Static environment variables for all stages.
         secret_specs: Secrets to resolve at pipeline start.
-        default_model: Fallback model for Generate stages without an
+        default_model: Fallback label for Generate stages without an
             explicit ``model`` parameter.
         pipeline_skills: Skills applied to all Generate stages.
     """
