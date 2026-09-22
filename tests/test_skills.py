@@ -123,6 +123,7 @@ def _make_fake_sdk(captured: dict[str, Any]) -> MagicMock:
 async def test_generate_stage_skills_injected_into_system_prompt(monkeypatch):
     captured: dict[str, Any] = {}
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", _make_fake_sdk(captured))
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk.types", MagicMock())
 
     from norn.stages.generate import Generate
 
@@ -140,6 +141,7 @@ async def test_generate_stage_skills_injected_into_system_prompt(monkeypatch):
 async def test_generate_multiple_skills_all_injected(monkeypatch):
     captured: dict[str, Any] = {}
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", _make_fake_sdk(captured))
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk.types", MagicMock())
 
     from norn.stages.generate import Generate
 
@@ -162,6 +164,7 @@ async def test_generate_multiple_skills_all_injected(monkeypatch):
 async def test_generate_pipeline_skills_merged_with_stage_skills(monkeypatch):
     captured: dict[str, Any] = {}
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", _make_fake_sdk(captured))
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk.types", MagicMock())
 
     from norn.stages.generate import Generate
 
@@ -184,6 +187,7 @@ async def test_generate_pipeline_skills_merged_with_stage_skills(monkeypatch):
 async def test_generate_no_system_prompt_when_no_skills(monkeypatch):
     captured: dict[str, Any] = {}
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", _make_fake_sdk(captured))
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk.types", MagicMock())
 
     from norn.stages.generate import Generate
 

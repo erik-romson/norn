@@ -323,6 +323,26 @@ Or via environment variable:
 export NORN_AGENT_PROVIDER=opencode
 ```
 
+**Which `claude` binary runs**
+
+The Claude Agent SDK ships its own copy of the Claude Code CLI and prefers it
+over the one on your `PATH`. That copy is frozen at the SDK release, so it
+falls behind the Claude Code you installed, and the gap shows up as a flag the
+CLI rejects mid-run — `--effort xhigh`, which the `deep` label sends, needs CLI
+2.1.9x or newer. norn compares the two versions and spawns the newer one,
+logging its choice once per run:
+
+```
+[claude-code] CLI: /Users/you/.local/bin/claude (PATH, 2.1.263)
+```
+
+Set `NORN_CLAUDE_CLI` to name a binary explicitly; it wins over both and is not
+version-checked.
+
+```bash
+export NORN_CLAUDE_CLI=/opt/claude/bin/claude
+```
+
 **OpenCode limitations (first-pass)**
 
 The following features are only supported with `claude-code` and will fail fast when used with `opencode`:

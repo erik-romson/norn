@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import functools
 import logging
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from norn.agents.base import (
@@ -22,6 +28,21 @@ log = logging.getLogger(__name__)
 # every transport spawn.  Pin the SDK logger to WARNING to keep real errors but
 # drop the spawn chatter.
 logging.getLogger("claude_agent_sdk").setLevel(logging.WARNING)
+
+# ---------------------------------------------------------------------------
+# Which `claude` binary to spawn
+# ---------------------------------------------------------------------------
+
+# The SDK's own search prefers the CLI bundled inside the installed
+# claude-agent-sdk wheel and only falls back to PATH when that file is absent.
+# The bundle is frozen at whatever version the wheel shipped with, so a norn
+# upgrade cycle away from the CLI the user actually installed is invisible until
+# a flag stops working mid-run: sdk 0.1.50 bundles CLI 2.1.81, which rejects
+# `--effort xhigh` that the `deep` label sends and that CLI 2.1.263 accepts.
+# norn therefore picks the *newer* of the two and says which one it chose.
+CLI_ENV_VAR = "NORN_CLAUDE_CLI"
+
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 _INPUT_SUMMARY_MAX = 200
 _RESULT_SUMMARY_MAX = 200
@@ -54,6 +75,90 @@ def _build_result_summary(content: Any) -> str:
     else:
         text = str(content) if content is not None else ""
     return text[:_RESULT_SUMMARY_MAX]
+
+
+def cli_version(path: str) -> tuple[int, int, int] | None:
+    """Return the version *path* reports, or ``None`` when it cannot be read.
+
+    Any failure — missing binary, non-zero exit, unparseable output, a hang —
+    is a "don't know", not an error: the caller then prefers a candidate whose
+    version it could read, and falls back to the SDK's own search if neither
+    answers.
+    """
+    try:
+        result = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = _VERSION_RE.search(result.stdout)
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def _bundled_cli() -> str | None:
+    """Return the CLI bundled in the installed SDK, mirroring the SDK's own lookup.
+
+    Every failure yields ``None``: the SDK may be absent, may be a namespace
+    package with no usable ``__file__``, or may be a test double standing in for
+    it. None of those are worth failing an agent call over — the caller simply
+    has one candidate fewer.
+    """
+    try:
+        import claude_agent_sdk
+
+        name = "claude.exe" if os.name == "nt" else "claude"
+        path = Path(claude_agent_sdk.__file__).parent / "_bundled" / name
+        return str(path) if path.is_file() else None
+    except (ImportError, AttributeError, TypeError, OSError):
+        return None
+
+
+@functools.cache
+def resolve_cli_path() -> str | None:
+    """Return the CLI norn should spawn, or ``None`` to let the SDK choose.
+
+    ``NORN_CLAUDE_CLI`` wins outright and is not version-checked — an operator
+    naming a binary means that binary. Otherwise the CLI on PATH and the one
+    bundled in the SDK are compared by version and the newer wins, because the
+    two drift apart independently: the bundle moves when the SDK is upgraded,
+    PATH moves when the user updates Claude Code.
+
+    Cached: the two ``--version`` probes run once per process, and the chosen
+    path is logged once rather than on every agent call.
+    """
+    override = os.environ.get(CLI_ENV_VAR)
+    if override:
+        log.info("[claude-code] CLI from %s: %s", CLI_ENV_VAR, override)
+        return override
+
+    candidates = [
+        (label, path)
+        for label, path in (("PATH", shutil.which("claude")), ("SDK bundle", _bundled_cli()))
+        if path
+    ]
+    versioned = [
+        (version, label, path)
+        for label, path in candidates
+        if (version := cli_version(path)) is not None
+    ]
+    if not versioned:
+        # Nothing answered `--version`. Let the SDK run its own search so its
+        # install instructions are what the user sees.
+        return None
+
+    version, label, path = max(versioned)
+    log.info(
+        "[claude-code] CLI: %s (%s, %s)",
+        path,
+        label,
+        ".".join(str(part) for part in version),
+    )
+    return path
 
 
 class ClaudeCodeError(AgentError):
@@ -139,6 +244,8 @@ class ClaudeCodeProvider:
             opt_kwargs["max_turns"] = request.max_turns
         if request.cwd:
             opt_kwargs["cwd"] = request.cwd
+        if (cli_path := resolve_cli_path()) is not None:
+            opt_kwargs["cli_path"] = cli_path
         if request.setting_sources:
             opt_kwargs["setting_sources"] = request.setting_sources
         if request.add_dirs:
