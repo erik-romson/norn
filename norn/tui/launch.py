@@ -20,6 +20,7 @@ from norn.state import (
     _load_checkpoint_for_config,
     _load_history_for_config,
     _primary_state_key,
+    publish_state_key,
 )
 
 
@@ -66,7 +67,16 @@ def load_pipeline_with_args(pipeline_ref: str, *, is_bundled: bool, params: dict
     import time to build their structure. Reconstruct ``argv`` from the
     positional ``args`` param around the import (and reload an already-imported
     module so a repeat selection with different args isn't served stale).
+
+    This is also the TUI's single pipeline-import site, so it is where the state
+    key is published. Pipelines that compute step ownership by diffing worktree
+    snapshots read ``NORN_STATE_KEY`` at import time to subtract norn's own
+    ``.runs``/``.checkpoint``/``.history`` from the diff; without it a TUI-
+    launched ``implement_features_v2`` commits its own run journal as a
+    step-owned change and then fails its own "owned paths are clean"
+    postcondition on the very next journal write.
     """
+    publish_state_key(pipeline_ref)
     positional = (params or {}).get("args", "")
     saved = list(sys.argv)
     try:

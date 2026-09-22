@@ -302,6 +302,15 @@ The runner is the **single source of truth**; the UI is a pure projection.
   `implement_features`) see them. `load_pipeline_with_args` also reloads an
   already-imported bundled module so a repeat run with different args isn't
   served a stale structure.
+- **`load_pipeline_with_args` is the TUI's only pipeline-import site, so it is
+  where the state key is published** (`norn.state.publish_state_key`), mirroring
+  `norn run`. Pipelines that compute step ownership by diffing worktree
+  snapshots read `NORN_STATE_KEY` at import time to subtract norn's own
+  `.runs`/`.checkpoint`/`.history`; when the TUI did not publish it, a
+  `norn ui` run of `implement_features_v2` committed its own run journal as a
+  step-owned change and then failed its own "owned paths are clean"
+  postcondition on the next journal write. `run_pipeline` re-checks the key and
+  registers those paths in `.git/info/exclude` as a second layer.
 - **fzf** (`args_prompt.run_fzf`): pipes a `find` listing into `fzf`. It
   **prunes** dependency/build/cache/VCS directories (`_FZF_PRUNE_DIRS`:
   `.git`, `.venv`, `node_modules`, `.m2`, `target`, `build`, `__pycache__`,

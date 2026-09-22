@@ -10,7 +10,10 @@ Features:
   step runs and again before commit. The diff between the two is the exact
   list of paths changed during this step, which is what gets committed.
   Pre-existing dirty files (whose status didn't change) are NOT swept into
-  the commit, so a dirty worktree no longer blocks the run.
+  the commit, so a dirty worktree no longer blocks the run. norn's own run
+  state (`<key>.runs/`, `<key>.checkpoint`, `<key>.history`) is subtracted
+  from that diff: it lives in the launch directory and keeps changing while
+  the run is in flight, so committing it would dirty the commit immediately.
 - Pre-flight toolchain check (uv, python) before any expensive Generate call
 - `record start` captures the starting SHA for later diffs
 - `review` and `handoff` stages at the end
@@ -48,6 +51,7 @@ from norn.dsl import Pipeline, Stage, ask_user, stage_failed
 from norn.stages.compress_test_log import CompressTestLog
 from norn.stages.generate import Generate
 from norn.stages.run_command import RunCommand
+from norn.state import state_ignore_flags
 
 # Pinned to the launch directory at import time. This pipeline is a
 # self-modifying pipeline that must target the repo it was launched from: its
@@ -90,6 +94,19 @@ GIT_TOPLEVEL = _git_toplevel(PROJECT_DIR)
 # never appear in `git status` output. Deterministic per feature_dir so
 # resume can be made aware of prior runs if needed.
 SNAPSHOT_HELPER = str(Path(__file__).parent / "_snapshot_diff.py")
+
+# norn's own run state — `<key>.checkpoint`, `<key>.history` and
+# `<key>.runs/<n>/` — is written into the launch directory *while the run is in
+# flight*. Launched from inside the target repo it lands in the worktree, where
+# the step diff sees it as work the step did and commits it; the next journal
+# write then dirties the commit that just went in. Every entry point calls
+# `norn.state.publish_state_key` before importing a pipeline, which exports
+# NORN_STATE_KEY so these paths can be subtracted from the diff. Empty when the
+# module is imported outside a run (--dry-run, tests); `run_pipeline`'s
+# `.git/info/exclude` registration is the backstop for that case.
+NORN_STATE_IGNORE_FLAGS = state_ignore_flags(
+    os.environ.get("NORN_STATE_KEY"), GIT_TOPLEVEL
+)
 
 metadata = {
     "env_vars": ["ANTHROPIC_API_KEY"],
@@ -625,7 +642,7 @@ for step_file in step_files:
                 f'git status --porcelain -uall > {shlex.quote(post_snapshot)} || exit 1; '
                 f'python3 {shlex.quote(SNAPSHOT_HELPER)} '
                 f'{shlex.quote(pre_snapshot)} {shlex.quote(post_snapshot)} '
-                f'--root {shlex.quote(GIT_TOPLEVEL)} '
+                f'--root {shlex.quote(GIT_TOPLEVEL)}{NORN_STATE_IGNORE_FLAGS} '
                 f'> {shlex.quote(changed_list)} || exit 1; '
                 f'if [ ! -s {shlex.quote(changed_list)} ]; then '
                 f'echo "no files changed during this step"; exit 0; fi; '

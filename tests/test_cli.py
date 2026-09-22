@@ -1,3 +1,5 @@
+import os
+import sys
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -132,6 +134,88 @@ def test_internal_file_state_key_stays_beside_config(tmp_path, monkeypatch):
 
     assert _state_key_candidates(str(internal)) == [str(internal.resolve())]
     assert _primary_state_key(str(internal)) == str(internal.resolve())
+
+
+# ---------------------------------------------------------------------------
+# Subtracting norn's own run state from a worktree diff
+#
+# norn writes `<key>.runs/<n>/events.jsonl`, `<key>.checkpoint` and
+# `<key>.history` into the launch directory and keeps writing to them for the
+# whole run. A pipeline that computes step ownership by diffing the worktree
+# has to subtract them, or it commits its own journal and then the next journal
+# write dirties the commit that just went in.
+# ---------------------------------------------------------------------------
+
+
+def test_state_artifact_paths_are_relative_to_the_repo_root():
+    from norn.state import state_artifact_paths
+
+    exact, prefixes = state_artifact_paths("/repo/pipe", "/repo")
+    assert exact == ["pipe.checkpoint", "pipe.history"]
+    assert prefixes == ["pipe.runs"]
+
+
+def test_state_artifact_paths_drops_state_outside_the_repo():
+    """State living elsewhere can never show up in git status — ignoring it is noise."""
+    from norn.state import state_artifact_paths
+
+    assert state_artifact_paths("/elsewhere/pipe", "/repo") == ([], [])
+
+
+def test_state_artifact_paths_without_a_state_key():
+    from norn.state import state_artifact_paths
+
+    assert state_artifact_paths(None, "/repo") == ([], [])
+    assert state_artifact_paths("", "/repo") == ([], [])
+
+
+def test_state_artifact_paths_match_the_writers(tmp_path):
+    """The three paths must be exactly what checkpoint / history / journal write."""
+    from norn.checkpoint import checkpoint_file
+    from norn.history import history_file
+    from norn.journal import runs_dir
+    from norn.state import state_artifact_paths
+
+    key = str(tmp_path / "pipe")
+    exact, prefixes = state_artifact_paths(key, str(tmp_path))
+    written = {checkpoint_file(key).name, history_file(key).name, runs_dir(key).name}
+    assert set(exact) | set(prefixes) == written
+
+
+def test_state_ignore_flags_render_for_both_snapshot_helpers():
+    from norn.state import state_ignore_flags
+
+    flags = state_ignore_flags("/repo/pipe", "/repo")
+    assert flags == (
+        " --ignore pipe.checkpoint --ignore pipe.history --ignore-prefix pipe.runs"
+    )
+
+
+def test_state_ignore_flags_are_empty_without_a_state_key():
+    """Importing a pipeline outside a run must not change the shell it builds."""
+    from norn.state import state_ignore_flags
+
+    assert state_ignore_flags(None, "/repo") == ""
+
+
+def test_run_exports_the_state_key_before_the_pipeline_is_imported(tmp_path, monkeypatch):
+    """The pipeline reads NORN_STATE_KEY at import time, so `run` must set it first."""
+    seen: dict[str, str | None] = {}
+
+    def fake_load(config_arg):
+        seen["at_import"] = os.environ.get("NORN_STATE_KEY")
+        raise SystemExit(0)
+
+    (tmp_path / "pipeline.py").write_text("config = None\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("NORN_STATE_KEY", raising=False)
+    monkeypatch.setattr("norn.cli._load_pipeline", fake_load)
+    monkeypatch.setattr(sys, "argv", ["norn", "run", "pipeline.py"])
+
+    with pytest.raises(SystemExit):
+        main()
+
+    assert seen["at_import"] == str((tmp_path / "pipeline.py").resolve())
 
 
 def test_history_run_shows_detailed_step_log(capsys, tmp_path):

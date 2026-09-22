@@ -18,6 +18,7 @@ from norn.pipelines._step_snapshot import (
     hook_fixes,
     main,
     parse_status_z,
+    under_any_prefix,
     unstageable_paths,
 )
 
@@ -198,6 +199,21 @@ class TestDiffSnapshots:
 # ---------------------------------------------------------------------------
 # hook_fixes — pure unit tests (mirrors v1 test_pipelines.py coverage)
 # ---------------------------------------------------------------------------
+
+
+class TestUnderAnyPrefix:
+    def test_path_equal_to_prefix_matches(self) -> None:
+        assert under_any_prefix("pipe.runs", ["pipe.runs"])
+
+    def test_path_inside_prefix_matches(self) -> None:
+        assert under_any_prefix("pipe.runs/2/events.jsonl", ["pipe.runs"])
+
+    def test_sibling_sharing_a_name_start_does_not_match(self) -> None:
+        """Components are compared whole — `pipe.runs` must not swallow `pipe.runs-old`."""
+        assert not under_any_prefix("pipe.runs-old/2/events.jsonl", ["pipe.runs"])
+
+    def test_no_prefixes_never_matches(self) -> None:
+        assert not under_any_prefix("pipe.runs", [])
 
 
 class TestHookFixes:
@@ -390,6 +406,66 @@ class TestDiffSubcommand:
         changed = _diff_output(capsysbinary, pre, post, ["--ignore", "a.py"])
         assert "a.py" not in changed
         assert "b.py" in changed
+
+    def test_ignore_prefix_drops_the_whole_subtree(
+        self, tmp_path: Path, capsysbinary
+    ) -> None:
+        """norn's journal directory is many files; one prefix has to cover them all."""
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+
+        pre = _snapshot(tmp_path, root, "pre.json")
+        runs = root / "pipe.runs" / "2"
+        runs.mkdir(parents=True)
+        (runs / "events.jsonl").write_bytes(b'{"e": 1}\n')
+        (runs / "metrics.json").write_bytes(b"{}")
+        (root / "src.py").write_bytes(b"code")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        changed = _diff_output(
+            capsysbinary, pre, post, ["--ignore-prefix", "pipe.runs"]
+        )
+        assert changed == ["src.py"]
+
+    def test_ignore_prefix_tolerates_a_trailing_slash(
+        self, tmp_path: Path, capsysbinary
+    ) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+
+        pre = _snapshot(tmp_path, root, "pre.json")
+        (root / "pipe.runs").mkdir()
+        (root / "pipe.runs" / "events.jsonl").write_bytes(b"{}")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        changed = _diff_output(
+            capsysbinary, pre, post, ["--ignore-prefix", "pipe.runs/"]
+        )
+        assert changed == []
+
+    def test_ignore_prefix_keeps_paths_outside_the_subtree(
+        self, tmp_path: Path, capsysbinary
+    ) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+
+        pre = _snapshot(tmp_path, root, "pre.json")
+        (root / "pipe.runs-old").mkdir()
+        (root / "pipe.runs-old" / "events.jsonl").write_bytes(b"{}")
+        post = _snapshot(tmp_path, root, "post.json")
+
+        changed = _diff_output(
+            capsysbinary, pre, post, ["--ignore-prefix", "pipe.runs"]
+        )
+        assert changed == ["pipe.runs-old/events.jsonl"]
+
+    def test_ignore_prefix_without_value_exits_2(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        root = Path(repo.working_tree_dir)
+        pre = _snapshot(tmp_path, root, "pre.json")
+        post = _snapshot(tmp_path, root, "post.json")
+        rc = main(["_step_snapshot.py", "diff", pre, post, "--ignore-prefix"])
+        assert rc == 2
 
     def test_ignore_file_drops_all_listed_paths(
         self, tmp_path: Path, capsysbinary

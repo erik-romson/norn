@@ -1,6 +1,7 @@
 """Diff two `git status --porcelain -uall` snapshots and print changed paths.
 
 Usage: python _snapshot_diff.py <pre> <post> [--root <dir>]
+                                [--ignore <path>]... [--ignore-prefix <path>]...
        python _snapshot_diff.py --hook-fixes <status>
 
 A path is "changed during this step" if its porcelain status in <post>
@@ -11,6 +12,13 @@ emitted so `git add -A -- <path>` can stage the cleanup.
 ``--root`` filters that list through ``unstageable_paths`` so a path
 ``git add`` would refuse never reaches the commit stage. Without it a single
 such path aborts the whole ``git add`` and kills the step.
+
+``--ignore`` drops one exact path and ``--ignore-prefix`` drops a whole
+subtree — the path itself and everything under it. norn's own run state is the
+caller for both: ``<key>.checkpoint`` and ``<key>.history`` are exact paths,
+while ``<key>.runs/`` is a directory whose files ``git status`` names
+individually. All three are written while the run is in flight, so committing
+them makes the commit dirty itself the moment the next event is journalled.
 
 Renames are reported under the new name. Quoted paths (filenames with
 special chars) are decoded.
@@ -59,6 +67,18 @@ def parse(path: str) -> dict[str, str]:
             rest = rest.split(" -> ", 1)[1]
         out[_decode_quoted(rest)] = status
     return out
+
+
+def under_any_prefix(path: str, prefixes: list[str]) -> bool:
+    """Return True when *path* is one of *prefixes* or lives inside one.
+
+    Path components are compared whole, so the prefix ``a.runs`` covers
+    ``a.runs`` and ``a.runs/2/events.jsonl`` but not ``a.runs-backup``.
+    """
+    for prefix in prefixes:
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
 
 
 def hook_fixes(path: str) -> list[str]:
@@ -174,6 +194,8 @@ def main(argv: list[str]) -> int:
             print(p)
         return 0
     root: str | None = None
+    ignore: set[str] = set()
+    ignore_prefixes: list[str] = []
     positional: list[str] = []
     i = 1
     while i < len(argv):
@@ -183,6 +205,20 @@ def main(argv: list[str]) -> int:
                 return 2
             root = argv[i + 1]
             i += 2
+        elif argv[i] == "--ignore":
+            if i + 1 >= len(argv):
+                print("--ignore requires a PATH argument", file=sys.stderr)
+                return 2
+            ignore.add(argv[i + 1])
+            i += 2
+        elif argv[i] == "--ignore-prefix":
+            if i + 1 >= len(argv):
+                print("--ignore-prefix requires a PATH argument", file=sys.stderr)
+                return 2
+            # A trailing slash would break the `path == prefix` arm of the
+            # comparison, so normalise it away here rather than at every call site.
+            ignore_prefixes.append(argv[i + 1].rstrip("/"))
+            i += 2
         else:
             positional.append(argv[i])
             i += 1
@@ -190,6 +226,7 @@ def main(argv: list[str]) -> int:
     if len(positional) != 2:
         print(
             "usage: _snapshot_diff.py <pre> <post> [--root <dir>]\n"
+            "                        [--ignore <path>]... [--ignore-prefix <path>]...\n"
             "       _snapshot_diff.py --hook-fixes <status>",
             file=sys.stderr,
         )
@@ -204,7 +241,11 @@ def main(argv: list[str]) -> int:
         if p not in post:
             changed.add(p)
 
-    paths = sorted(changed)
+    paths = [
+        p
+        for p in sorted(changed)
+        if p not in ignore and not under_any_prefix(p, ignore_prefixes)
+    ]
     if root is not None:
         dropped = unstageable_paths(paths, root)
         if dropped:

@@ -369,3 +369,116 @@ def test_v1_hook_fixes_still_works_with_the_new_argv_parsing(tmp_path) -> None:
 
     status = _write_status(tmp_path, "MM modified.py", "?? scratch.txt")
     assert main(["_snapshot_diff.py", "--hook-fixes", status]) == 0
+
+
+# ---------------------------------------------------------------------------
+# _snapshot_diff.py --ignore / --ignore-prefix — norn's own run state (v1)
+#
+# norn writes `<key>.runs/<n>/events.jsonl`, `<key>.checkpoint` and
+# `<key>.history` into the launch directory and keeps writing to them for the
+# whole run. Launched from inside the target repo, the step diff used to see
+# them as work the step did: it committed the journal, and the next journal
+# write dirtied the commit that had just gone in.
+# ---------------------------------------------------------------------------
+
+
+def test_v1_under_any_prefix_matches_whole_components() -> None:
+    from norn.pipelines._snapshot_diff import under_any_prefix
+
+    assert under_any_prefix("pipe.runs", ["pipe.runs"])
+    assert under_any_prefix("pipe.runs/2/events.jsonl", ["pipe.runs"])
+    assert not under_any_prefix("pipe.runs-old/2/events.jsonl", ["pipe.runs"])
+    assert not under_any_prefix("pipe.runs", [])
+
+
+def _v1_repo_with_norn_state(tmp_path):
+    """Build a repo where a step did real work while norn journalled the run."""
+    root = _v1_repo(tmp_path)
+    pre = _v1_status(tmp_path, root, "pre")
+
+    journal = root / "implement_features.runs" / "2"
+    journal.mkdir(parents=True)
+    (journal / "events.jsonl").write_text('{"event": "stage_start"}\n')
+    (root / "implement_features.checkpoint").write_text('{"stages": []}\n')
+    (root / "implement_features.history").write_text("[]\n")
+    (root / "app.py").write_text("real work")
+
+    return root, pre, _v1_status(tmp_path, root, "post")
+
+
+def test_v1_diff_subtracts_norn_run_state(tmp_path, capsys) -> None:
+    root, pre, post = _v1_repo_with_norn_state(tmp_path)
+
+    changed = _v1_diff(capsys, pre, post, [
+        "--root", str(root),
+        "--ignore", "implement_features.checkpoint",
+        "--ignore", "implement_features.history",
+        "--ignore-prefix", "implement_features.runs",
+    ])
+
+    assert changed == ["app.py"]
+    assert _v1_git_add(root, changed) == 0
+
+
+def test_v1_diff_without_the_flags_reports_norn_run_state(tmp_path, capsys) -> None:
+    """Unfiltered v1 behaviour is unchanged — and this is the bug being fixed."""
+    root, pre, post = _v1_repo_with_norn_state(tmp_path)
+
+    changed = _v1_diff(capsys, pre, post, ["--root", str(root)])
+
+    assert "implement_features.runs/2/events.jsonl" in changed
+    assert "implement_features.checkpoint" in changed
+
+
+def test_v1_diff_ignore_prefix_keeps_a_sibling_with_the_same_name_start(
+    tmp_path, capsys
+) -> None:
+    root = _v1_repo(tmp_path)
+    pre = _v1_status(tmp_path, root, "pre")
+
+    (root / "pipe.runs-old").mkdir()
+    (root / "pipe.runs-old" / "events.jsonl").write_text("{}")
+    post = _v1_status(tmp_path, root, "post")
+
+    changed = _v1_diff(capsys, pre, post, ["--ignore-prefix", "pipe.runs"])
+
+    assert changed == ["pipe.runs-old/events.jsonl"]
+
+
+def test_v1_diff_ignore_prefix_tolerates_a_trailing_slash(tmp_path, capsys) -> None:
+    root = _v1_repo(tmp_path)
+    pre = _v1_status(tmp_path, root, "pre")
+
+    (root / "pipe.runs").mkdir()
+    (root / "pipe.runs" / "events.jsonl").write_text("{}")
+    post = _v1_status(tmp_path, root, "post")
+
+    assert _v1_diff(capsys, pre, post, ["--ignore-prefix", "pipe.runs/"]) == []
+
+
+def test_v1_diff_ignore_flags_require_a_value() -> None:
+    from norn.pipelines._snapshot_diff import main
+
+    assert main(["_snapshot_diff.py", "pre.txt", "post.txt", "--ignore"]) == 2
+    assert main(["_snapshot_diff.py", "pre.txt", "post.txt", "--ignore-prefix"]) == 2
+
+
+def test_v1_commit_stage_subtracts_norn_run_state(monkeypatch) -> None:
+    """`norn run` exports NORN_STATE_KEY; the commit diff must consume it."""
+    toplevel = _import_implement_features().GIT_TOPLEVEL
+
+    monkeypatch.setenv("NORN_STATE_KEY", str(Path(toplevel) / "implement_features"))
+    cmd = _commit_stage_cmd(_import_implement_features())
+
+    assert "--ignore implement_features.checkpoint" in cmd
+    assert "--ignore implement_features.history" in cmd
+    assert "--ignore-prefix implement_features.runs" in cmd
+
+
+def test_v1_commit_stage_unchanged_without_a_state_key(monkeypatch) -> None:
+    """Importing outside a run (the TUI, --dry-run, tests) must not change the shell."""
+    monkeypatch.delenv("NORN_STATE_KEY", raising=False)
+    mod = _import_implement_features()
+
+    assert mod.NORN_STATE_IGNORE_FLAGS == ""
+    assert "--ignore" not in _commit_stage_cmd(mod)

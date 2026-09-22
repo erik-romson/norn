@@ -1102,6 +1102,13 @@ async def run_pipeline(
     start_time = time.monotonic()
     if config_path:
         from norn.history import next_run_id
+        from norn.state import prepare_state_isolation
+
+        # Before anything is written: repair NORN_STATE_KEY for an entry point
+        # that forgot to publish it, refuse to start when norn's own state is
+        # already tracked by git, and register it in `.git/info/exclude` so no
+        # commit gate in any pipeline can ever see it. Raises StateTrackedError.
+        prepare_state_isolation(config_path)
 
         ctx._history_config_path = config_path
         ctx._history_run_id = next_run_id(config_path)

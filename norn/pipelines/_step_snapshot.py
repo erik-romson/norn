@@ -21,8 +21,12 @@ Three subcommands
     Run ``git status`` in *dir*, build the snapshot, write JSON.  Non-zero git
     exit propagates immediately.
 
-``diff <pre.json> <post.json> [--root DIR] [--ignore PATH]... [--ignore-file NULLIST]...``
+``diff <pre.json> <post.json> [--root DIR] [--ignore PATH]...
+     [--ignore-prefix PATH]... [--ignore-file NULLIST]...``
     Print NUL-terminated changed paths after filtering any ignore lists.
+    ``--ignore-prefix`` drops a whole subtree — the path itself and everything
+    under it — which ``--ignore`` cannot do because it matches exact paths and
+    a directory's contents are named individually in ``git status``.
     Missing *pre.json* is a hard error (exit 2) — a stale resume must be loud.
     Missing *post.json* is also a hard error.  With ``--root`` the changed set
     is additionally filtered through :func:`unstageable_paths`, so a path
@@ -128,6 +132,18 @@ def diff_snapshots(
         if path not in post:
             changed.add(path)
     return sorted(changed)
+
+
+def under_any_prefix(path: str, prefixes: list[str]) -> bool:
+    """Return True when *path* is one of *prefixes* or lives inside one.
+
+    Path components are compared whole, so the prefix ``a.runs`` covers
+    ``a.runs`` and ``a.runs/2/events.jsonl`` but not ``a.runs-backup``.
+    """
+    for prefix in prefixes:
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
 
 
 def hook_fixes(entries: list[tuple[str, str]]) -> list[str]:
@@ -271,9 +287,10 @@ def _cmd_snapshot(args: list[str]) -> int:
 
 
 def _cmd_diff(args: list[str]) -> int:
-    """diff <pre.json> <post.json> [--root DIR] [--ignore PATH]... [--ignore-file NULLIST]..."""
+    """diff <pre.json> <post.json> [--root DIR] [--ignore PATH]... [--ignore-prefix PATH]... [--ignore-file NULLIST]..."""
     positional: list[str] = []
     ignore: set[str] = set()
+    ignore_prefixes: list[str] = []
     root: str | None = None
     i = 0
     while i < len(args):
@@ -288,6 +305,14 @@ def _cmd_diff(args: list[str]) -> int:
                 print("--ignore requires a PATH argument", file=sys.stderr)
                 return 2
             ignore.add(args[i + 1])
+            i += 2
+        elif args[i] == "--ignore-prefix":
+            if i + 1 >= len(args):
+                print("--ignore-prefix requires a PATH argument", file=sys.stderr)
+                return 2
+            # A trailing slash would break the `path == prefix` arm of the
+            # comparison, so normalise it away here rather than at every call site.
+            ignore_prefixes.append(args[i + 1].rstrip("/"))
             i += 2
         elif args[i] == "--ignore-file":
             if i + 1 >= len(args):
@@ -310,7 +335,8 @@ def _cmd_diff(args: list[str]) -> int:
     if len(positional) < 2:
         print(
             "usage: _step_snapshot.py diff <pre.json> <post.json>"
-            " [--root DIR] [--ignore PATH]... [--ignore-file NULLIST]...",
+            " [--root DIR] [--ignore PATH]... [--ignore-prefix PATH]..."
+            " [--ignore-file NULLIST]...",
             file=sys.stderr,
         )
         return 2
@@ -338,7 +364,11 @@ def _cmd_diff(args: list[str]) -> int:
     with open(post_path) as fh:
         post: dict[str, list[str]] = json.load(fh)
 
-    changed = [path for path in diff_snapshots(pre, post) if path not in ignore]
+    changed = [
+        path
+        for path in diff_snapshots(pre, post)
+        if path not in ignore and not under_any_prefix(path, ignore_prefixes)
+    ]
 
     if root is not None:
         dropped = unstageable_paths(changed, root)
@@ -375,7 +405,7 @@ def _cmd_hook_fixes(args: list[str]) -> int:
 _USAGE = (
     "usage: _step_snapshot.py snapshot --root <dir> <out.json>\n"
     "       _step_snapshot.py diff <pre.json> <post.json>"
-    " [--ignore PATH]... [--ignore-file NULLIST]...\n"
+    " [--ignore PATH]... [--ignore-prefix PATH]... [--ignore-file NULLIST]...\n"
     "       _step_snapshot.py hook-fixes --root <dir>"
 )
 

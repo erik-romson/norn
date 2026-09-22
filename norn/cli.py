@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -22,10 +23,12 @@ from norn.loader import (
 from norn.responder import NonInteractiveResponder
 from norn.runner import PipelineError, run_pipeline
 from norn.state import (
+    StateTrackedError,
     _load_checkpoint_for_config,
     _load_history_for_config,
     _primary_state_key,
     _state_key_candidates,
+    publish_state_key,
 )
 
 log = logging.getLogger(__name__)
@@ -631,6 +634,16 @@ def main() -> None:
     params["args"] = _expand_file_refs(" ".join(remaining))
     params["skip"] = set(args.skip)
 
+    # Publish the state key before the pipeline module is imported.  A pipeline
+    # that computes step ownership by diffing worktree snapshots has to exclude
+    # norn's own run state — `<key>.runs/`, `<key>.checkpoint`, `<key>.history`
+    # are written into the launch directory *while the run is in flight*, so a
+    # pipeline launched from inside the target repo would otherwise commit them
+    # and then fail its own "owned paths are clean" postcondition on the next
+    # journal write.  The TUI launcher does the same in `norn/tui/launch.py`;
+    # `run_pipeline` re-checks and registers a git exclude for every entry point.
+    publish_state_key(args.config)
+
     # Resolve pipeline: --org flag, issue key auto-detection, or plain file path
     pipeline_source: str | None = None
     if args.org:
@@ -737,6 +750,12 @@ def main() -> None:
             require_quota=abort_on_quota_failure,
         ))
         # Checkpoint is saved incrementally during run_pipeline — no explicit save needed here
+    except StateTrackedError as e:
+        # Nothing ran: the repository has to be fixed before any run can pass a
+        # commit gate, and the message says exactly how.
+        from norn.ui import console
+        console.print(f"\n[bold red]Cannot start the run:[/bold red] {e}", highlight=False)
+        sys.exit(1)
     except PipelineError as e:
         pipeline_failed = True
         from norn.ui import console
