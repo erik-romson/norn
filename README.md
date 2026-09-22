@@ -235,11 +235,18 @@ a branch — all in one command.
 uv run python -m norn run fix_jira_issue CBS-2249
 ```
 
+The run works on a branch named after the issue. When the branch you are
+already on names the issue — `CBS-2249`, `feature/CBS-2249-sorting`,
+`bugfix/cbs-2249`, matched case-insensitively — it stays there rather than
+cutting a new branch and stranding the work in progress. Pass
+`--arg branch=<name>` to name a branch yourself; an explicit name is always
+honoured.
+
 **Required environment variables:**
 
 | Variable | Description |
 | --- | --- |
-| `JIRA_AUTH` | Jira Basic-auth credentials — `email:api-token`, base64-encoded |
+| `JIRA_AUTH` | Jira Basic-auth credentials — plaintext `email:api-token` (`curl -u` encodes them) |
 | `JIRA_BASE` | Jira instance URL with trailing slash — `https://your-org.atlassian.net/` |
 | `ANTHROPIC_API_KEY` | Anthropic API key (or `CLAUDE_CODE_OAUTH_TOKEN`) |
 
@@ -273,9 +280,9 @@ and edit it freely, then press `[c]ontinue` to proceed with implementation — o
 **CLI-only knobs** (not available under `norn ui`):
 
 ```bash
---arg model=sonnet        # Claude model for all Generate stages (default: opus)
---arg codex_model=...     # model passed to `codex exec -m` for plan review
---arg budget=20           # cost ceiling in USD before the run pauses (default: 10)
+--arg model=standard      # intent label for all Generate stages (default: deep)
+--arg codex_label=review  # label for the codex plan-review pass (default: review)
+--arg budget=20           # cost ceiling in USD before the run pauses (default: 50)
 --arg branch=CBS-2249     # git branch name (default: the issue key)
 ```
 
