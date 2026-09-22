@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,11 @@ class Checkpoint:
         results: Serialised stage outputs keyed by stage name.
         usage: Reserved for future per-stage usage data.
         file_checkpoint_id: Reserved for SDK-level file checkpointing.
+        params: The string params the run was launched with (the positional
+            ``args`` and any ``--arg`` values).  A resume has to rebuild the
+            same pipeline, and pipelines like ``implement_features_v2`` build
+            their stages from these at import time.  Empty in checkpoints
+            written before params were recorded.
     """
 
     pipeline: str
@@ -37,6 +42,7 @@ class Checkpoint:
     usage: list[dict[str, Any]]
     file_checkpoint_id: str | None = None
     agent_provider: str = "claude-code"
+    params: dict[str, str] = field(default_factory=dict)
 
 
 def checkpoint_file(config_path: str) -> Path:
@@ -51,6 +57,7 @@ def save_checkpoint(
     completed_stages: list[str],
     stage_outputs: dict[str, Any],
     agent_provider: str = "claude-code",
+    params: dict[str, str] | None = None,
 ) -> None:
     """Atomically write checkpoint state beside the config file."""
     path = checkpoint_file(config_path)
@@ -63,6 +70,7 @@ def save_checkpoint(
         "usage": [],
         "file_checkpoint_id": None,
         "agent_provider": agent_provider,
+        "params": dict(params or {}),
     }
     tmp = path.with_suffix(".checkpoint.tmp")
     tmp.write_text(json.dumps(data, indent=2))
@@ -86,6 +94,7 @@ def load_checkpoint(config_path: str) -> Checkpoint | None:
             usage=data.get("usage", []),
             file_checkpoint_id=data.get("file_checkpoint_id"),
             agent_provider=data.get("agent_provider", "claude-code"),
+            params=data.get("params", {}),
         )
     except Exception:
         log.warning("Failed to load checkpoint from %s — ignoring", path)

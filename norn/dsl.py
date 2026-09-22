@@ -196,6 +196,12 @@ class Stage:
             ``stage_succeeded()``, ``stage_failed()``, ``file_exists()``.
         timeout: Seconds before the stage is cancelled via
             ``asyncio.wait_for``. ``None`` means no timeout.
+        always_run: When ``True``, ``--resume`` re-executes the stage instead
+            of restoring it from the checkpoint. For guards that check the
+            state of the world rather than produce a result — a clean index, a
+            reachable toolchain: a cached verdict describes the repo as it was
+            when the earlier run passed, and the whole point of the guard is
+            that the repo may have moved since.
     """
 
     name: str
@@ -203,6 +209,7 @@ class Stage:
     on_failure: OnFailure = OnFailure.FAIL
     when: Callable[[PipelineContext], bool] | None = None
     timeout: float | None = None
+    always_run: bool = False
 
 
 @dataclass
@@ -383,12 +390,20 @@ class Pipeline:
         on_failure: OnFailure = OnFailure.FAIL,
         when: Callable[[PipelineContext], bool] | None = None,
         timeout: float | None = None,
+        always_run: bool = False,
         **kwargs: Any,
     ) -> Pipeline:
         if isinstance(impl, str):
             from norn.registry import get_stage_class
             impl = get_stage_class(impl)(**kwargs)
-        self.items.append(Stage(name=name, impl=impl, on_failure=on_failure, when=when, timeout=timeout))
+        self.items.append(Stage(
+            name=name,
+            impl=impl,
+            on_failure=on_failure,
+            when=when,
+            timeout=timeout,
+            always_run=always_run,
+        ))
         return self
 
     def loop(

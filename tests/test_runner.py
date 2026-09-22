@@ -995,3 +995,86 @@ def test_preflight_effort_env_ignored_for_opencode():
     # For opencode the effort env check is skipped; only the label check runs.
     # "standard" is known for opencode so the preflight should pass without raising.
     _check_model_labels(p, "opencode")
+
+
+# ---------------------------------------------------------------------------
+# always_run — guards that must not be restored from a checkpoint
+#
+# A resumed run that skips its own preconditions inherits a verdict about the
+# repo as it stood when the earlier run passed. If the repo moved in between
+# (a staged change, a vanished toolchain), the run sails past the guard and
+# dies later at a postcondition, blaming a stage that did nothing wrong.
+# ---------------------------------------------------------------------------
+
+
+class CountingStage(BaseStage):
+    """Records how many times it ran."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, ctx: PipelineContext) -> StageResult:
+        self.calls += 1
+        return StageResult(name="", success=True, output="ok")
+
+
+def _checkpoint(*completed: str):
+    from norn.checkpoint import Checkpoint
+
+    return Checkpoint(
+        pipeline="p",
+        timestamp="2026-01-01T00:00:00Z",
+        session_id=None,
+        completed_stages=list(completed),
+        results={name: "ok" for name in completed},
+        usage=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_always_run_stage_reruns_on_resume():
+    guard, work = CountingStage(), CountingStage()
+    pipeline = Pipeline("p")
+    pipeline.stage("preflight", guard, always_run=True)
+    pipeline.stage("work", work)
+
+    await run_pipeline(pipeline, resume_checkpoint=_checkpoint("preflight", "work"))
+
+    assert guard.calls == 1, "an always_run guard must re-execute on resume"
+    assert work.calls == 0, "ordinary stages must still be restored from the checkpoint"
+
+
+@pytest.mark.asyncio
+async def test_always_run_stage_can_still_fail_the_resumed_run():
+    """The point of re-running the guard is that it gets to stop the run."""
+    pipeline = Pipeline("p")
+    pipeline.stage("preflight", FailStage(), always_run=True)
+
+    with pytest.raises(PipelineError):
+        await run_pipeline(pipeline, resume_checkpoint=_checkpoint("preflight"))
+
+
+@pytest.mark.asyncio
+async def test_always_run_stage_inside_a_loop_reruns_on_resume():
+    guard = CountingStage()
+    pipeline = Pipeline("p")
+    pipeline.loop(
+        "body",
+        stages=[Stage(name="preflight", impl=guard, always_run=True)],
+        max_retries=1,
+    )
+
+    await run_pipeline(pipeline, resume_checkpoint=_checkpoint("preflight"))
+
+    assert guard.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stages_are_cached_by_default():
+    work = CountingStage()
+    pipeline = Pipeline("p")
+    pipeline.stage("work", work)
+
+    await run_pipeline(pipeline, resume_checkpoint=_checkpoint("work"))
+
+    assert work.calls == 0

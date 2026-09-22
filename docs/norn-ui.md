@@ -54,7 +54,13 @@ Launcher ──select──▶ [Args prompt, if the pipeline declares args] ─�
   from the pipeline's `.history` (status, cost, duration, resumable), with a
   per-run `stage_log` detail panel (including error text). **`r`** resumes from
   the `.checkpoint` (starts a run with `resume_checkpoint`); `q`/Esc returns to
-  the launcher. The pipeline's history/checkpoint paths are resolved with the
+  the launcher. A resume rebuilds the pipeline, and pipelines such as
+  `implement_features_v2` build their stages from their params at import, so
+  the run needs the params it was launched with: the runner saves them in the
+  checkpoint (`Checkpoint.params`, the string values only), and a pipeline that
+  declares args gets the `ArgsPromptScreen` pre-filled from it to confirm
+  (Esc returns to the launcher). A checkpoint written before params were
+  recorded opens the form empty. The pipeline's history/checkpoint paths are resolved with the
   same state-key logic as `norn run`/`norn history` (`norn/state.py`).
   **Both frontends share one state key**: `build_run_setup` (`norn/tui/launch.py`)
   sets `config_path = history_config_key(ref)` for every TUI run (including

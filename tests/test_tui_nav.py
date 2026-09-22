@@ -295,3 +295,68 @@ async def test_history_resume_starts_run(patch_load, monkeypatch, tmp_path) -> N
         await pilot.press("r")
         await pilot.pause()
         assert isinstance(app.screen, RunScreen)
+
+
+def _resume_setup(monkeypatch, tmp_path, checkpoint) -> list[dict]:
+    """Stub history + checkpoint for a resume, and record the params each load gets."""
+    import norn.tui.screens as screens_mod
+    from norn.history import RunRecord
+
+    rec = RunRecord(
+        run_id=1, timestamp="2026-01-01T00:00:00", success=False,
+        total_cost_usd=0.0, total_tokens=0, duration_ms=0, stages=[], retries=0,
+    )
+    loads: list[dict] = []
+
+    def _load(ref, *, is_bundled, params):
+        loads.append(dict(params))
+        return _stub_pipeline()
+
+    monkeypatch.setattr(app_mod, "load_pipeline_with_args", _load)
+    monkeypatch.setattr(app_mod, "load_run_history", lambda ref: [rec])
+    monkeypatch.setattr(app_mod, "load_run_checkpoint", lambda ref: checkpoint)
+    ckpt = tmp_path / "needs.checkpoint"
+    ckpt.write_text("{}")
+    monkeypatch.setattr(screens_mod, "checkpoint_file", lambda _cp: ckpt)
+    return loads
+
+
+@pytest.mark.asyncio
+async def test_history_resume_prefills_args_from_checkpoint(monkeypatch, tmp_path) -> None:
+    """Resume shows the args form filled with the params the run was started with."""
+    from norn.checkpoint import Checkpoint
+
+    cp = Checkpoint(
+        pipeline="needs", timestamp="t", session_id=None, completed_stages=[], results={},
+        usage=[], params={"args": "PLAN-final-plan"},
+    )
+    loads = _resume_setup(monkeypatch, tmp_path, cp)
+    app = NornUIApp(bundled=[_info("needs", args={"args": "Path"})], discovered=[])
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("h")
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause()
+        assert isinstance(app.screen, ArgsPromptScreen)
+        assert app.screen.get_values() == {"args": "PLAN-final-plan"}
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, RunScreen)
+    assert loads == [{"args": "PLAN-final-plan"}]
+
+
+@pytest.mark.asyncio
+async def test_history_resume_args_cancel_returns_to_launcher(monkeypatch, tmp_path) -> None:
+    _resume_setup(monkeypatch, tmp_path, None)
+    app = NornUIApp(bundled=[_info("needs", args={"args": "Path"})], discovered=[])
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("h")
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause()
+        assert app.screen.get_values() == {"args": ""}
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, LauncherScreen)

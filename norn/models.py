@@ -240,6 +240,9 @@ class PipelineContext:
     usage_tracker: UsageTracker = field(default_factory=UsageTracker)
     stage_log: list[StageLogEntry] = field(default_factory=list)
     params: dict[str, Any] = field(default_factory=dict)
+    # The string params the run was launched with, before stages or includes
+    # add to ``params``; saved in the checkpoint so a resume can rebuild the run.
+    launch_params: dict[str, str] = field(default_factory=dict)
     checkpoint_stages: set[str] = field(default_factory=set)
     injected_context: list[tuple[str, str]] = field(default_factory=list)
     secrets: dict[str, str] = field(default_factory=dict)

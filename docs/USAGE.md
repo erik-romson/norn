@@ -178,7 +178,7 @@ Pipeline(name, default_model=None)
 ### Stage
 
 ```python
-Stage(name, impl, on_failure=fail, when=None, timeout=None)
+Stage(name, impl, on_failure=fail, when=None, timeout=None, always_run=False)
 ```
 
 - `name` — human-readable name (lowercase, may contain spaces)
@@ -186,6 +186,10 @@ Stage(name, impl, on_failure=fail, when=None, timeout=None)
 - `on_failure` — `fail` (raise error) or `ask_user` (interactive prompt)
 - `when` — optional predicate: `lambda ctx: bool`. Stage is skipped if False.
 - `timeout` — seconds before the stage is cancelled (raises PipelineError)
+- `always_run` — re-execute on `--resume` instead of restoring the stage from
+  the checkpoint. Use it for guards that check the state of the world (a clean
+  index, a reachable toolchain): a cached verdict describes the repo as it was
+  when the earlier run passed, and the repo may have moved since.
 
 ### Loop
 

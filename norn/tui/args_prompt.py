@@ -173,10 +173,20 @@ class ArgsPromptScreen(Screen):
     }
     """
 
-    def __init__(self, pipeline_name: str, args_meta: dict[str, str]) -> None:
+    def __init__(
+        self,
+        pipeline_name: str,
+        args_meta: dict[str, str],
+        *,
+        initial: dict[str, str] | None = None,
+        resume: bool = False,
+    ) -> None:
         super().__init__()
         self._pipeline_name = pipeline_name
         self._args_meta = dict(args_meta)
+        # Pre-filled values: a resume shows the params its checkpoint recorded.
+        self._initial = dict(initial or {})
+        self._resume = resume
         self._id_to_name: dict[str, str] = {_input_id(n): n for n in self._args_meta}
         self._path_args = {n for n, d in self._args_meta.items() if is_path_arg(d)}
         # A pipeline that declares an arg of the same name owns that name; the
@@ -190,11 +200,17 @@ class ArgsPromptScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with VerticalScroll():
-            yield Label(f"Arguments for [b]{self._pipeline_name}[/b]")
+            if self._resume:
+                yield Label(
+                    f"Resume [b]{self._pipeline_name}[/b] from its checkpoint — "
+                    "use the arguments the run was started with"
+                )
+            else:
+                yield Label(f"Arguments for [b]{self._pipeline_name}[/b]")
             for name, desc in self._args_meta.items():
                 hint = " — ctrl+o to browse" if name in self._path_args else ""
                 yield Label(f"{name}: {desc}{hint}")
-                yield Input(id=_input_id(name), placeholder=desc)
+                yield Input(value=self._initial.get(name, ""), id=_input_id(name), placeholder=desc)
             for _declared_name, input_id, label, placeholder in self._budget_fields.values():
                 yield Label(label)
                 yield Input(id=input_id, placeholder=placeholder)

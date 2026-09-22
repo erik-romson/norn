@@ -773,9 +773,38 @@ class NornUIApp(App):
     ) -> None:
         # HistoryBrowserScreen dismisses with ("resume", config_path) or None.
         if isinstance(result, tuple) and result and result[0] == "resume":
-            self._start_run(ref, is_bundled, info.name, True, {}, resume=True)
+            self._begin_resume(ref, is_bundled, info.name, dict(info.args))
             return
         self._show_launcher()
+
+    def _begin_resume(
+        self, ref: str, is_bundled: bool, display_name: str, args_meta: dict[str, str]
+    ) -> None:
+        """Resume from the checkpoint with the params the run was launched with.
+
+        The pipeline is rebuilt from those params, so resuming with none would
+        import e.g. ``implement_features_v2`` without its feature directory.  A
+        pipeline that declares args gets the args form pre-filled from the
+        checkpoint, to confirm or — for a checkpoint written before params were
+        recorded — to fill in.
+        """
+        checkpoint = load_run_checkpoint(ref)
+        saved = checkpoint.params if checkpoint is not None else {}
+        if not args_meta:
+            self._start_run(ref, is_bundled, display_name, True, saved, resume=True)
+            return
+        self.push_screen(
+            ArgsPromptScreen(display_name, args_meta, initial=saved, resume=True),
+            lambda params: self._on_resume_args(ref, is_bundled, display_name, params),
+        )
+
+    def _on_resume_args(
+        self, ref: str, is_bundled: bool, display_name: str, params: dict[str, str] | None
+    ) -> None:
+        if params is None:  # cancelled the args prompt
+            self._show_launcher()
+            return
+        self._start_run(ref, is_bundled, display_name, True, params, resume=True)
 
     def _on_run_result(self, result: Any, from_launcher: bool) -> None:
         if result == "back":

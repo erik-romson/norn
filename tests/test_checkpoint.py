@@ -93,6 +93,29 @@ def test_serialise_output_falls_back_to_str():
     assert "unserializable-object" in result
 
 
+def test_checkpoint_round_trips_launch_params(tmp_path):
+    config = str(tmp_path / "p.py")
+    save_checkpoint(config, "p", None, ["a"], {}, params={"args": "PLAN-final-plan"})
+    assert load_checkpoint(config).params == {"args": "PLAN-final-plan"}
+
+
+def test_checkpoint_without_params_loads_empty(tmp_path):
+    """Checkpoints written before params were recorded still load."""
+    config = str(tmp_path / "p.py")
+    checkpoint_file(config).write_text(
+        '{"pipeline": "p", "timestamp": "t", "session_id": null, "completed_stages": []}'
+    )
+    assert load_checkpoint(config).params == {}
+
+
+@pytest.mark.asyncio
+async def test_run_saves_launch_params_in_checkpoint(tmp_path):
+    config = str(tmp_path / "p.py")
+    p = Pipeline("p").stage("a", SuccessStage())
+    await run_pipeline(p, params={"args": "PLAN-final-plan", "skip": set()}, config_path=config)
+    assert load_checkpoint(config).params == {"args": "PLAN-final-plan"}
+
+
 # ---------------------------------------------------------------------------
 # Integration: run_pipeline with resume_checkpoint
 # ---------------------------------------------------------------------------

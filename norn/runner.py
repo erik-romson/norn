@@ -101,7 +101,17 @@ def _is_skipped(stage: Stage, ctx: PipelineContext) -> bool:
 
 
 def _is_cached(stage: Stage, ctx: PipelineContext) -> bool:
-    """Return True if this stage was pre-loaded from a checkpoint."""
+    """Return True if this stage was pre-loaded from a checkpoint.
+
+    An ``always_run`` stage is never cached. Restoring a guard from a
+    checkpoint replays a verdict about the state of the world at the time the
+    earlier run passed it, which is exactly the thing a resume cannot assume
+    still holds: a repo can pick up a staged change between two runs, and the
+    resumed run would then sail past its own precondition and fail later, at a
+    stage that did nothing wrong.
+    """
+    if stage.always_run:
+        return False
     return stage.name in ctx.checkpoint_stages
 
 
@@ -632,7 +642,10 @@ def _save_checkpoint_state(
         for name in completed_stages
         if name in ctx.results
     }
-    save_checkpoint(config_path, pipeline_name, session_id, completed_stages, stage_outputs, ctx.agent_provider)
+    save_checkpoint(
+        config_path, pipeline_name, session_id, completed_stages, stage_outputs, ctx.agent_provider,
+        params=ctx.launch_params,
+    )
 
 
 async def _run_loop(
@@ -1157,6 +1170,8 @@ async def run_pipeline(
     as before.
     """
     ctx = PipelineContext(params=dict(params or {}))
+    # Only strings: the CLI also passes non-launch values such as the `skip` set.
+    ctx.launch_params = {k: v for k, v in (params or {}).items() if isinstance(v, str)}
     ctx.agent_provider = agent_provider
     ctx.working_dir = working_dir
     if event_sink is not None:
