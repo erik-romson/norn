@@ -171,7 +171,7 @@ Read the plan at {plan} and the codex review at {review}.
 
 def split_prompt(*, plan: str, steps_dir: str) -> str:
     return f"""\
-Split the finished plan into the step files `norn run implement_features` runs.
+Split the finished plan into the step files `norn run implement_features_v2` runs.
 
 Follow the split-plan skill in your system prompt, with its arguments bound to:
 
@@ -194,9 +194,18 @@ raised as a question. Point its `test_cmd` at the narrowest existing suite that
 would still catch a regression there, and say why under that step's
 `Why this test_cmd is the right contract` section.
 
+The steps run under `implement_features_v2`, whose contract the skill spells
+out. The three rules that most often break a split: the pipeline commits every
+step itself and the agent may not run git, so no step may commit, stage, stash
+or reset; the run refuses a dirty worktree, so pending uncommitted work is not
+a step but a "Before running" note in `README.md` telling the human to commit
+it; and a step that changes no file stops the run unless its front matter
+declares `allow_noop: true`.
+
 A gate reads {steps_dir} when you stop. It fails this stage when `index.md` is
-missing, when no `step-*.md` file exists, or when any step file has no real
-`test_cmd:` — a retry lands you back here with the same instructions.
+missing, when no `step-*.md` file exists, when any step file has no real
+`test_cmd:`, or when any front matter carries a key `implement_features_v2`
+rejects — a retry lands you back here with the same instructions.
 """
 
 

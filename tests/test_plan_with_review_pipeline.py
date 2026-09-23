@@ -294,6 +294,23 @@ def test_split_prompt_mentions_plan_and_steps_dir():
     assert mod.STEPS_DIR in mod._SPLIT_PROMPT
 
 
+def test_split_targets_implement_features_v2():
+    """The steps run under v2, which forbids the agent git and refuses a dirty tree.
+
+    A split written against v1's model (a step that commits the pending
+    working tree itself) passed every gate here and then failed v2's HEAD
+    guard hours in; the prompt and the skill must both name v2's contract.
+    """
+    mod = _import_plan_with_review()
+    assert "norn run implement_features_v2" in mod._SPLIT_PROMPT
+    assert "norn run implement_features`" not in mod._SPLIT_PROMPT
+    assert "allow_noop: true" in mod._SPLIT_PROMPT
+    skill = mod.SPLIT_SKILL.content
+    assert "implement_features_v2" in skill
+    assert "`git commit`" in skill
+    assert "clean worktree" in skill
+
+
 def test_module_loads_from_a_directory_without_the_skill(tmp_path, monkeypatch):
     """A pipeline that raises at import cannot be listed, let alone run.
 

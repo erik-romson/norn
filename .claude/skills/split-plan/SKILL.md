@@ -1,13 +1,57 @@
 ---
 name: split-plan
-description: "Split a plan/spec file into step files for the implement_features pipeline. Creates an index.md with shared context and numbered step-*.md files. Use when you have a plan and want to break it into executable steps. Triggers on: split plan, divide plan, break into steps, create steps from plan."
+description: "Split a plan/spec file into step files for the implement_features_v2 pipeline. Creates an index.md with shared context and numbered step-*.md files. Use when you have a plan and want to break it into executable steps. Triggers on: split plan, divide plan, break into steps, create steps from plan."
 argument-hint: "[plan-file] [output-directory]"
 disable-model-invocation: true
 ---
 
 # Split Plan into Pipeline Steps
 
-Take a plan file and split it into `index.md` + `step-NN-name.md` files that can be executed by `norn run implement_features <output-directory>`.
+Take a plan file and split it into `index.md` + `step-NN-name.md` files that can be executed by `norn run implement_features_v2 <output-directory>`.
+
+## The pipeline contract (read first)
+
+`implement_features_v2` (`norn/pipelines/implement_features_v2.py`) runs the
+steps, and it enforces rules that a step file cannot opt out of. A step written
+against a different model of the pipeline fails a gate at run time, hours and
+dollars in. Every step you write must fit these rules:
+
+- **The pipeline owns git. The agent never touches it.** After each step the
+  pipeline stages exactly the paths the step changed and commits them with the
+  subject `refactor: <step stem>` (`refactor: step-03-move-matchers`). The
+  agent is forbidden to run `git add`, `git commit`, `git amend`, `git reset`,
+  `git checkout`, `git restore`, `git rebase`, `git stash`, `git clean` or
+  `git push`, and a HEAD that moves during a step fails the run. So a step's
+  **Actions** must never say "commit", "stage", "amend", "stash", "reset",
+  "check out a branch" or "push". Never write a "land the pending work" or
+  "commit the working tree" step.
+- **The run starts from a clean worktree and a clean index.** Uncommitted work
+  is refused at preflight. If the tree carries finished but uncommitted work
+  the plan depends on, do not turn it into a step: say in `README.md`, under
+  "Before running", that the human must commit it first, and name the paths.
+- **Every step must change at least one file.** A step that changes nothing
+  stops the run to ask, and aborts a `--non-interactive` run. A step that is
+  verification-only declares `allow_noop: true` (rules below). Never write a
+  step whose only output is git state.
+- **`test_cmd` runs after the agent, in the working tree, before the commit.**
+  It must not assert git state (commit subjects, a clean tree, HEAD position),
+  and it must leave tracked files as it found them: a command that regenerates
+  a fixture or rewrites a lock file dirties the tree and fails the final audit.
+  Gitignored outputs are fine.
+- **`test_cmd`s are rerun together at the end.** After the last commit the
+  unique `test_cmd`s of all steps run again as the aggregate pass (or
+  `final_test_cmd` from `index.md` when set), so each one must be idempotent
+  and must still pass once later steps have landed.
+- **Front matter is validated strictly at load.** A step accepts only
+  `test_cmd`, `bats_cmd`, `test_timeout`, `bats_timeout`, `model` and
+  `allow_noop`; `index.md` accepts only `test_cmd`, `bats_cmd`,
+  `test_timeout`, `bats_timeout` and `final_test_cmd`. Any other key, including
+  `effort`, makes the pipeline refuse to load. Step files are numbered from
+  `01` and contiguous.
+- **Step stems must be unique in the repo.** A rerun skips any step whose
+  `refactor: <stem>` commit is already on HEAD, so two plans that share a stem
+  collide. Include the feature in the stem when the name would otherwise be
+  generic (`step-02-suggestions-plumbing`, not `step-02-plumbing`).
 
 ## Arguments
 
@@ -37,8 +81,8 @@ Naming: `step-01-short-name.md`, `step-02-short-name.md`, etc.
 
 Each step file MUST start with YAML front-matter declaring a real
 `test_cmd:` — the exact shell command the pipeline runs to validate the
-step. The pipeline (`norn/pipelines/implement_features.py`) does NOT guess a
-default any more; a missing or empty `test_cmd` halts the run.
+step. The pipeline (`norn/pipelines/implement_features_v2.py`) does NOT guess
+a default; a missing or empty `test_cmd` halts the run.
 
 ```markdown
 ---
@@ -70,6 +114,9 @@ Rules for `test_cmd`:
   placeholder. If a step is purely documentation/refactor with no
   behaviour change, point `test_cmd` at the existing test suite (or the
   most relevant subset) so a regression in this step is still caught.
+- **Must not depend on git state or dirty the tree** — see the pipeline
+  contract above. It runs on the uncommitted working tree before the
+  step's commit exists, and again in the aggregate pass at the end.
 - **Must run in plain bash without a Claude session** — no Claude Code
   skills, no MCP tools. The pipeline executes `test_cmd` via
   `RunCommand`, which shells out with no agent context, so anything
@@ -139,6 +186,10 @@ The body of each step file must contain:
 
 A table showing the step order, what each does, and why tests pass between steps. This file is NOT picked up by the pipeline.
 
+Add a "Before running" section whenever the human has to do something the
+pipeline forbids the agent: commit pending work so the tree is clean, land
+a dependency in another repo, or provide a credential.
+
 ## Process
 
 1. Read the plan file at `$0`
@@ -156,6 +207,7 @@ A table showing the step order, what each does, and why tests pass between steps
 ## Key Principles
 
 - **Tests must pass after every step.** If a step would break tests, include the fix in the same step or use a compatibility strategy (shims, re-exports, etc.) documented in `index.md`.
+- **No step touches git.** The pipeline commits; a step that commits, stages, stashes or resets fails the run. Pending work is committed by the human before the run, not by a step.
 - **Every step has a real `test_cmd`.** No placeholders, no `true`. If a step is pure refactor with no behaviour change, point `test_cmd` at the existing suite (or the narrowest relevant subset) so a regression still fails the step. Ask the user before falling back to the full suite for the whole plan.
 - **Each step should be independently understandable.** Combined with `index.md`, a step file must give the implementing agent everything it needs. No implicit knowledge from prior steps.
 - **Steps should be as small as possible but no smaller.** Group tightly coupled changes that can't be separated without breaking tests. Split everything else.

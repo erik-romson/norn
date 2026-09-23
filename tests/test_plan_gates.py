@@ -654,3 +654,54 @@ async def test_step_files_gate_resolves_relative_path(tmp_path):
     _write_steps(tmp_path)
     result = await StepFilesGate(steps_dir="x-plan").run(_ctx(tmp_path))
     assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_step_files_gate_rejects_front_matter_keys_v2_refuses(tmp_path):
+    """A key v2 rejects at load (``effort``, a typo) fails the split, not the implement run."""
+    steps_dir = _write_steps(tmp_path)
+    (steps_dir / "step-01-thing.md").write_text(
+        "---\ntest_cmd: uv run python -m pytest tests/test_x.py\neffort: high\n---\n\n# Step 1\n"
+    )
+    (steps_dir / "step-02-thing.md").write_text(
+        "---\ntest_cmd: uv run python -m pytest tests/test_y.py\ntests_cmd: x\n---\n\n# Step 2\n"
+    )
+    result = await StepFilesGate(steps_dir=str(steps_dir)).run(_ctx())
+    assert result.success is False
+    assert "not accepted by implement_features_v2" in result.error
+    assert "step-01-thing.md: unknown key 'effort'" in result.error
+    assert "step-02-thing.md: unknown key 'tests_cmd'" in result.error
+
+
+@pytest.mark.asyncio
+async def test_step_files_gate_rejects_index_keys_v2_refuses(tmp_path):
+    steps_dir = _write_steps(tmp_path)
+    (steps_dir / "index.md").write_text("---\nmodel: deep\n---\n\n# Shared context\n")
+    result = await StepFilesGate(steps_dir=str(steps_dir)).run(_ctx())
+    assert result.success is False
+    assert "index.md: unknown key 'model'" in result.error
+
+
+@pytest.mark.asyncio
+async def test_step_files_gate_accepts_every_v2_key(tmp_path):
+    steps_dir = _write_steps(tmp_path)
+    (steps_dir / "index.md").write_text(
+        "---\ntest_cmd: uv run python -m pytest\nbats_cmd: bats bats/\n"
+        "test_timeout: 600\nbats_timeout: 60\nfinal_test_cmd: uv run python -m pytest -q\n---\n\n# Shared\n"
+    )
+    (steps_dir / "step-01-thing.md").write_text(
+        "---\ntest_cmd: uv run python -m pytest tests/test_x.py\nbats_cmd: bats bats/x.bats\n"
+        "test_timeout: 600\nbats_timeout: 60\nmodel: deep\nallow_noop: true\n---\n\n# Step 1\n"
+    )
+    result = await StepFilesGate(steps_dir=str(steps_dir)).run(_ctx())
+    assert result.success is True
+
+
+def test_gate_key_sets_match_implement_features_v2():
+    """The gate's copies of v2's allowed keys must not drift from the loader's."""
+    from norn.pipelines._plan_gates import V2_INDEX_KEYS, V2_STEP_KEYS
+    from tests.test_implement_features_v2 import GOOD_DIR, _import_v2
+
+    v2 = _import_v2(GOOD_DIR)
+    assert V2_STEP_KEYS == frozenset(v2._STEP_ALLOWED)
+    assert V2_INDEX_KEYS == frozenset(v2._INDEX_ALLOWED)

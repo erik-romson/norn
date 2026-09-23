@@ -146,14 +146,15 @@ one directory:
 | `tmp/<slug>-plan-questions.md` | Claude writes; **you answer** |
 | `tmp/<slug>-plan-review.md` | codex |
 | `tmp/<slug>-plan-review-response.md` | Claude |
-| `tmp/<slug>-final-plan/` | Claude — `index.md` + `step-NN-*.md`, ready for `norn run implement_features tmp/<slug>-final-plan` |
+| `tmp/<slug>-final-plan/` | Claude — `index.md` + `step-NN-*.md`, ready for `norn run implement_features_v2 tmp/<slug>-final-plan` |
 
 `final` marks the deliverable so it is never mistaken for the brief it came
 from: only a trailing `-preplan`/`_preplan` is stripped when deriving the slug,
 so a brief named `x-plan.md` would otherwise produce `x-plan-plan.md`. The step
 directory is the plan path minus `.md`. The final gate rejects a split
-whose steps lack a real `test_cmd:`, so the run stops rather than handing
-`implement_features` steps that validate nothing.
+whose steps lack a real `test_cmd:` or carry front-matter keys
+`implement_features_v2` refuses to load, so the run stops rather than handing
+over steps that validate nothing or that the implementer cannot load.
 
 **Human round-trip (open questions):** the run pauses and sends a notification →
 open `<slug>-plan-questions.md` → fill in the `**Answer:**` slots (leave

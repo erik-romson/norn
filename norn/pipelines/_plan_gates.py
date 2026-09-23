@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from typing import Any, NamedTuple
 
+import yaml
+
 from norn.models import PipelineContext, StageResult
 from norn.runner import resolve_run_path
 from norn.stages.base import BaseStage
@@ -287,15 +289,19 @@ class ReviewDispositionGate(BaseStage):
 # Values that satisfy the YAML key but never catch a regression.
 _PLACEHOLDER_TEST_CMDS = {"true", "false", ":", "/bin/true"}
 
+# The front-matter keys implement_features_v2 accepts.  Kept in step with
+# ``_STEP_ALLOWED`` / ``_INDEX_ALLOWED`` in ``implement_features_v2.py`` by a
+# guard test; duplicated here because that module reads ``sys.argv`` at import.
+V2_STEP_KEYS = frozenset({"test_cmd", "bats_cmd", "test_timeout", "bats_timeout", "model", "allow_noop"})
+V2_INDEX_KEYS = frozenset({"test_cmd", "bats_cmd", "test_timeout", "bats_timeout", "final_test_cmd"})
 
-def step_test_cmd(text: str) -> str | None:
-    """Return the ``test_cmd`` declared in a step file's YAML front-matter.
 
-    Returns None when the file has no front-matter, no ``test_cmd`` key, or a
-    blank value. Block scalars (``test_cmd: |``) are handled by the YAML parser.
+def front_matter(text: str) -> dict | None:
+    """Return a file's YAML front-matter as a dict, or None.
+
+    None means no front-matter, unparsable YAML, or a document that is not a
+    mapping.  Block scalars (``test_cmd: |``) are handled by the YAML parser.
     """
-    import yaml
-
     m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
     if not m:
         return None
@@ -304,6 +310,26 @@ def step_test_cmd(text: str) -> str | None:
     except yaml.YAMLError:
         return None
     if not isinstance(data, dict):
+        return None
+    return data
+
+
+def unknown_front_matter_keys(text: str, allowed: frozenset[str]) -> list[str]:
+    """Return the front-matter keys of *text* that *allowed* does not contain."""
+    data = front_matter(text)
+    if data is None:
+        return []
+    return sorted(str(k) for k in data if k not in allowed)
+
+
+def step_test_cmd(text: str) -> str | None:
+    """Return the ``test_cmd`` declared in a step file's YAML front-matter.
+
+    Returns None when the file has no front-matter, no ``test_cmd`` key, or a
+    blank value.
+    """
+    data = front_matter(text)
+    if data is None:
         return None
     value = data.get("test_cmd")
     if isinstance(value, bool):
@@ -323,7 +349,9 @@ class StepFilesGate(BaseStage):
     3. No ``step-*.md`` files.
     4. Any step file without a ``test_cmd`` front-matter value, or with a
        placeholder one (``true``, ``:``) — fail.
-    5. Every step file carries a real ``test_cmd`` — pass.
+    5. ``index.md`` or any step file carries a front-matter key that
+       ``implement_features_v2`` rejects at load (``effort``, a typo) — fail.
+    6. Otherwise — pass.
     """
 
     needs_agent = False
@@ -382,5 +410,28 @@ class StepFilesGate(BaseStage):
                 error=format_gate_error(summary, bad, action),
             )
 
-        # Rule 5: all good
+        # Rule 5: front-matter keys v2 refuses to load
+        bad = []
+        for key in unknown_front_matter_keys((resolved / "index.md").read_text(), V2_INDEX_KEYS):
+            bad.append(f"index.md: unknown key {key!r}")
+        for step in step_files:
+            for key in unknown_front_matter_keys(step.read_text(), V2_STEP_KEYS):
+                bad.append(f"{step.name}: unknown key {key!r}")
+        if bad:
+            summary = (
+                f"{len(bad)} front-matter keys in {dir_str} are not accepted by "
+                "implement_features_v2"
+            )
+            action = (
+                "Step files accept only test_cmd, bats_cmd, test_timeout, bats_timeout, "
+                "model and allow_noop; index.md accepts test_cmd, bats_cmd, test_timeout, "
+                "bats_timeout and final_test_cmd. Remove the others, then choose [r]etry."
+            )
+            return StageResult(
+                name="",
+                success=False,
+                error=format_gate_error(summary, bad, action),
+            )
+
+        # Rule 6: all good
         return StageResult(name="", success=True)
