@@ -311,6 +311,118 @@ on re-run. To rerun manually:
 uv run python -m norn run implement_features_v2 tmp/jira/CBS-2249/CBS-2249-final-plan
 ```
 
+### merge_branch
+
+`merge_branch` takes the current feature branch from "committed locally" to
+"merged into its base branch": resolve the base and rebase, loop the local
+test suite with an LLM either fixing a failure or saying STOP, push, open or
+reuse the PR and request Copilot as reviewer, wait out the PR's checks
+(handing red Actions checks to a `check_and_fix_ci` child run) and Copilot's
+review, classify and post review findings, fast-forward merge, and watch the
+post-merge build.
+
+```bash
+uv run python -m norn run merge_branch --non-interactive
+```
+
+`--non-interactive` is the fire-and-forget form: the run never pauses for a
+human, so if it halts it simply ends (a halted guard still exits 0, but
+`--non-interactive` always answers the closing prompt `[a]bort`).
+
+**Prerequisites:**
+
+- `gh auth login` with a push-capable token — `preflight` checks push
+  permission on the repository before spending anything.
+- macOS, for the `osascript`-based lifecycle notifications fired on pause and
+  at the end of the run (`norn run` only; `norn ui` passes no `AlertManager`,
+  so a run launched from the TUI gets none).
+- The base branch's protection rules must accept a direct fast-forward push
+  of a PR head that already satisfies them — the merge step is
+  `git push origin <sha>:refs/heads/<base>`, never `gh pr merge`. A squash or
+  GitHub-rebase merge would re-create the commit SHA the checks ran against;
+  `--auto` would end the run before the merge happens, with the outcome
+  unknown.
+
+**CLI-only knobs** (not available under `norn ui`, same as `fix_jira_issue`):
+
+| Knob | Default | Description |
+| --- | --- | --- |
+| `base=<branch>` | resolved | Base branch to rebase onto and merge into — checked against an open PR's base, then the nearest fork point among `main`/`master`/`develop`/`development`, then the repo's default branch |
+| `test_cmd="..."` | auto-detected | Local test command |
+| `fix_model=<light\|standard\|deep>` | `standard` | Label for the local-fix Generate stage |
+| `classify_model=<light\|standard\|deep>` | `standard` | Label for the review-findings classifier |
+| `budget=<float>` | `15` | USD cost ceiling before the run pauses |
+| `guidance="..."` | (none) | Extra text passed verbatim to the local fixer |
+| `overwrite_remote=<sha>` | (none) | One-shot authorisation to force-push over commits on the remote branch with no patch-equivalent on HEAD — refused even when the same human wrote them, unless this is passed and matches the current `origin/<branch>` sha exactly. Never repeated by the rerun command the run's own summary prints. |
+
+**Interactive runs** (no `--non-interactive`) pause only at the very end, and
+only when the run halted — `escalate` is the pipeline's one `ask_user` stage.
+The prompt offers:
+
+- `[a]bort` — ends the run. Recommended; this is what `--non-interactive`
+  always answers.
+- `[c]ontinue` — ends the run recorded as a success, even though nothing
+  merged.
+- `[r]etry` — asks again (nothing about the halt changes by retrying the
+  prompt itself; fix the underlying cause and rerun the pipeline instead).
+
+**Red PR checks** start a `check_and_fix_ci` child run (at most one per
+round) with its own journal under `<state-key>.runs/<n>/` and its own
+lifecycle notifications, separate from `merge_branch`'s. A merge that lands
+with no push-triggered workflow on the base within 120 seconds still ends
+`MERGED`, with a warning in the summary and a notification — not a halt; a
+base branch with no CI at all is not this run's problem. CI that runs longer
+than an hour always halts on the timeout ceiling rather than waiting
+indefinitely.
+
+**Where the summary lives:** `<tempfile.gettempdir()>/norn-merge/v1/<hash of
+the repo path>/<branch-slug>-merge-state.md` — never inside the repository.
+Every halt path writes it, along with a narrated `## What happened` section.
+
+**Rerun, don't resume:** `--resume` is refused (`AssertFreshRun`) — a halted
+guard exits 0 and is checkpointed as a success, so resuming would just skip
+straight past it. Every stage is idempotent, so recovery is always "fix the
+cause, then rerun the exact command the summary prints."
+
+A few halts are structural, not bugs to route around:
+
+- A repository that requires a human approval on the PR always stops the run
+  at the merge gate (`review_required`) — by design, not a gap to fill in.
+- A check that must gate the merge belongs in branch protection. A
+  non-required app check that only reports after the merge-time re-read
+  cannot be seen by this pipeline and is not part of its contract.
+
+**Halt catalogue** — what each named stop means and what to do next (answer
+`[a]bort` at the `escalate` prompt first, if the run is interactive):
+
+| Kind | What to do next |
+| --- | --- |
+| `rebase_conflict` | Rebase by hand onto `origin/<base>`, resolve, then rerun. |
+| `local_stop`, `local_cap`, `local_stuck` | Fix it yourself and commit, or rerun with `--arg guidance="..."`, then rerun. |
+| `local_verdict_missing`, `local_verdict_malformed` | Rerun. If it repeats, fix by hand. |
+| `local_head_moved`, `local_no_diff`, `untracked_files` | Inspect `git status`/`git log`, clean up, rerun. |
+| `local_gate_red`, `test_timeout` | Fix, commit, rerun. |
+| `commit_rejected` | Read the round's commit log (usually a pre-commit hook), fix, rerun. |
+| `push_rejected` | The remote branch moved or refused the push. Reconcile, rerun. |
+| `pr_base_mismatch`, `pr_draft` | Retarget or undraft the PR yourself, rerun. |
+| `checks_red` | Fix CI by hand, push, rerun. |
+| `checks_timeout`, `checks_none`, `pr_head_moved` | `checks_none` means the workflows did not trigger. Check the Actions tab, push, rerun. |
+| `checks_changed` | A check appeared or changed after settling. Look at it, rerun. A gating check belongs in branch protection. |
+| `ci_fix_failed`, `ci_fix_timeout` | Read the child's journal (path is in the summary). Fix CI by hand, push, rerun. |
+| `ci_fix_unpushed` | The child left commits unpushed or edits uncommitted. Inspect, clean up, rerun. |
+| `attribution_found` | Remove the assistant attribution line, rerun. |
+| `copilot_timeout` | Wait for or re-request the Copilot review of the current head, rerun. |
+| `copilot_rerequest_failed` | Re-request Copilot on the PR by hand, rerun. |
+| `findings_malformed`, `classifier_touched_repo` | Rerun. Discard any change the classifier made. |
+| `findings_blocking`, `changes_requested` | Address the findings (by hand or with `implement_features_v2`), push, rerun. |
+| `review_required`, `merge_state` | Get the approval, or fix the named merge state, then rerun. |
+| `head_moved_since_checks` | A commit landed after the checks ran. Rerun. |
+| `merge_rejected` | Branch protection refused the fast-forward. Merge by hand. |
+| `merged_pr_not_closed`, `branch_delete_failed` | The base is already fast-forwarded. Check the PR and branch by hand. |
+| `no_merge_after_rounds` | The base moves too fast. Merge by hand or rerun later. |
+| `base_build_red`, `base_build_timeout` | The merge landed and the base build is red. Fix the base. |
+| `unexpected_failure` | Read `## Why it stopped` in the summary. Transient (gh 5xx, network)? Rerun. Else fix the cause. `Status` in the summary says whether the merge landed. |
+
 ## Launch the UI
 
 `norn ui` opens a terminal UI (Textual) with a launcher, an arguments prompt, a
