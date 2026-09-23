@@ -8,7 +8,8 @@ norn repo:
     current branch. Use the ``implement_features`` pipeline if you need
     plan-driven step implementation; this pipeline is for the
     "I have commits, make CI green" use case.
-  * Single workflow gate (``ci.yml``) — override with ``--arg workflow=...``.
+  * Workflow gate (``ci.yml``) — override with ``--arg workflow=...``, a
+    comma-separated list to check more than one workflow in order.
   * Local validation with ``uv run python -m pytest tests/ -v`` before
     ever touching CI. Override with ``--arg test_cmd=...``.
   * Same safeguards as the egnedata version: ``MIN_USEFUL_LOG_CHARS``
@@ -18,6 +19,7 @@ Run with::
 
     norn run check_and_fix_ci
     norn run check_and_fix_ci --arg workflow=ci.yml
+    norn run check_and_fix_ci --arg workflow=ci.yml,release.yml
     norn run check_and_fix_ci --arg test_cmd="uv run python -m pytest tests/test_runner.py -v"
     norn run check_and_fix_ci --arg skip_local=true
 
@@ -30,7 +32,6 @@ import os
 import shlex
 import subprocess
 import sys
-from pathlib import Path
 from typing import Any
 
 
@@ -66,6 +67,8 @@ from norn.stages.compress_test_log import CompressTestLog
 from norn.stages.extract_failing_step import ExtractFailingStep
 from norn.stages.generate import Generate
 from norn.stages.run_command import RunCommand
+from norn.pipelines._comment_style import COMMENT_RULE, attribution_guard_sh
+from norn.pipelines._test_cmd import detect_test_cmd
 
 
 # Pinned to the launch directory at import time. This pipeline operates on the
@@ -90,7 +93,10 @@ VERBOSE = os.environ.get("FIX_CI_LOOP_VERBOSE", "").lower() in ("1", "true", "ye
 metadata = {
     "env_vars": ["ANTHROPIC_API_KEY", "GH_TOKEN"],
     "args": {
-        "workflow": "GitHub Actions workflow filename (default: ci.yml)",
+        "workflow": (
+            "Comma-separated GitHub Actions workflow filenames, checked in "
+            "order (default: ci.yml)"
+        ),
         "test_cmd": "Local test command (default: auto-detected from project markers)",
         "skip_local": "Set to true to skip the local test loop and go straight to CI",
         "app_packages": (
@@ -101,34 +107,6 @@ metadata = {
         ),
     },
 }
-
-
-# --- per-project test command resolution ----------------------------------
-
-def detect_test_cmd(project_dir: str) -> str:
-    """Pick a sensible local test command from common project markers.
-
-    Resolution order — first match wins. Add markers as needed for new
-    project shapes; this stays a flat lookup on purpose so each project
-    can also override via the ``test_cmd`` arg or ``NORN_TEST_CMD`` env
-    var without touching this file.
-    """
-    root = Path(project_dir)
-    if (root / "pom.xml").exists():
-        return "mvn -q verify"
-    if (root / "gradlew").exists():
-        return "./gradlew test"
-    if (root / "package.json").exists():
-        return "npm test"
-    if (root / "Cargo.toml").exists():
-        return "cargo test"
-    if (root / "go.mod").exists():
-        return "go test ./..."
-    if (root / "tests").is_dir() or (root / "pyproject.toml").exists():
-        if (root / "tests").is_dir():
-            return "uv run python -m pytest tests/ -v"
-        return "uv run python -m pytest -v"
-    return "true"
 
 
 # --- parse --arg flags so we can configure stages at build time -----------
@@ -147,7 +125,7 @@ def _parse_args(argv: list[str]) -> dict[str, str]:
 
 
 _args = _parse_args(sys.argv[1:])
-WORKFLOWS = [_args.get("workflow", "ci.yml")]
+WORKFLOWS = [w.strip() for w in _args.get("workflow", "ci.yml").split(",") if w.strip()]
 
 # Surefire log extractor settings.
 _app_pkgs_raw = _args.get("app_packages", "") or os.environ.get("NORN_APP_PACKAGES", "")
@@ -496,6 +474,7 @@ if not SKIP_LOCAL:
                         "- Read the relevant source files before making changes\n"
                         "- Fix the root cause, not the symptom\n"
                         "- Do not disable or skip failing tests to make them pass\n"
+                        f"{COMMENT_RULE}\n"
                     ),
                     allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
                     permission_mode="acceptEdits",
@@ -523,6 +502,7 @@ if not SKIP_LOCAL:
             '  exit 0; '
             'fi && '
             'git status --short && '
+            f"{attribution_guard_sh()} && "
             'git commit -m "fix: auto-fix from check_and_fix_ci local loop"'
         )),
     )
@@ -605,6 +585,7 @@ pipeline.loop(
                         if not SKIP_LOCAL
                         else ""
                     )
+                    + f"{COMMENT_RULE}\n"
                 ),
                 allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
                 permission_mode="acceptEdits",
@@ -657,6 +638,7 @@ pipeline.loop(
                 f"cd {shlex.quote(PROJECT_DIR)} && "
                 'git add -u && '
                 'git status --short && '
+                f"{attribution_guard_sh(messages_range='@{u}..HEAD')} && "
                 'git commit -m "fix(ci): auto-fix from check_and_fix_ci" && '
                 'git push'
             )),
