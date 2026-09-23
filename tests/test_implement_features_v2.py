@@ -2300,6 +2300,19 @@ def test_aggregate_fix_prompt_references_failure_output_placeholder() -> None:
     assert "{aggregate compress.output}" in fix_stage.impl.prompt
 
 
+def test_aggregate_fix_prompt_names_stale_gates_as_plan_defects() -> None:
+    """aggregate fix prompt says the command is frozen and a stale gate is reported, not repaired."""
+    from norn.stages.generate import Generate
+
+    mod = _import_v2(GOOD_DIR)
+    fix_stage = _stage(mod, "aggregate fix")
+    assert isinstance(fix_stage.impl, Generate)
+    prompt = fix_stage.impl.prompt
+    assert "frozen for the rest of the run" in prompt
+    assert "A stale gate is a plan defect" in prompt
+    assert "make no change and say so" in prompt
+
+
 def test_aggregate_fix_timeout_is_1200() -> None:
     """aggregate fix stage-level timeout is 1200."""
     mod = _import_v2(GOOD_DIR)

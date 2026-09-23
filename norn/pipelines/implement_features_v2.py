@@ -46,6 +46,10 @@ command.  Otherwise v2 assembles the aggregate command from the unique
 in file order, each preceded by ``echo "=== <step stem> ==="``; steps whose
 command is identical to an earlier step are deduplicated.  The aggregate phase
 allows up to two repair rounds via ``--arg aggregate_model`` (default ``standard``).
+The command is assembled once at import, so a step file edited during the run
+does not change what the aggregate reruns; the fix prompt says so and tells
+the agent to report, not repair, a gate that a later step's correct work
+invalidates.  The operator corrects that step's ``test_cmd`` and relaunches.
 
 Review gate
 -----------
@@ -899,6 +903,9 @@ def _aggregate_fix_prompt() -> str:
         f"{step_list}\n\n"
         "## Command the pipeline reruns\n\n"
         f"```\n{AGGREGATE_CMD}\n```\n\n"
+        "This command was assembled from the step files when the run started and is "
+        "frozen for the rest of the run. Editing a step file's `test_cmd` now changes "
+        "nothing the pipeline reruns.\n\n"
         "## Failure evidence\n\n"
         "<failure-output>\n"
         "{aggregate compress.output}\n"
@@ -913,6 +920,11 @@ def _aggregate_fix_prompt() -> str:
         "- Do not make unrelated changes\n"
         f"- Do not run any of the following: {forbidden}\n"
         "- Stop after the repair — do not run the validation command yourself\n"
+        "- A stale gate is a plan defect, not something to repair: if the failing check "
+        "is a step's `test_cmd` that a later step's committed, correct work invalidates "
+        "(for example a checkpoint that only held before that step landed), make no "
+        "change and say so. Name the step whose `test_cmd` must be corrected by the "
+        "operator before the run is relaunched\n"
     )
 
 
