@@ -931,6 +931,8 @@ def load_metrics(run_dir: Path) -> RunMetrics | None:
         ]
         quota_data = data.pop("quota", None)
         quota = QuotaMetrics(**quota_data) if quota_data else None
+        # metrics.json written before timed-out attempts were counted lacks the field.
+        data.setdefault("timed_out_attempts", 0)
         return RunMetrics(**data, stages=stages, quota=quota)
     except Exception:
         log.warning("metrics: failed to load metrics.json from %s", path, exc_info=True)

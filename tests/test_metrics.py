@@ -859,6 +859,20 @@ class TestSerialisation:
         assert len(loaded_f) == 1
         assert loaded_f[0].rule == "test-rule"
 
+    def test_load_defaults_missing_timed_out_attempts(self, tmp_path):
+        rd = make_run_dir(tmp_path, stages=[
+            _make_stage_record(node_id="gen", usage=_agent_usage()),
+        ])
+        write_metrics(rd, compute_metrics(rd), [])
+        path = rd / "metrics.json"
+        data = json.loads(path.read_text())
+        del data["timed_out_attempts"]
+        path.write_text(json.dumps(data))
+
+        loaded = load_metrics(rd)
+        assert loaded is not None
+        assert loaded.timed_out_attempts == 0
+
 
 # ---------------------------------------------------------------------------
 # load_prior_metrics with multiple prior dirs
