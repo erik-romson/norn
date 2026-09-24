@@ -420,10 +420,19 @@ agent kwarg as soon as the provider sends it, and the runner puts it on the
 timeout result's `usage`, where the normal session hand-off picks it up. That
 usage record carries no tokens or cost, because the provider never sent a final
 usage report for the cancelled attempt. The resumed call does not repeat the stage prompt: the runner
-passes `resume_after_timeout`, and `Generate` sends the short
+passes `resume_reason="timeout"`, and `Generate` sends the short
 `TIMEOUT_CONTINUE_PROMPT` telling the agent to pick up where it stopped. In a
 retried loop only the stage that timed out gets it, and only if no other agent
-stage has run in the session first; otherwise it gets its own prompt. `norn.dsl.failure_choices`
+stage has run in the session first; otherwise it gets its own prompt.
+
+**A stage that ran out of turns is resumed the same way.** When the agent hits
+`max_turns`, the Claude Code CLI sends its final usage report
+(`result_subtype="error_max_turns"`) and then exits 1. `Generate` keeps that
+report on the failed result, so the attempt's cost counts toward the run and its
+budget, marks `details["max_turns_exhausted"]`, and names the limit in the error.
+A retry resumes that session with `resume_reason="max_turns"` and
+`MAX_TURNS_CONTINUE_PROMPT`, with a fresh `max_turns` budget, instead of
+starting the task over and running out of turns at the same place. `norn.dsl.failure_choices`
 is the one home of the codes and labels for both the CLI prompt and the modal.
 
 **A budget answer raises the limit.** The three continue codes are not "let this

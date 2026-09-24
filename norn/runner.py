@@ -348,13 +348,13 @@ async def _run_stage(
     budgets: list[Budget] | None = None,
     fork_session: bool = False,
     node_id: str | None = None,
-    resume_after_timeout: bool = False,
+    resume_reason: str | None = None,
 ) -> StageResult:
     """Run a single stage and store the result in context.
 
-    *resume_after_timeout* tells an agent stage that *session_id* is the
-    session its previous attempt timed out in, so it sends a short
-    continue prompt instead of repeating the task.
+    *resume_reason* (``"timeout"`` or ``"max_turns"``) tells an agent stage
+    that *session_id* is the session its previous attempt was cut off in, so
+    it sends a short continue prompt instead of repeating the task.
 
     *node_id* is the fully-qualified graph node id used as the event
     ``stage_id`` so the TUI graph can attribute events to the right node.
@@ -392,7 +392,7 @@ async def _run_stage(
             # with the StageStarted/StageFinished events emitted here.
             "node_id": stage_id,
             "on_session_id": _record_session_id,
-            "resume_after_timeout": resume_after_timeout,
+            "resume_reason": resume_reason,
         }
         mcp_tools = getattr(stage.impl, "mcp_tools", None)
         if isinstance(mcp_tools, list) and mcp_tools:
@@ -617,9 +617,19 @@ def _timed_out(result: StageResult | None) -> bool:
     return result is not None and bool(result.details.get("timed_out"))
 
 
-def _resumable_timeout(result: StageResult | None) -> bool:
-    """Whether *result* timed out inside an agent session a retry can resume."""
-    return _timed_out(result) and bool(result.usage and result.usage.session_id)
+def _resume_reason(result: StageResult | None) -> str | None:
+    """Why a retry of *result* should resume its session, or ``None``.
+
+    A stage cut off by its timeout or its agent's max_turns limit left
+    unfinished work in an agent session; the retry continues that session.
+    """
+    if result is None or not (result.usage and result.usage.session_id):
+        return None
+    if _timed_out(result):
+        return "timeout"
+    if result.details.get("max_turns_exhausted"):
+        return "max_turns"
+    return None
 
 
 def _with_extended_timeout(stage: Stage, code: str) -> Stage:
@@ -661,15 +671,15 @@ async def _run_loop(
     completed_stages: list[str] | None = None,
     fork_session: bool = False,
     step_mode: bool = False,
-    resume_timed_out_stage: str | None = None,
+    resume_stage: tuple[str, str] | None = None,
 ) -> str | None:
     """Run a do-while loop: execute all stages, retry from top on failure.
 
     Agent-backed stages (Generate) within the same loop share a session so
     the agent remembers prior errors when retrying.
 
-    *resume_timed_out_stage* names the body stage whose timeout ended the
-    previous round.  It gets the continue prompt, but only while it is still
+    *resume_stage* is ``(stage name, resume reason)`` for the body stage
+    whose timeout or max_turns limit ended the previous round.  It gets the continue prompt, but only while it is still
     the next agent call in the session; once another agent stage has spoken,
     the conversation has moved on and the stage's own prompt is sent.
 
@@ -780,10 +790,10 @@ async def _run_loop(
             result = await _run_stage(
                 stage, ctx, session_id=session_id, attempt=attempt, budgets=budgets,
                 fork_session=_fork_pending, node_id=stage_node_id,
-                resume_after_timeout=stage.name == resume_timed_out_stage,
+                resume_reason=resume_stage[1] if resume_stage and stage.name == resume_stage[0] else None,
             )
             if stage.impl.needs_agent:
-                resume_timed_out_stage = None
+                resume_stage = None
             last_result = result
 
             # Capture session_id from first Generate result for reuse; update on fork
@@ -884,7 +894,7 @@ async def _run_loop(
                 completed_stages=completed_stages,
                 fork_session=False,
                 step_mode=step_mode,
-                resume_timed_out_stage=last_result.name if _resumable_timeout(last_result) else None,
+                resume_stage=(last_result.name, reason) if (reason := _resume_reason(last_result)) else None,
             )
     if loop.on_exhaust == OnFailure.DRAFT_PR:
         ctx.event_sink.emit(LoopDraftPR(
@@ -1483,7 +1493,7 @@ async def run_pipeline(
                     result = await _run_stage(
                         stage_to_run, ctx, session_id=current_session, budgets=budgets,
                         fork_session=_fork_pending, attempt=attempt,
-                        resume_after_timeout=_resumable_timeout(result),
+                        resume_reason=_resume_reason(result),
                     )
                     if result.usage and result.usage.session_id:
                         if _fork_pending:

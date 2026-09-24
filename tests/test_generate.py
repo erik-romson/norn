@@ -5,7 +5,7 @@ from norn.agents.base import AgentError, AgentEvent, AgentRequest, AgentUsage
 from norn.agents import registry as agent_registry
 from norn.model_labels import ModelLabelError, resolve_label
 from norn.models import PipelineContext, StageResult
-from norn.stages.generate import TIMEOUT_CONTINUE_PROMPT, Generate
+from norn.stages.generate import MAX_TURNS_CONTINUE_PROMPT, TIMEOUT_CONTINUE_PROMPT, Generate
 
 
 # ---------------------------------------------------------------------------
@@ -660,18 +660,22 @@ async def test_session_id_reported_while_running(fake_provider):
 
 
 @pytest.mark.asyncio
-async def test_resume_after_timeout_sends_continue_prompt(fake_provider):
+@pytest.mark.parametrize(
+    ("reason", "prompt"),
+    [("timeout", TIMEOUT_CONTINUE_PROMPT), ("max_turns", MAX_TURNS_CONTINUE_PROMPT)],
+)
+async def test_resume_reason_sends_continue_prompt(fake_provider, reason, prompt):
     gen = Generate(prompt="implement the whole feature")
-    await gen.run(_ctx_for_fake(), session_id="sess-1", resume_after_timeout=True)
+    await gen.run(_ctx_for_fake(), session_id="sess-1", resume_reason=reason)
     request = fake_provider.requests[0]
-    assert request.prompt == TIMEOUT_CONTINUE_PROMPT
+    assert request.prompt == prompt
     assert request.session_id == "sess-1"
 
 
 @pytest.mark.asyncio
-async def test_resume_after_timeout_without_session_sends_stage_prompt(fake_provider):
+async def test_resume_reason_without_session_sends_stage_prompt(fake_provider):
     gen = Generate(prompt="implement the whole feature")
-    await gen.run(_ctx_for_fake(), resume_after_timeout=True)
+    await gen.run(_ctx_for_fake(), resume_reason="timeout")
     assert fake_provider.requests[0].prompt == "implement the whole feature"
 
 
@@ -700,6 +704,48 @@ async def test_agent_error_surfaces_stderr(fake_provider):
     assert result.error is not None
     assert "You've hit your limit" in result.error
     assert "Check stderr output for details" not in result.error
+
+
+class _MaxTurnsProvider:
+    """Sends the CLI's error_max_turns report, then fails like the CLI's exit 1."""
+
+    name = "_fake-test-provider"
+
+    async def run(self, request):
+        yield AgentEvent(text="Now let's check step 09.")
+        yield AgentEvent(usage=AgentUsage(
+            provider="test", session_id="sess-9", total_cost_usd=1.27,
+            num_turns=41, is_error=True, result_subtype="error_max_turns",
+        ))
+        raise AgentError(RuntimeError("Command failed with exit code 1"))
+
+
+@pytest.mark.asyncio
+async def test_max_turns_failure_keeps_usage_and_names_the_limit(fake_provider):
+    agent_registry.register(_MaxTurnsProvider())
+    result = await Generate(prompt="review", max_turns=40).run(_ctx_for_fake())
+    assert not result.success
+    assert result.error.startswith("Agent reached its max_turns limit (40) after 41 turns")
+    assert result.details["max_turns_exhausted"] is True
+    assert result.usage is not None
+    assert result.usage.total_cost_usd == 1.27
+    assert result.usage.session_id == "sess-9"
+
+
+@pytest.mark.asyncio
+async def test_failure_before_usage_report_has_no_usage(fake_provider):
+    class FailingProvider:
+        name = "_fake-test-provider"
+
+        async def run(self, request):
+            yield AgentEvent(session_id="sess-1")
+            raise AgentError(RuntimeError("Command failed with exit code 1"))
+
+    agent_registry.register(FailingProvider())
+    result = await Generate(prompt="hi").run(_ctx_for_fake())
+    assert not result.success
+    assert result.usage is None
+    assert "max_turns_exhausted" not in result.details
 
 
 @pytest.mark.asyncio

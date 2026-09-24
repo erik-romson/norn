@@ -277,11 +277,11 @@ class _SessionAgentStage(BaseStage):
     def __init__(self, hang: float) -> None:
         self._hang = hang
         self.sessions: list[str | None] = []
-        self.resumes: list[bool] = []
+        self.resumes: list[str | None] = []
 
     async def run(self, ctx: PipelineContext, **kwargs) -> StageResult:
         self.sessions.append(kwargs.get("session_id"))
-        self.resumes.append(kwargs.get("resume_after_timeout"))
+        self.resumes.append(kwargs.get("resume_reason"))
         if len(self.sessions) == 1:
             kwargs["on_session_id"]("sess-1")
             await asyncio.sleep(self._hang)
@@ -297,7 +297,7 @@ async def test_timeout_retry_resumes_the_cut_off_session(answer):
     ctx = await run_pipeline(p, input_responder=responder)
     assert ctx.get("agent") == "done"
     assert stage.sessions == [None, "sess-1"]
-    assert stage.resumes == [False, True]
+    assert stage.resumes == [None, "timeout"]
 
 
 @pytest.mark.asyncio
@@ -312,17 +312,17 @@ async def test_exhausted_loop_retry_resumes_the_cut_off_session():
     )
     await run_pipeline(p, input_responder=responder)
     assert stage.sessions == [None, "sess-1"]
-    assert stage.resumes == [False, True]
+    assert stage.resumes == [None, "timeout"]
 
 
 class _AgentProbeStage(BaseStage):
     needs_agent = True
 
     def __init__(self) -> None:
-        self.resumes: list[bool] = []
+        self.resumes: list[str | None] = []
 
     async def run(self, ctx: PipelineContext, **kwargs) -> StageResult:
-        self.resumes.append(kwargs.get("resume_after_timeout"))
+        self.resumes.append(kwargs.get("resume_reason"))
         return StageResult(name="", success=True)
 
 
@@ -339,8 +339,8 @@ async def test_loop_continue_prompt_skipped_once_another_agent_spoke():
         stages=[Stage("first", first), Stage("agent", slow, timeout=0.05)],
     )
     await run_pipeline(p, input_responder=responder)
-    assert first.resumes == [False, False]
-    assert slow.resumes == [False, False]
+    assert first.resumes == [None, None]
+    assert slow.resumes == [None, None]
 
 
 @pytest.mark.asyncio
@@ -355,7 +355,53 @@ async def test_retry_after_plain_failure_sends_the_stage_prompt():
     stage = _FailOnce()
     p = Pipeline("t").stage("agent", stage, on_failure=OnFailure.ASK_USER)
     await run_pipeline(p, input_responder=responder)
-    assert stage.resumes == [False, False]
+    assert stage.resumes == [None, None]
+
+
+class _MaxTurnsOnceStage(_AgentProbeStage):
+    """Agent stage that runs out of turns in session 'sess-1' on its first run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sessions: list[str | None] = []
+
+    async def run(self, ctx, **kwargs):
+        await super().run(ctx, **kwargs)
+        self.sessions.append(kwargs.get("session_id"))
+        if len(self.sessions) > 1:
+            return StageResult(name="", success=True, output="done")
+        return StageResult(
+            name="", success=False, error="max turns",
+            usage=UsageRecord(stage_name="", session_id="sess-1", result_subtype="error_max_turns"),
+            details={"max_turns_exhausted": True},
+        )
+
+
+@pytest.mark.asyncio
+async def test_max_turns_retry_resumes_the_cut_off_session():
+    stage = _MaxTurnsOnceStage()
+    responder = _ScriptedResponder(["r"])
+    p = Pipeline("t").stage("agent", stage, on_failure=OnFailure.ASK_USER)
+    ctx = await run_pipeline(p, input_responder=responder)
+    assert ctx.get("agent") == "done"
+    assert stage.sessions == [None, "sess-1"]
+    assert stage.resumes == [None, "max_turns"]
+    assert responder.timed_out_flags == [False]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_loop_retry_resumes_the_max_turns_session():
+    stage = _MaxTurnsOnceStage()
+    responder = _ScriptedResponder(["r"])
+    p = Pipeline("t").loop(
+        "lp",
+        max_retries=1,
+        on_exhaust=OnFailure.ASK_USER,
+        stages=[Stage("agent", stage)],
+    )
+    await run_pipeline(p, input_responder=responder)
+    assert stage.sessions == [None, "sess-1"]
+    assert stage.resumes == [None, "max_turns"]
 
 
 @pytest.mark.asyncio

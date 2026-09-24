@@ -31,6 +31,22 @@ TIMEOUT_CONTINUE_PROMPT = (
     "Check where you got to, then continue the same task from there and finish it."
 )
 
+# Sent instead of the stage prompt when a retry resumes the session that ran
+# out of turns.  The retry gets a fresh max_turns budget, so the agent only
+# needs telling not to spend it re-checking what it already covered.
+MAX_TURNS_CONTINUE_PROMPT = (
+    "You were stopped because this task used up its turn limit. Your work so far "
+    "is in the conversation above, and every file you changed is still on disk. "
+    "Do not redo what you already covered: continue the same task from where you "
+    "stopped and finish it."
+)
+
+# The continue prompt for each reason the runner resumes a cut-off session.
+CONTINUE_PROMPTS = {
+    "timeout": TIMEOUT_CONTINUE_PROMPT,
+    "max_turns": MAX_TURNS_CONTINUE_PROMPT,
+}
+
 
 def _normalize_error_text(text: str) -> str:
     """Trim duplicate SDK boilerplate from CLI failure messages."""
@@ -233,7 +249,9 @@ class Generate(BaseStage):
         # runner still knows the session when it cancels this stage on timeout
         # and the StageResult carrying the id is never returned.
         on_session_id: Callable[[str], None] | None = kwargs.get("on_session_id")
-        resume_after_timeout: bool = kwargs.get("resume_after_timeout", False)
+        # "timeout" or "max_turns" when session_id is the session the previous
+        # attempt was cut off in; the retry then sends a short continue prompt.
+        resume_reason: str | None = kwargs.get("resume_reason")
 
         # One effective working dir: explicit stage cwd wins, falls back to run working_dir.
         effective_cwd = self.cwd or ctx.working_dir
@@ -371,8 +389,8 @@ class Generate(BaseStage):
 
         output_format: dict | None = tmpl.output_format if (tmpl and tmpl.output_format) else None
 
-        if resume_after_timeout and session_id:
-            resolved_prompt = TIMEOUT_CONTINUE_PROMPT
+        if resume_reason and session_id:
+            resolved_prompt = CONTINUE_PROMPTS[resume_reason]
 
         # Build env: merge pipeline-level env and stage-level env (with secret resolution)
         merged_env: dict[str, str] = {}
@@ -565,8 +583,20 @@ class Generate(BaseStage):
             if isinstance(e, AgentError):
                 stderr_lines = e.stderr_lines
                 original = e.original
+            error = _render_cli_exception(original, stderr_lines, chunks)
+            # The CLI exits non-zero *after* sending its final usage report on
+            # e.g. error_max_turns.  Keep that report: it is what the attempt
+            # cost, and its session is what a retry resumes.
+            reported = usage_record.result_subtype is not None
+            if usage_record.result_subtype == "error_max_turns":
+                _details["max_turns_exhausted"] = True
+                error = (
+                    f"Agent reached its max_turns limit ({effective_max_turns}) after "
+                    f"{usage_record.num_turns} turns without finishing.\n{error}"
+                )
             return StageResult(
                 name="", success=False,
-                error=_render_cli_exception(original, stderr_lines, chunks),
+                error=error,
+                usage=usage_record if reported else None,
                 details=_details,
             )
