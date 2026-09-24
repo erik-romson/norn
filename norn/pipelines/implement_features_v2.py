@@ -197,7 +197,6 @@ TIMEOUT_REVIEW           = 1800
 TIMEOUT_REVIEW_FIX       = 1200
 TIMEOUT_HANDOFF          = 300
 
-MAX_TURNS_REVIEW   = 40
 MAX_TURNS_HANDOFF  = 4
 MAX_TURNS_CLOSEOUT = 1
 
@@ -662,6 +661,13 @@ BUDGET        = _require_knob_float(
 TOKEN_BUDGET  = _require_knob_int(
     "token_budget", str(BUDGET_TOKENS_PER_STEP * _step_count + BUDGET_TOKENS_REVIEW)
 )
+
+# A review is one agent call that walks every step of the plan, so its turn
+# limit scales the same way.  A flat 40 ran out at step 09 of the 11-step
+# CBS-2623 plan (2026-09-23), twice: about 4 turns per step after setup.
+MAX_TURNS_REVIEW_BASE     = 20
+MAX_TURNS_REVIEW_PER_STEP = 6
+MAX_TURNS_REVIEW = MAX_TURNS_REVIEW_BASE + MAX_TURNS_REVIEW_PER_STEP * _step_count
 
 # ---------------------------------------------------------------------------
 # Resume scan: skip steps whose commit is already on HEAD

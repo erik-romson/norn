@@ -136,6 +136,7 @@ def test_default_knobs() -> None:
     # which cost the same however many steps came before them.
     assert mod.BUDGET == mod.BUDGET_USD_PER_STEP * steps + mod.BUDGET_USD_REVIEW
     assert mod.TOKEN_BUDGET == mod.BUDGET_TOKENS_PER_STEP * steps + mod.BUDGET_TOKENS_REVIEW
+    assert mod.MAX_TURNS_REVIEW == mod.MAX_TURNS_REVIEW_BASE + mod.MAX_TURNS_REVIEW_PER_STEP * steps
     assert mod.REVIEW_MODEL == "standard"
     assert mod.AGGREGATE_MODEL == "standard"
     assert mod.MAX_RETRIES == 3
@@ -2691,13 +2692,13 @@ def test_review_fix_stages_gated_on_needs_fixes_marker() -> None:
 
 
 def test_review_generate_config() -> None:
-    """review Generate has max_turns=40, timeout=1800, no Edit, no Task, model follows knob."""
+    """review Generate has max_turns scaled to the plan, timeout=1800, no Edit, no Task, model follows knob."""
     from norn.stages.generate import Generate
     mod = _import_v2(GOOD_DIR)
     for n in range(1, 4):
         s = _stage(mod, f"review {n}")
         assert isinstance(s.impl, Generate)
-        assert s.impl.max_turns == 40, f"review {n}: max_turns should be 40"
+        assert s.impl.max_turns == mod.MAX_TURNS_REVIEW, f"review {n}: max_turns should be MAX_TURNS_REVIEW"
         assert s.timeout == 1800, f"review {n}: timeout should be 1800"
         tools = s.impl.allowed_tools or []
         assert "Edit" not in tools, f"review {n}: should not have Edit tool"
