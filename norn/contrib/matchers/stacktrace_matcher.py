@@ -24,6 +24,7 @@ async def github_code_search(cls_name: str, github_org: str | None) -> list[str]
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )

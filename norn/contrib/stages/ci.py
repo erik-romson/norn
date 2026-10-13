@@ -66,6 +66,7 @@ async def _check_ci_status(repo: str, branch: str) -> dict:
     """Check GitHub Actions workflow status via gh CLI."""
     proc = await asyncio.create_subprocess_shell(
         f"gh run list -R {repo} -b {branch} --json status,conclusion,name,databaseId -L 5",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

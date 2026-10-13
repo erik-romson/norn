@@ -163,6 +163,7 @@ async def _resolve_contexts(
         elif spec.kind == "cmd":
             proc = await asyncio.create_subprocess_shell(
                 spec.source,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=working_dir,

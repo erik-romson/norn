@@ -51,6 +51,7 @@ async def run_coverage(repo_path: Path) -> CoverageReport:
 async def _python_coverage(repo_path: Path) -> CoverageReport:
     proc = await asyncio.create_subprocess_shell(
         "python -m pytest --cov --cov-report=json",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(repo_path),
@@ -79,6 +80,7 @@ async def _python_coverage(repo_path: Path) -> CoverageReport:
 async def _java_coverage(repo_path: Path) -> CoverageReport:
     proc = await asyncio.create_subprocess_shell(
         "mvn verify -B jacoco:report",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(repo_path),

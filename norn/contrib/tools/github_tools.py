@@ -42,7 +42,9 @@ async def github_search_code(args: dict) -> dict:
         cmd += f" --language {shlex.quote(language)}"
     cmd += " --json repository,path --limit 20"
 
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        cmd, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30
+    )
     if result.returncode != 0:
         return {
             "content": [{"type": "text", "text": f"Error: {result.stderr.strip()}"}],
@@ -62,7 +64,9 @@ async def github_list_repos(args: dict) -> dict:
     language: str | None = args.get("language")
 
     cmd = f"gh repo list {shlex.quote(org)} -L 200 --json name,url,language,description"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        cmd, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30
+    )
     if result.returncode != 0:
         return {
             "content": [{"type": "text", "text": f"Error: {result.stderr.strip()}"}],

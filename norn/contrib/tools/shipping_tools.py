@@ -37,7 +37,9 @@ async def check_ci_status(args: dict) -> dict:
         f"gh run list -R {shlex.quote(repo)} -b {shlex.quote(branch)}"
         " --json status,conclusion,name,databaseId -L 5"
     )
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        cmd, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30
+    )
     if result.returncode != 0:
         return {
             "content": [{"type": "text", "text": f"Error: {result.stderr.strip()}"}],
@@ -68,7 +70,9 @@ async def create_pr(args: dict) -> dict:
     if draft:
         cmd += " --draft"
 
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        cmd, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30
+    )
     output = {"url": result.stdout.strip(), "success": result.returncode == 0}
     if result.returncode != 0:
         output["error"] = result.stderr.strip()

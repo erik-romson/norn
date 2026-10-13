@@ -197,6 +197,22 @@ class RunScreen(Screen):
     def on_mount(self) -> None:
         if self._pipeline_obj is not None:
             self._run_task = asyncio.create_task(self._drive_run())
+            self.set_interval(1.0, self._keep_raw_mode)
+
+    def _keep_raw_mode(self) -> None:
+        """Undo a child process switching the shared terminal to line mode."""
+        from textual.drivers.linux_driver import LinuxDriver  # noqa: PLC0415
+
+        from norn.tui.terminal import restore_raw_mode  # noqa: PLC0415
+
+        driver = self.app._driver
+        if isinstance(driver, LinuxDriver) and restore_raw_mode(driver.fileno):
+            self.notify(
+                "A command switched the terminal out of raw mode; restored it. "
+                "Keys pressed meanwhile were dropped.",
+                severity="warning",
+                timeout=10,
+            )
 
     async def _drive_run(self) -> None:
         """Run the pipeline in-process, feeding events into the UI.
@@ -468,6 +484,7 @@ class RunScreen(Screen):
         kind = getattr(wi, "kind", "") or ""
         stage_name = node_display_name(getattr(getattr(wi, "key", None), "stage_id", None))
         excerpt = getattr(wi, "prompt_excerpt", "") or ""
+        self._keep_raw_mode()
         self._modal_open = True
         self.app.push_screen(
             InputDecisionModal(kind, stage_name=stage_name, excerpt=excerpt),

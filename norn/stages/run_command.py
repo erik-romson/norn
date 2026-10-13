@@ -101,6 +101,9 @@ class RunCommand(BaseStage):
             ``DEFAULT_TIMEOUT_SECONDS`` (1h) as a hang backstop; pass ``None``
             to wait indefinitely.
 
+    The command sees ``NORN_ATTEMPT``: the stage's attempt number, which
+    inside a loop is the loop's attempt (1 on its first pass).
+
     Output:
         ``StageResult.output`` is a dict::
 
@@ -141,11 +144,9 @@ class RunCommand(BaseStage):
         **kwargs: Any,
     ) -> StageResult:
         # Build subprocess env: process env + pipeline env + stage env (with secret resolution)
-        subprocess_env: dict[str, str] | None = None
-        if self.env or ctx.env:
-            subprocess_env = {**os.environ, **ctx.env}
-            if self.env:
-                subprocess_env.update(resolve_env(self.env, ctx))
+        subprocess_env = {**os.environ, **ctx.env, "NORN_ATTEMPT": str(attempt)}
+        if self.env:
+            subprocess_env.update(resolve_env(self.env, ctx))
 
         # start_new_session=True runs the command as its own process-group
         # leader. That lets us tear down the *entire* tree (a backgrounded
@@ -155,6 +156,7 @@ class RunCommand(BaseStage):
         # pipe open, the exact deadlock that wedges proc.communicate().
         proc = await asyncio.create_subprocess_shell(
             self.cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=subprocess_env,

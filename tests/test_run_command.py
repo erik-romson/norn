@@ -29,6 +29,27 @@ async def test_run_command_failure():
 
 
 @pytest.mark.asyncio
+async def test_run_command_does_not_hand_the_terminal_to_the_command():
+    """A command gets no terminal on stdin, so it cannot switch the TUI's out of raw mode."""
+    master, slave = os.openpty()
+    saved_stdin = os.dup(0)
+    os.dup2(slave, 0)
+    try:
+        result = await RunCommand(cmd="[ -t 0 ] && echo tty || echo notty").run(PipelineContext())
+    finally:
+        os.dup2(saved_stdin, 0)
+        for fd in (saved_stdin, slave, master):
+            os.close(fd)
+    assert result.output["stdout"].strip() == "notty"
+
+
+@pytest.mark.asyncio
+async def test_run_command_exposes_the_attempt_number():
+    result = await RunCommand(cmd='echo "$NORN_ATTEMPT"').run(PipelineContext(), attempt=3)
+    assert result.output["stdout"].strip() == "3"
+
+
+@pytest.mark.asyncio
 async def test_run_command_env_injected():
     """Stage-level env dict values are available in the subprocess environment."""
     stage = RunCommand(cmd="echo $MY_VAR", env={"MY_VAR": "hello_from_env"})

@@ -66,7 +66,8 @@ async def run_tests(args: dict) -> dict:
         cmd = _detect_test_command(repo_path, test_files)
 
     result = subprocess.run(
-        cmd, shell=True, capture_output=True, text=True, cwd=repo_path, timeout=300
+        cmd, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True, cwd=repo_path,
+        timeout=300,
     )
     output = {
         "success": result.returncode == 0,
@@ -91,6 +92,7 @@ async def run_coverage(args: dict) -> dict:
         "python -m pytest --cov --cov-report=json",
         shell=True,
         cwd=repo_path,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=300,
     )
