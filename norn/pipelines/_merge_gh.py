@@ -94,6 +94,17 @@ COPILOT_LOGINS = {
     "Copilot",
 }
 
+# `gh run list` event of GitHub's own agent runs (the Copilot code review,
+# the Copilot coding agent). They are not the repository's CI, and a Copilot
+# review that fails on quota must not read as a red build.
+_AGENT_RUN_EVENT = "dynamic"
+
+
+def _ci_runs(out: str) -> list[dict]:
+    """Parse ``gh run list --json ...,event`` output, dropping GitHub's agent runs."""
+    return [run for run in json.loads(out) if run.get("event") != _AGENT_RUN_EVENT]
+
+
 # WaitForChecks constants (Phase 4). Raising one is a deliberate edit, per
 # AGENTS.md's "module constants, never knobs".
 HEAD_SYNC_TIMEOUT = 60
@@ -171,6 +182,7 @@ async def _run(argv: list[str], *, cwd: str, env: dict[str, str] | None) -> tupl
         *argv,
         cwd=cwd,
         env={**os.environ, **(env or {})},
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -298,6 +310,13 @@ class ResolveBranch(BaseStage):
 
             if branch == base:
                 raise _Fail(f"branch and base are both {branch!r}; pass --arg base=<name> or switch branches")
+
+            rc, _, _ = await git(
+                ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}"],
+                cwd=project_dir, env=env, ok=(0, 1),
+            )
+            if not base or rc != 0:
+                raise _Fail(f"base {base!r} ({source}) does not exist on origin; push it first or pass --arg base=<name>")
 
             _, out, _ = await git(["rev-list", "--count", f"origin/{base}..HEAD"], cwd=project_dir, env=env)
             if out.strip() == "0":
@@ -596,10 +615,11 @@ def _copilot_commit_filter() -> str:
     Built once, at Python build time, from the static :data:`COPILOT_LOGINS`
     set — never a runtime shell value — so no external ``jq`` binary is
     needed, only gh's own built-in ``-q``. ``json.dumps`` gives each login a
-    valid (gh-``-q``-compatible) double-quoted string literal.
+    valid (gh-``-q``-compatible) double-quoted string literal. gh applies it
+    to each ``--paginate`` page on its own (``--slurp`` rejects ``-q``).
     """
     logins = " or ".join(f".user.login == {json.dumps(login)}" for login in sorted(COPILOT_LOGINS))
-    return f".[][] | select({logins}) | .commit_id"
+    return f".[] | select({logins}) | .commit_id"
 
 
 def request_copilot_cmd(paths: MergePaths, project_dir: str, *, rerequest: bool) -> str:
@@ -673,7 +693,7 @@ def request_copilot_cmd(paths: MergePaths, project_dir: str, *, rerequest: bool)
         f"REPO=$(cat {repo_path}) || exit 1\n"
         f"NUM=$(cat {pr_path}) || exit 1\n"
         f"PUSHED_HEAD=$(cat {pushed_head_path}) || exit 1\n"
-        f'REVIEWED_COMMITS=$(gh api "repos/$REPO/pulls/$NUM/reviews" --paginate --slurp '
+        f'REVIEWED_COMMITS=$(gh api "repos/$REPO/pulls/$NUM/reviews" --paginate '
         f"-q {commit_filter}) || exit 1\n"
         'if printf \'%s\\n\' "$REVIEWED_COMMITS" | grep -qxF "$PUSHED_HEAD"; then\n'
         f"  printf 'already-reviewed\\n' > {reviewer_path}\n"
@@ -945,11 +965,11 @@ class WaitForChecks(HaltOnFailure, BaseStage):
         _, out, _ = await gh(
             [
                 "run", "list", "-R", repo, "-c", head, "-L", "100", "--json",
-                "databaseId,workflowName,status,conclusion,url",
+                "databaseId,workflowName,status,conclusion,url,event",
             ],
             cwd=project_dir, env=env,
         )
-        return json.loads(out)
+        return _ci_runs(out)
 
     # -- phases ---------------------------------------------------------
 
@@ -1513,9 +1533,14 @@ class WaitForCopilotReview(HaltOnFailure, BaseStage):
         repo = _read(paths.repo)
         pr_num = _read(paths.pr)
         pushed_head = _read(paths.pushed_head)
-        requested_at_text = _read(paths.copilot_requested_at)
-        requested_at = _parse_iso(requested_at_text)
-        already_elapsed = max(0.0, (datetime.now(timezone.utc) - requested_at).total_seconds())
+        # `already-reviewed` never requested, so there is no timestamp; its match comes on the first poll.
+        if Path(paths.copilot_requested_at).is_file():
+            requested_at_text = _read(paths.copilot_requested_at)
+            requested_at = _parse_iso(requested_at_text)
+            already_elapsed = max(0.0, (datetime.now(timezone.utc) - requested_at).total_seconds())
+        else:
+            requested_at_text = "(not requested)"
+            already_elapsed = 0.0
         deadline = self._clock() + max(COPILOT_REVIEW_TIMEOUT - already_elapsed, 0.0)
 
         while True:
@@ -1974,11 +1999,11 @@ class CheckMergePreconditions(HaltOnFailure, BaseStage):
         _, out, _ = await gh(
             [
                 "run", "list", "-R", repo, "-c", head, "-L", "100", "--json",
-                "databaseId,workflowName,status,conclusion,url",
+                "databaseId,workflowName,status,conclusion,url,event",
             ],
             cwd=project_dir, env=env,
         )
-        return json.loads(out)
+        return _ci_runs(out)
 
     # -- orchestration ----------------------------------------------------
 
@@ -2243,11 +2268,11 @@ class WatchBaseBuild(HaltOnFailure, BaseStage):
         _, out, _ = await gh(
             [
                 "run", "list", "-R", repo, "-c", sha, "-b", base, "--json",
-                "databaseId,workflowName,status,conclusion,url,startedAt,updatedAt",
+                "databaseId,workflowName,status,conclusion,url,startedAt,updatedAt,event",
             ],
             cwd=project_dir, env=env,
         )
-        return json.loads(out)
+        return _ci_runs(out)
 
     async def _await_appearance(
         self, repo: str, sha: str, base: str, project_dir: str, env: dict[str, str] | None

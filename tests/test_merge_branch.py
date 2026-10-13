@@ -237,6 +237,26 @@ async def test_nothing_to_merge_fails(tmp_path):
     assert "nothing to merge" in result.error
 
 
+@pytest.mark.asyncio
+async def test_base_missing_on_origin_fails(tmp_path):
+    repo = _repo(tmp_path)
+    repo.repo.git.checkout("-b", "feature-x")
+    (Path(repo.path) / "f.txt").write_text("one\n")
+    repo.repo.index.add(["f.txt"])
+    repo.repo.index.commit("feature commit")
+    # An empty GitHub repo reports no default branch and origin has no branches.
+    git.Repo(repo.origin_path).git.config("receive.denyDeleteCurrent", "ignore")
+    repo.repo.git.push("origin", "--delete", "main", "develop")
+
+    paths = _paths(tmp_path)
+    env = _gh_env(tmp_path, _routes(default_branch=""))
+
+    result = await _resolve(repo, paths, env)
+
+    assert result.success is False
+    assert "does not exist on origin" in result.error
+
+
 # ---------------------------------------------------------------------------
 # ResolveBranch — the remote-only-commit guard
 # ---------------------------------------------------------------------------
@@ -1311,6 +1331,13 @@ def _write_copilot_prereqs(paths, *, pushed_head="cafef00d") -> None:
     Path(paths.pushed_head).write_text(pushed_head + "\n")
 
 
+def test_request_copilot_does_not_combine_slurp_with_jq(tmp_path):
+    # gh rejects `--slurp` together with `-q`; the fake gh ignores flags, so pin it here.
+    cmd = _merge_gh.request_copilot_cmd(_paths(tmp_path), str(tmp_path), rerequest=False)
+
+    assert "--slurp" not in cmd
+
+
 def test_request_copilot_already_reviewed_when_review_matches_pushed_head(tmp_path):
     paths = _paths(tmp_path)
     _write_copilot_prereqs(paths, pushed_head="cafef00d")
@@ -1877,6 +1904,37 @@ async def test_wait_for_checks_completed_failure_run_with_no_check_gives_red(tmp
     data = json.loads(Path(paths.checks(1)).read_text())
     assert data["outcome"] == "checks_red"
     assert data["checks"] == []
+
+
+@pytest.mark.asyncio
+async def test_wait_for_checks_ignores_failed_copilot_review_run(tmp_path):
+    paths = _paths(tmp_path)
+    _write_wait_prereqs(paths, pushed_head="deadbeef")
+
+    green_checks = json.dumps([_chk("build", "pass")])
+    runs = json.dumps([
+        _run_entry(1, "build", "completed", "success"),
+        # The Copilot code review runs as a "dynamic" Actions run and fails when out of quota.
+        {**_run_entry(2, "Copilot", "completed", "failure"), "event": "dynamic"},
+    ])
+    bin_dir, _ = install_fake_gh(
+        tmp_path,
+        {
+            ("pr", "view"): [(0, json.dumps({"headRefOid": "deadbeef"}), "")],
+            ("pr", "checks"): [(0, green_checks, "")],
+            ("run", "list"): [(0, runs, "")],
+        },
+    )
+    env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+    fc = _FakeClock()
+    stage = _wait_stage(paths, str(tmp_path), 1, fc)
+    result = await stage.run(ctx_for(env=env))
+
+    assert result.success is True
+    assert not Path(paths.halt).exists()
+    data = json.loads(Path(paths.checks(1)).read_text())
+    assert data["outcome"] == "green"
 
 
 @pytest.mark.asyncio
@@ -2538,8 +2596,8 @@ async def test_wait_for_copilot_review_older_commit_id_keeps_waiting_then_times_
 async def test_wait_for_copilot_review_matching_commit_id_succeeds(tmp_path):
     paths = _paths(tmp_path)
     _write_wait_prereqs(paths, pushed_head="deadbeef")
+    # The request stage writes no copilot-requested-at when it finds the review already there.
     Path(paths.copilot_reviewer).write_text("already-reviewed\n")
-    Path(paths.copilot_requested_at).write_text(_iso_now() + "\n")
     review = [
         {
             "user": {"login": "Copilot"},
