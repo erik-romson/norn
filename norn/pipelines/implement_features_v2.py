@@ -926,11 +926,22 @@ def _aggregate_fix_prompt() -> str:
         "- Do not make unrelated changes\n"
         f"- Do not run any of the following: {forbidden}\n"
         "- Stop after the repair — do not run the validation command yourself\n"
-        "- A stale gate is a plan defect, not something to repair: if the failing check "
-        "is a step's `test_cmd` that a later step's committed, correct work invalidates "
-        "(for example a checkpoint that only held before that step landed), make no "
-        "change and say so. Name the step whose `test_cmd` must be corrected by the "
-        "operator before the run is relaunched\n"
+        "- A stale gate is a check that held when its step landed but that a later "
+        "step's committed, correct work invalidates. Where the check lives decides "
+        "what to do:\n"
+        "  - In a test file in the repository: update the assertion so it checks what "
+        "it originally protected against the current, correct state — for example, "
+        "assert that the specific services publish no ports instead of counting "
+        "`ports:` file-wide. It must stay as strict for what it protected; never "
+        "delete it or loosen it just to pass. This is repairing a stale test, not "
+        "weakening one. Name the step that wrote the check and the step that "
+        "invalidated it\n"
+        "  - Inline in the command above, not in any file: it cannot be repaired "
+        "here, since the command is frozen. A stale gate is then a plan defect: make "
+        "no change and say so. Name the step whose `test_cmd` must be corrected by "
+        "the operator before the run is relaunched\n"
+        "- If you make no change, the pipeline does not rerun the command: the loop "
+        "fails and the operator decides\n"
     )
 
 
@@ -1066,15 +1077,41 @@ def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
     exists and the tree still matches it. The file name carries a hash of the
     command, so a proof never vouches for a command that was edited between
     runs. HEAD and index are asserted separately by the gate.
+
+    A failed run leaves a snapshot of the tree it failed on. A later attempt of
+    the same loop pass (``NORN_ATTEMPT`` > 1) on that exact tree means the fix
+    changed nothing, so it fails at once instead of rerunning a suite that can
+    only fail the same way: an aggregate loop once spent six eight-minute runs
+    on a fix that, each time, correctly declined to change anything. Attempt 1
+    always runs, so an operator's retry after exhaustion reruns in full.
     """
     q = shlex.quote
     digest = hashlib.sha1(validation_cmd.encode()).hexdigest()[:12]
     proof = os.path.join(snapshot_root, f"{key}.validated.{digest}.json")
     now = proof + ".now"
     delta = proof + ".delta"
+    failed = os.path.join(snapshot_root, f"{key}.failed.{digest}.json")
+    failed_now = failed + ".now"
+    failed_delta = failed + ".delta"
+    unchanged_since_failure = (
+        f'if [ "${{NORN_ATTEMPT:-1}}" -gt 1 ] && [ -f {q(failed)} ]; then '
+        f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(failed_now)} && "
+        f"python3 {q(SNAPSHOT_HELPER)} diff {q(failed)} {q(failed_now)}{NORN_STATE_IGNORE_FLAGS}"
+        f" > {q(failed_delta)} && "
+        f"if [ ! -s {q(failed_delta)} ]; then "
+        f'echo "ERROR: the fix changed nothing since the last failing run, so the validation '
+        f'was not rerun: it would fail the same way. The previous failure stands." 1>&2; '
+        f'echo "To rerun it anyway (a flaky failure, or something outside the tree was fixed), '
+        f'answer [r] once the loop is exhausted." 1>&2; '
+        f"false; fi; fi"
+    )
     in_loop = (
-        f"rm -f {q(proof)} && {{ {validation_cmd} ; }} && "
-        f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(proof)}"
+        f"{unchanged_since_failure} && rm -f {q(proof)} {q(failed)} && "
+        f"if {{ {validation_cmd} ; }}; then "
+        f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(proof)}; "
+        f"else rc=$?; "
+        f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(failed)}; "
+        f"(exit $rc); fi"
     )
     gate = (
         f"rm -f {q(delta)} && "
@@ -1507,9 +1544,11 @@ pipeline.stage(
 # The "assert owned diff" assertion is the one recoverable gate in that chain:
 # a step that changed nothing prompts instead of failing, and [c]ontinue drops
 # a `.noop` marker that skips commit and assert-committed and substitutes a
-# no-op facts file.  A step whose front matter sets `allow_noop: true` declares
-# itself verification-only: the gate drops that marker and passes without
-# prompting, which is what lets such a step survive `--non-interactive`.
+# no-op facts file, unless the fix loop changed files during validation (the
+# marker is then dropped and the step commits).  A step whose front matter
+# sets `allow_noop: true` declares itself verification-only: the gate drops
+# that marker and passes without prompting, which is what lets such a step
+# survive `--non-interactive`.
 for step_file in step_files:
     name = Path(step_file).stem
     raw_step_text = Path(step_file).read_text()
@@ -1578,6 +1617,8 @@ for step_file in step_files:
     step_hookfix_marker = os.path.join(snapshot_root, f"{name}.hookfix.marker")
     step_facts   = os.path.join(snapshot_root, f"{name}.facts")
     step_noop    = os.path.join(snapshot_root, f"{name}.noop")
+    step_recheck     = os.path.join(snapshot_root, f"{name}.recheck.json")
+    step_recheck_chg = os.path.join(snapshot_root, f"{name}.recheck.changed")
 
     # Stage names referenced by multiple stages — the gate must differ from
     # the in-loop name so ctx.results holds a fresh result at the gate.
@@ -1814,6 +1855,37 @@ for step_file in step_files:
         ),
         on_failure=ask_user,
         timeout=TIMEOUT_CLOSEOUT,
+    )
+
+    # ------------------------------------------------------------------
+    # 8b. Re-check an accepted no-op against the tree as it is now.
+    #
+    # The `.noop` marker is decided at the owned-diff gate, before
+    # validation.  When the suite then fails and the fix loop edits code,
+    # the step is no longer a no-op, but the marker would still skip the
+    # commit and leave the fix uncommitted, so the next run refuses the
+    # dirty tree.  If anything changed since the baseline, drop the marker
+    # so the commit, assert-committed and facts stages run as for any
+    # other step.
+    # ------------------------------------------------------------------
+    pipeline.stage(
+        f"recheck no-op {name}",
+        RunCommand(cmd=(
+            f"cd {shlex.quote(GIT_TOPLEVEL)} && "
+            f"python3 {shlex.quote(SNAPSHOT_HELPER)} snapshot "
+            f"--root {shlex.quote(GIT_TOPLEVEL)} {shlex.quote(step_recheck)} && "
+            f"python3 {shlex.quote(SNAPSHOT_HELPER)} diff "
+            f"{shlex.quote(step_pre)} {shlex.quote(step_recheck)}"
+            f"{NORN_STATE_IGNORE_FLAGS} "
+            f"> {shlex.quote(step_recheck_chg)} && "
+            f"if [ -s {shlex.quote(step_recheck_chg)} ]; then "
+            f"rm -f {shlex.quote(step_noop)} && "
+            f'echo "NOTE: {name} was accepted as a no-op, but validation changed '
+            f'files; committing them as the step\'s work:" && '
+            f"tr '\\0' '\\n' < {shlex.quote(step_recheck_chg)}; fi"
+        )),
+        when=file_exists(step_noop),
+        on_failure=fail,
     )
 
     # ------------------------------------------------------------------

@@ -229,6 +229,11 @@ subjects match `refactor: <step-stem>` are detected as already committed and
 skipped automatically on the next run. Use `--resume` for stage-level resume
 (loads the checkpoint and skips completed stages as cached).
 
+Inside a validation loop, a fix that leaves the tree exactly as it was when the
+validation failed ends that attempt at once instead of rerunning the command.
+Answering `[r]` on the exhausted loop always reruns it in full, for a flaky
+failure or one fixed outside the tree.
+
 ### fix_jira_issue
 
 `fix_jira_issue` takes a Jira issue key and carries it end-to-end: fetches the

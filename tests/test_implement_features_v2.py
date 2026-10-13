@@ -1035,6 +1035,47 @@ def test_validation_gate_reruns_only_when_the_loop_left_no_proof_for_this_tree(
     assert run_count() == 5
 
 
+def test_validation_is_not_rerun_in_the_same_loop_pass_on_the_tree_it_failed_on(
+    tmp_path, monkeypatch
+) -> None:
+    """A later attempt fails at once when the fix changed nothing; attempt 1 always runs."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    shutil.copytree(GOOD_DIR, repo_path / "feat")
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(repo_path / "feat", monkeypatch)
+
+    runs = tmp_path / "runs.txt"
+    fail_flag = tmp_path / "fail"
+    fail_flag.touch()
+    cmd = f"echo run >> {runs} && test ! -f {fail_flag}"
+    in_loop, _ = mod._proven_validation("step-y", cmd)
+
+    def sh(attempt: int) -> subprocess.CompletedProcess:
+        env = {**os.environ, "NORN_ATTEMPT": str(attempt)}
+        return subprocess.run(in_loop, shell=True, cwd=repo_path, env=env,
+                              capture_output=True, text=True)
+
+    def run_count() -> int:
+        return len(runs.read_text().splitlines())
+
+    assert sh(1).returncode != 0
+    assert run_count() == 1
+
+    unchanged = sh(2)
+    assert unchanged.returncode != 0
+    assert "fix changed nothing" in unchanged.stderr
+    assert run_count() == 1, "an unchanged tree must not be revalidated within the loop pass"
+
+    assert sh(1).returncode != 0, "attempt 1 is an operator retry and always reruns"
+    assert run_count() == 2
+
+    (repo_path / "README.md").write_text("# the fix changed this\n")
+    fail_flag.unlink()
+    assert sh(2).returncode == 0
+    assert run_count() == 3
+
+
 @pytest.mark.asyncio
 async def test_assert_owned_diff_fails_with_no_changes(tmp_path, monkeypatch) -> None:
     """assert owned diff fails when no worktree changes occurred after baseline."""
@@ -1187,6 +1228,74 @@ async def test_allow_noop_step_passes_owned_diff_with_no_changes(tmp_path, monke
     assert marker.exists(), "allow_noop must still drop the .noop marker"
     assert not _stage(mod, f"commit {stem}").when(ctx)
     assert not _stage(mod, f"assert committed {stem}").when(ctx)
+    assert _stage(mod, f"record no-op {stem}").when(ctx)
+
+
+@pytest.mark.asyncio
+async def test_noop_step_commits_files_the_fix_loop_changed(tmp_path, monkeypatch) -> None:
+    """Regression: the marker is set before validation, so a fix the loop made
+    in a gate step was never committed and the next run refused the dirty tree."""
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(FIXTURE_DIR / "allow-noop", feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-02-v2-noop-gate"
+    ctx = PipelineContext()
+    marker = Path(mod.snapshot_root) / f"{stem}.noop"
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+    assert (await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)).success
+    assert marker.exists()
+    head_before = repo.head.commit.hexsha
+
+    # The fix loop edits a file after the owned-diff gate.
+    (repo_path / "fixed_by_loop.py").write_text("# fix\n")
+
+    recheck = _stage(mod, f"recheck no-op {stem}")
+    assert recheck.when(ctx)
+    r = await recheck.impl.run(ctx)
+    assert r.success, f"recheck no-op failed: {r.output}"
+    assert "fixed_by_loop.py" in (r.output or {}).get("stdout", "")
+    assert not marker.exists(), "a changed tree must clear the no-op marker"
+    assert not _stage(mod, f"record no-op {stem}").when(ctx)
+    assert _stage(mod, f"commit {stem}").when(ctx)
+
+    r = await _stage(mod, f"commit {stem}").impl.run(ctx)
+    assert r.success, f"commit failed: {r.output}"
+    assert repo.head.commit.parents[0].hexsha == head_before
+    assert f"refactor: {stem}" in repo.head.commit.message
+
+
+@pytest.mark.asyncio
+async def test_noop_step_with_unchanged_tree_stays_a_noop(tmp_path, monkeypatch) -> None:
+    """The recheck keeps the marker when validation left the tree as it was."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(FIXTURE_DIR / "allow-noop", feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-02-v2-noop-gate"
+    ctx = PipelineContext()
+    marker = Path(mod.snapshot_root) / f"{stem}.noop"
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+    assert (await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)).success
+
+    r = await _stage(mod, f"recheck no-op {stem}").impl.run(ctx)
+    assert r.success, f"recheck no-op failed: {r.output}"
+    assert marker.exists(), "an unchanged tree must keep the no-op marker"
+    assert not _stage(mod, f"commit {stem}").when(ctx)
     assert _stage(mod, f"record no-op {stem}").when(ctx)
 
 
@@ -2301,8 +2410,8 @@ def test_aggregate_fix_prompt_references_failure_output_placeholder() -> None:
     assert "{aggregate compress.output}" in fix_stage.impl.prompt
 
 
-def test_aggregate_fix_prompt_names_stale_gates_as_plan_defects() -> None:
-    """aggregate fix prompt says the command is frozen and a stale gate is reported, not repaired."""
+def test_aggregate_fix_prompt_repairs_stale_test_files_and_reports_stale_inline_checks() -> None:
+    """A stale assertion in a test file is re-targeted; one inline in the frozen command is reported."""
     from norn.stages.generate import Generate
 
     mod = _import_v2(GOOD_DIR)
@@ -2310,7 +2419,9 @@ def test_aggregate_fix_prompt_names_stale_gates_as_plan_defects() -> None:
     assert isinstance(fix_stage.impl, Generate)
     prompt = fix_stage.impl.prompt
     assert "frozen for the rest of the run" in prompt
-    assert "A stale gate is a plan defect" in prompt
+    assert "In a test file in the repository: update the assertion" in prompt
+    assert "never delete it or loosen it" in prompt
+    assert "Inline in the command above" in prompt
     assert "make no change and say so" in prompt
 
 
