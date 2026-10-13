@@ -418,7 +418,10 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
     console.print(f"  Status:    {status}")
     console.print(f"  Timestamp: {timestamp}")
     console.print(f"  Cost:      ${record.total_cost_usd:.4f}")
-    console.print(f"  Tokens:    {record.total_tokens:,}")
+    # total_tokens is input + output only; on a long agent stage the prompt
+    # cache reads dwarf both, so show them beside it.
+    cache_read = sum(entry.cache_read_input_tokens for entry in record.stage_log)
+    console.print(f"  Tokens:    {record.total_tokens:,}   [dim](cache read: {cache_read:,})[/dim]")
     console.print(f"  Duration:  {record.duration_ms / 1000:.1f}s")
     console.print(f"  Retries:   {record.retries}")
     if record.session_id:
@@ -458,9 +461,9 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
 
     # Use a wide-enough console so the step log table is not truncated when
     # stdout is not a TTY (e.g. pytest capture, CI pipe) where Rich defaults
-    # to 80 columns.  The table has 12 columns and needs ~160 chars for all
+    # to 80 columns.  The table has 13 columns and needs ~175 chars for all
     # values to render unclipped.
-    wide = Console(width=max(console.width, 160))
+    wide = Console(width=max(console.width, 175))
     table = Table(title=f"Run #{record.run_id} — Step Log", title_style="bold", show_edge=False)
     table.add_column("Step", style="cyan", overflow="fold")
     table.add_column("Att", justify="right")
@@ -468,6 +471,7 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
     table.add_column("Cost", justify="right")
     table.add_column("Running", justify="right")
     table.add_column("Tokens", justify="right")
+    table.add_column("Cache rd", justify="right")
     table.add_column("Turns", justify="right")
     table.add_column("Tools (x)", justify="right")
     table.add_column("API", justify="right")
@@ -491,6 +495,7 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
 
     for entry in record.stage_log:
         tokens = f"{entry.input_tokens:,}/{entry.output_tokens:,}" if entry.total_tokens else "-"
+        cache_read_str = f"{entry.cache_read_input_tokens:,}" if entry.cache_read_input_tokens else "-"
         api = f"{entry.duration_api_ms / 1000:.1f}s" if entry.duration_api_ms else "-"
         cost = f"${entry.cost_usd:.4f}" if entry.cost_usd else "-"
         running = f"${entry.running_total_cost_usd:.4f}"
@@ -508,6 +513,7 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
             cost,
             running,
             tokens,
+            cache_read_str,
             turns_str,
             tools_str,
             api,
