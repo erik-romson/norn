@@ -7,21 +7,21 @@
 version = 1
 
 [claude-code.light]      # cheap, fast: briefs, judging, log compression
-model  = "claude-haiku-4-5-20251001"
+model  = "claude-haiku-5-5"
 effort = "low"
-since  = "2026-09-07"
-context_window = 200000
+since  = "2026-10-08"
+context_window = 1000000
 
 [claude-code.standard]   # implementation steps, reviews, aggregate repair, CI fixes
-model  = "claude-sonnet-5"
+model  = "claude-sonnet-5-5"
 effort = "high"
-since  = "2026-09-08"
+since  = "2026-10-05"
 context_window = 1000000
 
 [claude-code.deep]       # plan drafting, hard bugs, steps that ask for it
-model  = "claude-opus-5"
+model  = "claude-opus-5-5"
 effort = "xhigh"
-since  = "2026-09-08"
+since  = "2026-10-05"
 context_window = 1000000
 
 [codex.review]           # plan review in plan_with_review / fix_jira_issue
@@ -30,13 +30,13 @@ effort = "high"          # mirrors ~/.codex/config.toml on the dev machine today
 since  = "2026-09-07"
 
 [opencode.light]
-model  = "github-copilot/claude-sonnet-4.6"
-since  = "2026-09-07"
+model  = "github-copilot/claude-sonnet-5.5"
+since  = "2026-10-05"
 
 [opencode.standard]
-model  = "github-copilot/claude-sonnet-4.6"
-since  = "2026-09-07"
+model  = "github-copilot/claude-sonnet-5.5"
+since  = "2026-10-05"
 
 [opencode.deep]
-model  = "github-copilot/claude-opus-4.7"
-since  = "2026-09-07"
+model  = "github-copilot/claude-opus-5.5"
+since  = "2026-10-05"

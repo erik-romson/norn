@@ -150,7 +150,7 @@ async def test_details_model_label_resolved_for_known_provider():
         result = await gen.run(ctx)
         assert result.details is not None
         assert result.details["model_label"] == "light"
-        assert result.details["pinned_model"] == "claude-haiku-4-5-20251001"
+        assert result.details["pinned_model"] == "claude-haiku-5-5"
         assert result.details["effort"] == "low"
     finally:
         if original:
@@ -1638,7 +1638,7 @@ async def test_opencode_cwd_passed_to_cli():
 
 @pytest.mark.asyncio
 async def test_opencode_label_model_resolution():
-    """Intent label 'standard' resolves to github-copilot/claude-sonnet-4.6."""
+    """Intent label 'standard' resolves to github-copilot/claude-sonnet-5.5."""
     events = [_step_finish_event()]
     captured_cmd: list = []
 
@@ -1653,7 +1653,7 @@ async def test_opencode_label_model_resolution():
 
     assert "-m" in captured_cmd
     idx = captured_cmd.index("-m")
-    assert captured_cmd[idx + 1] == "github-copilot/claude-sonnet-4.6"
+    assert captured_cmd[idx + 1] == "github-copilot/claude-sonnet-5.5"
 
 
 # -- Permission mapping --
