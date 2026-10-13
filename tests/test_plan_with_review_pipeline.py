@@ -311,6 +311,19 @@ def test_split_targets_implement_features_v2():
     assert "clean worktree" in skill
 
 
+def test_planning_turns_review_gates_into_unattended_steps():
+    """Regression: a pre-plan written for a hand-driven session ("do groups 1-3,
+    stop") became Gate A/B in the plan, and the split used the 'changed
+    nothing' guard as the pause. The guard fires before the gate's test runs
+    and is not remembered, so every restart stopped at every gate again."""
+    mod = _import_plan_with_review()
+    assert "The plan runs unattended." in mod._DRAFT_PROMPT
+    assert "Write no review gate, pause or approval wait" in mod._DRAFT_PROMPT
+    assert "do not ask for mid-run review gates" in mod._REVIEW_PROMPT
+    assert "That stop is a guard, not a pause" in mod._SPLIT_PROMPT
+    assert "The pipeline cannot pause for human review." in mod.SPLIT_SKILL.content
+
+
 def test_module_loads_from_a_directory_without_the_skill(tmp_path, monkeypatch):
     """A pipeline that raises at import cannot be listed, let alone run.
 

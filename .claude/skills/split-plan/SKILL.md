@@ -33,6 +33,15 @@ dollars in. Every step you write must fit these rules:
   stops the run to ask, and aborts a `--non-interactive` run. A step that is
   verification-only declares `allow_noop: true` (rules below). Never write a
   step whose only output is git state.
+- **The pipeline cannot pause for human review.** The "changed nothing" prompt
+  is a guard against an agent that did no work, not a pause. It fires before
+  the step's `test_cmd` runs, so the human answers without the result, and
+  nothing records the answer, so every resume reruns the step and asks again.
+  When the plan says "gate", "stop for review" or "approve before continuing",
+  split it like this: the check becomes a verification-only step with
+  `allow_noop: true` that runs the broad suite and writes its findings to the
+  run report; a decision the plan leaves open goes into `README.md` under
+  "Before running".
 - **`test_cmd` runs after the agent, in the working tree, before the commit.**
   It must not assert git state (commit subjects, a clean tree, HEAD position),
   and it must leave tracked files as it found them: a command that regenerates
@@ -101,6 +110,8 @@ Rules for `allow_noop`:
 
 - Set it **only** on a step whose whole job is to run a suite and confirm
   nothing broke — a regression gate that is expected to produce no commit.
+  Every review gate the plan describes is such a step and gets it; never leave
+  it off to make the run stop for a human.
 - Leave it off everywhere else. The pipeline's default is to stop and ask
   when a step changes nothing, which is what catches an agent that silently
   did no work; `allow_noop: true` waives that check for one step.

@@ -107,6 +107,24 @@ Read the pre-plan at {preplan} and produce two files:
      write `STATUS: READY` with the body `No open questions.` —
      do NOT invent questions.
    - When there are genuine open questions, write `STATUS: NEEDS_INPUT`.
+
+The plan runs unattended. It is split into step files that
+`norn run implement_features_v2` executes one after another, and that pipeline
+cannot pause for a human: "show me X before continuing", "review gate",
+"approve before applying" or "do groups 1-3, stop" cannot happen mid-run. When
+the pre-plan asks for such a checkpoint, move what it guards out of the run:
+
+- A decision the human must make (pick an option, approve a table, accept a
+  behaviour change) is an open question now. Do the read-only analysis it needs
+  while drafting and put the evidence in the plan. If those facts can change
+  before the run, the plan re-checks them first and stops when they differ.
+- A condition that must halt the work (missing access, a bug the plan forbids
+  bypassing) is a stop condition in the step that can hit it.
+- A check that earlier work broke nothing is a step that runs the broad suite.
+- Material the human only needs to read (commit lists, dropped items, notes)
+  goes into the run report, which the human reviews after the run.
+
+Write no review gate, pause or approval wait into the plan.
 """
 
 
@@ -137,6 +155,10 @@ def review_prompt(*, plan: str, preplan: str, review: str) -> str:
     """
     return (
         f"Review the plan at {plan} against the pre-plan at {preplan}. "
+        "The plan runs unattended under `norn run implement_features_v2`, which "
+        "cannot pause for a human, so a pre-plan checkpoint that the plan turned "
+        "into an open question, a stop condition, a regression step or a report "
+        "item is correct; do not ask for mid-run review gates. "
         "Your final message IS the review: emit the review document and "
         f"nothing else — norn captures that message verbatim to {review}. "
         "Do not create or edit any file. This session is sandboxed read-only, "
@@ -200,7 +222,16 @@ step itself and the agent may not run git, so no step may commit, stage, stash
 or reset; the run refuses a dirty worktree, so pending uncommitted work is not
 a step but a "Before running" note in `README.md` telling the human to commit
 it; and a step that changes no file stops the run unless its front matter
-declares `allow_noop: true`.
+declares `allow_noop: true`. That stop is a guard, not a pause: never leave
+`allow_noop` off so the run waits for a human to review, even where the plan
+says "gate" or "stop for review".
+
+Writing these files is the whole job. Do not run the build, the tests or any
+`test_cmd` to check one — `implement_features_v2` runs every `test_cmd` itself;
+pick the runner and target by reading the build files instead. Do not start
+background tasks. Read only this repository and the plan: the skill in your
+system prompt is the complete `implement_features_v2` contract, so there is no
+need to read norn's source or another repository's step files.
 
 A gate reads {steps_dir} when you stop. It fails this stage when `index.md` is
 missing, when no `step-*.md` file exists, when any step file has no real
@@ -214,6 +245,12 @@ rejects — a retry lands you back here with the same instructions.
 # ---------------------------------------------------------------------------
 
 _TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+
+# Subagents a planning stage spawns (Explore, general-purpose) run on this
+# label, not on the stage's own, usually `deep`, model.  The built-in Explore
+# agent declares `model: inherit`, which outranks CLAUDE_CODE_SUBAGENT_MODEL;
+# CLAUDE_CODE_SUBAGENT_MODEL_FORCE is what makes the override apply to it.
+_SUBAGENT_LABEL = "standard"
 
 
 def add_plan_review_stages(
@@ -273,6 +310,10 @@ def add_plan_review_stages(
     _apply_p = apply_prompt(plan=plan, review=review, response=response)
     _split_p = split_prompt(plan=plan, steps_dir=steps_dir)
 
+    _subagent_env = {
+        "CLAUDE_CODE_SUBAGENT_MODEL": resolve_label("claude-code", _SUBAGENT_LABEL).model,
+        "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+    }
     _codex_resolved = resolve_label("codex", codex_label)
     _effort_token = shlex.quote(f'model_reasoning_effort="{_codex_resolved.effort}"')
     codex_cmd = (
@@ -302,6 +343,7 @@ def add_plan_review_stages(
             allowed_tools=_TOOLS,
             permission_mode="acceptEdits",
             setting_sources=["project"],
+            env=_subagent_env,
         ),
         on_failure=ask_user,
     )
@@ -320,6 +362,7 @@ def add_plan_review_stages(
                     allowed_tools=_TOOLS,
                     permission_mode="acceptEdits",
                     setting_sources=["project"],
+                    env=_subagent_env,
                 ),
                 when=stage_failed("check open questions"),
             ),
@@ -390,6 +433,7 @@ def add_plan_review_stages(
                     allowed_tools=_TOOLS,
                     permission_mode="acceptEdits",
                     setting_sources=["project"],
+                    env=_subagent_env,
                 ),
             ),
             Stage(
@@ -422,6 +466,7 @@ def add_plan_review_stages(
                     allowed_tools=_TOOLS,
                     permission_mode="acceptEdits",
                     setting_sources=["project"],
+                    env=_subagent_env,
                 ),
             ),
             Stage("check step files", StepFilesGate(steps_dir=steps_dir)),

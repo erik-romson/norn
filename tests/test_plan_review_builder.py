@@ -151,6 +151,42 @@ def test_codex_command_is_read_only_and_captures_last_message():
     assert f"-o {_REVIEW}" in cmd
 
 
+def test_split_prompt_forbids_verifying_test_cmds_by_running_them():
+    """Regression: the split agent ran full Maven builds in the background to
+    check its `test_cmd`s, and read another repo's step files and norn's own
+    source, turning a file-writing stage into a 23-minute deep-model session."""
+    from norn.pipelines._plan_review import split_prompt
+
+    prompt = split_prompt(plan=_PLAN, steps_dir=_STEPS_DIR)
+    assert "Do not run the build, the tests or any\n`test_cmd`" in prompt
+    assert "Do not start\nbackground tasks" in prompt
+    assert "Read only this repository and the plan" in prompt
+
+
+def _generate_stages(pipeline: Pipeline) -> list[Stage]:
+    from norn.stages.generate import Generate
+
+    stages: list[Stage] = []
+    for item in pipeline.items:
+        candidates = item.stages if isinstance(item, Loop) else [item]
+        stages += [s for s in candidates if isinstance(s, Stage) and isinstance(s.impl, Generate)]
+    return stages
+
+
+def test_every_planning_agent_pins_its_subagents_to_the_standard_label():
+    """Explore declares `model: inherit`, so without the FORCE flag every
+    subagent a `deep` planning stage spawns would also run on the deep model."""
+    from norn.model_labels import resolve_label
+
+    stages = _generate_stages(_build())
+    assert [s.name for s in stages] == ["draft plan", "revise plan", "apply findings", "write step files"]
+    for stage in stages:
+        assert stage.impl.env == {
+            "CLAUDE_CODE_SUBAGENT_MODEL": resolve_label("claude-code", "standard").model,
+            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+        }, stage.name
+
+
 # ---------------------------------------------------------------------------
 # Review retry loop
 # ---------------------------------------------------------------------------
