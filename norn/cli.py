@@ -8,6 +8,7 @@ import re
 import sys
 from pathlib import Path
 
+from norn.agents import session_totals
 from norn.alerts import AlertManager
 from norn.catalog import get_pipeline_info, list_pipelines, load_bundled_pipeline
 from norn.envfile import apply_env_files
@@ -743,6 +744,7 @@ def main() -> None:
             console.print(f"  [dim]Resuming from checkpoint ({label})[/dim]")
         elif args.continue_session and checkpoint and checkpoint.session_id:
             resume_session = checkpoint.session_id
+            session_totals.seed(checkpoint.session_id, checkpoint.session_totals)
             from norn.ui import console
             console.print(f"  [dim]Continuing session {resume_session}[/dim]")
         else:

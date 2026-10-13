@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from norn.agents.session_totals import SessionTotals
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +34,10 @@ class Checkpoint:
             same pipeline, and pipelines like ``implement_features_v2`` build
             their stages from these at import time.  Empty in checkpoints
             written before params were recorded.
+        session_totals: Running cost and API time ``session_id`` had reached
+            when the checkpoint was saved, so the first stage that resumes it
+            in a new process is charged only for its own work.  ``None`` when
+            there is no session or the checkpoint predates the field.
     """
 
     pipeline: str
@@ -43,6 +49,7 @@ class Checkpoint:
     file_checkpoint_id: str | None = None
     agent_provider: str = "claude-code"
     params: dict[str, str] = field(default_factory=dict)
+    session_totals: SessionTotals | None = None
 
 
 def checkpoint_file(config_path: str) -> Path:
@@ -58,6 +65,7 @@ def save_checkpoint(
     stage_outputs: dict[str, Any],
     agent_provider: str = "claude-code",
     params: dict[str, str] | None = None,
+    session_totals: SessionTotals | None = None,
 ) -> None:
     """Atomically write checkpoint state beside the config file."""
     path = checkpoint_file(config_path)
@@ -71,6 +79,7 @@ def save_checkpoint(
         "file_checkpoint_id": None,
         "agent_provider": agent_provider,
         "params": dict(params or {}),
+        "session_totals": asdict(session_totals) if session_totals is not None else None,
     }
     tmp = path.with_suffix(".checkpoint.tmp")
     tmp.write_text(json.dumps(data, indent=2))
@@ -95,6 +104,7 @@ def load_checkpoint(config_path: str) -> Checkpoint | None:
             file_checkpoint_id=data.get("file_checkpoint_id"),
             agent_provider=data.get("agent_provider", "claude-code"),
             params=data.get("params", {}),
+            session_totals=SessionTotals(**data["session_totals"]) if data.get("session_totals") else None,
         )
     except Exception:
         log.warning("Failed to load checkpoint from %s — ignoring", path)

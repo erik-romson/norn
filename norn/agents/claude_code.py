@@ -6,9 +6,11 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from norn.agents import session_totals
 from norn.agents.base import (
     AgentError,
     AgentEvent,
@@ -20,6 +22,7 @@ from norn.agents.base import (
     ToolUseBlock,
 )
 from norn.agents.capabilities import AgentCapabilities, CostMode
+from norn.agents.session_totals import SessionTotals
 from norn.model_labels import resolve_label
 
 log = logging.getLogger(__name__)
@@ -290,6 +293,10 @@ class ClaudeCodeProvider:
 
         session_id: str | None = None
         model_id: str | None = None
+        # Running totals of the session this call resumes or forks (zero for
+        # a fresh session); a fork starts from its parent's totals.
+        prior = session_totals.get(request.session_id)
+        call_usage = AgentUsage(provider="claude-code", model=request.model)
 
         try:
             async for message in query(prompt=request.prompt, options=options):
@@ -339,26 +346,33 @@ class ClaudeCodeProvider:
                     if hasattr(message, "structured_output") and message.structured_output is not None:
                         yield AgentEvent(structured_output=message.structured_output)
 
-                    # Emit usage
-                    usage = AgentUsage(
-                        provider="claude-code",
-                        model=request.model,
-                        session_id=message.session_id,
-                        total_cost_usd=message.total_cost_usd or 0.0,
-                        duration_ms=message.duration_ms,
-                        duration_api_ms=message.duration_api_ms,
-                        num_turns=message.num_turns,
-                        is_error=message.is_error,
-                        model_id=model_id,
-                        result_subtype=message.subtype if hasattr(message, "subtype") else None,
-                        stop_reason=message.stop_reason if hasattr(message, "stop_reason") else None,
-                    )
+                    # One call can produce several ResultMessages: a background
+                    # task or subagent finishing wakes the agent for another
+                    # round, and each round ends with its own result.  Tokens,
+                    # turns and wall time are per round, so they add up; cost
+                    # and API time are session running totals, so the call's
+                    # share is the latest total minus what the session had
+                    # already spent before this call.
+                    call_usage.session_id = message.session_id
+                    call_usage.duration_ms += message.duration_ms
+                    call_usage.num_turns += message.num_turns
+                    call_usage.is_error = message.is_error
+                    call_usage.model_id = model_id
+                    call_usage.result_subtype = message.subtype if hasattr(message, "subtype") else None
+                    call_usage.stop_reason = message.stop_reason if hasattr(message, "stop_reason") else None
                     if message.usage:
-                        usage.input_tokens = message.usage.get("input_tokens", 0)
-                        usage.output_tokens = message.usage.get("output_tokens", 0)
-                        usage.cache_read_input_tokens = message.usage.get("cache_read_input_tokens", 0)
-                        usage.cache_creation_input_tokens = message.usage.get("cache_creation_input_tokens", 0)
-                    yield AgentEvent(usage=usage)
+                        call_usage.input_tokens += message.usage.get("input_tokens", 0)
+                        call_usage.output_tokens += message.usage.get("output_tokens", 0)
+                        call_usage.cache_read_input_tokens += message.usage.get("cache_read_input_tokens", 0)
+                        call_usage.cache_creation_input_tokens += message.usage.get("cache_creation_input_tokens", 0)
+                    running = SessionTotals(
+                        cost_usd=message.total_cost_usd or 0.0,
+                        duration_api_ms=message.duration_api_ms,
+                    )
+                    session_totals.record(message.session_id, running)
+                    call_usage.total_cost_usd = running.cost_usd - prior.cost_usd
+                    call_usage.duration_api_ms = running.duration_api_ms - prior.duration_api_ms
+                    yield AgentEvent(usage=replace(call_usage))
 
                 else:
                     # Capture session_id from init/system messages

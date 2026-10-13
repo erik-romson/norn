@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from norn.agents import session_totals
 from norn.alerts import AlertEvent, AlertManager, AlertMessage
 from norn.checkpoint import Checkpoint, save_checkpoint, serialise_output
 from norn.dsl import (
@@ -656,6 +657,7 @@ def _save_checkpoint_state(
     save_checkpoint(
         config_path, pipeline_name, session_id, completed_stages, stage_outputs, ctx.agent_provider,
         params=ctx.launch_params,
+        session_totals=session_totals.get(session_id) if session_id else None,
     )
 
 
@@ -1371,6 +1373,7 @@ async def run_pipeline(
         completed_stages = list(restored)
         if current_session is None:
             current_session = resume_checkpoint.session_id
+        session_totals.seed(resume_checkpoint.session_id, resume_checkpoint.session_totals)
 
     _persist_history_snapshot(ctx)
 

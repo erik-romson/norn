@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from norn.agents import session_totals
+from norn.agents.session_totals import SessionTotals
 from norn.checkpoint import (
     Checkpoint,
     checkpoint_file,
@@ -106,6 +108,50 @@ def test_checkpoint_without_params_loads_empty(tmp_path):
         '{"pipeline": "p", "timestamp": "t", "session_id": null, "completed_stages": []}'
     )
     assert load_checkpoint(config).params == {}
+
+
+def test_checkpoint_round_trips_session_totals(tmp_path):
+    config = str(tmp_path / "p.py")
+    totals = SessionTotals(cost_usd=10.02, duration_api_ms=84482)
+    save_checkpoint(config, "p", "sess-a", ["a"], {}, session_totals=totals)
+    assert load_checkpoint(config).session_totals == totals
+
+
+def test_checkpoint_without_session_totals_loads_none(tmp_path):
+    """Checkpoints written before session totals were recorded still load."""
+    config = str(tmp_path / "p.py")
+    checkpoint_file(config).write_text(
+        '{"pipeline": "p", "timestamp": "t", "session_id": "sess-a", "completed_stages": []}'
+    )
+    assert load_checkpoint(config).session_totals is None
+
+
+@pytest.mark.asyncio
+async def test_resume_seeds_the_checkpointed_session_totals():
+    """The first stage to resume the session in a new process must be charged
+    only for its own work, so the saved totals become the ledger baseline."""
+    totals = SessionTotals(cost_usd=10.02, duration_api_ms=84482)
+    cp = Checkpoint(
+        pipeline="test",
+        timestamp="2026-01-01T00:00:00Z",
+        session_id="sess-a",
+        completed_stages=["s1"],
+        results={"s1": "done"},
+        usage=[],
+        session_totals=totals,
+    )
+    await run_pipeline(Pipeline("test").stage("s1", SuccessStage()), resume_checkpoint=cp)
+    assert session_totals.get("sess-a") == totals
+
+
+@pytest.mark.asyncio
+async def test_run_saves_the_session_totals_of_the_checkpointed_session(tmp_path):
+    config = str(tmp_path / "p.py")
+    session_totals.record("sess-a", SessionTotals(cost_usd=1.5, duration_api_ms=900))
+    await run_pipeline(Pipeline("p").stage("a", SuccessStage()), config_path=config, resume_session="sess-a")
+    cp = load_checkpoint(config)
+    assert cp.session_id == "sess-a"
+    assert cp.session_totals == SessionTotals(cost_usd=1.5, duration_api_ms=900)
 
 
 @pytest.mark.asyncio
