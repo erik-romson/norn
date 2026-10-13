@@ -134,12 +134,15 @@ class CLIRenderer:
         elif status == "failed":
             self._console.print(f"\r  [bold red]\u2717[/bold red] [red]{event.name:<20}[/red]  [dim]{elapsed:.1f}s[/dim]")
             if event.error:
+                from rich.markup import escape
+
                 from norn.ui import mask
 
                 lines = mask(event.error).strip().splitlines()
                 tail = lines[-5:] if len(lines) > 5 else lines
                 for line in tail:
-                    self._console.print(f"    [dim red]{line}[/dim red]")
+                    # escape(): a stage's error is external text, not console markup.
+                    self._console.print(f"    [dim red]{escape(line)}[/dim red]")
 
         elif status == "skipped":
             self._console.print(f"  [dim]\u2298 {event.name:<20}  skipped[/dim]")

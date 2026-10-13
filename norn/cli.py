@@ -779,8 +779,10 @@ def main() -> None:
         sys.exit(1)
     except PipelineError as e:
         pipeline_failed = True
+        from rich.markup import escape
+
         from norn.ui import console
-        console.print(f"\n[bold red]Pipeline failed:[/bold red] {e}")
+        console.print(f"\n[bold red]Pipeline failed:[/bold red] {escape(str(e))}")
         # Print findings from the latest run journal
         try:
             from norn.journal import latest_run_id as _latest_rid, runs_dir as _runs_dir
