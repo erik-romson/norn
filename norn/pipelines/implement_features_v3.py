@@ -40,6 +40,10 @@ in pipeline invocations):
 - ``--arg max_retries=<int>``      — per-step validation attempts, must be ≥ 1 (default 3)
 - ``--arg allow_dirty_index=1``    — skip the clean-index preflight check
 - ``--arg allow_dirty_worktree=1`` — skip the clean-worktree preflight check
+- ``--arg learn=on|off``           — propose a learning after review passes
+  (default on; ``off`` adds none of the learn stages and the handoff says
+  ``Learning: off``)
+- ``--arg learn_model=<label>``    — intent label for the learn agent (default light)
 
 Aggregate validation
 --------------------
@@ -89,6 +93,26 @@ Rounds are unrolled (not a ``Loop``) because a ``Loop``'s stages share one
 agent session and ``ClearContext`` cannot sit inside it.  Round 2 runs only
 when round 1's ``check review`` wrote a ``review-1.needs-fixes`` marker;
 round 3 only when round 2 wrote ``review-2.needs-fixes``.
+
+Learning proposal
+-----------------
+A run that passes review ends with at most one grounded learning in the
+Compound Engineering schema (``_learnings.py``), written as a **proposal**:
+``<run dir>/learning.md`` plus ``<run dir>/learning-target``, the store path it
+belongs at.  Nothing is committed, staged or pushed — the pipeline proposes, a
+human validates, copies and commits, and the handoff carries the exact copy
+command.  ``collect learning evidence`` assembles the review files, the retry
+ledgers, oscillations, closeouts, commits and related learnings under the
+snapshot root; ``learn`` (Write tool only, its own 300 s timeout) writes
+``learning.md`` + ``target`` or ``skipped`` in a scratch dir there;
+``decide learning`` validates the result; ``publish learning proposal`` copies
+it into the run directory; ``record learning outcome`` writes the one-line
+outcome the handoff quotes.  None of these stages fails the run (decision 5) —
+every failure becomes ``failed: <reason>`` — except ``learn postcondition``,
+which fails when the repository itself changed during the learn stages (HEAD
+moved, the index is dirty, or a repo file changed): an unreviewed change in a
+reviewed tree.  The handoff postcondition and the final audit still require
+HEAD to equal ``reviewed.head``.
 
 Handoff model
 -------------
@@ -180,7 +204,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from glob import glob
 from pathlib import Path
 from typing import Any
@@ -195,6 +219,24 @@ from norn.stages.read_file import ReadFile
 from norn.stages.run_command import RunCommand
 from norn.state import state_ignore_flags
 
+from norn.pipelines._find_related import find_related
+from norn.pipelines._learnings import (
+    LearnGenerate,
+    LearnOutcomeStage,
+    LearnPaths,
+    StoreConfigError,
+    decide_learning,
+    existing_categories,
+    keywords_from,
+    learn_prompt,
+    marker_reason,
+    outcome_text,
+    publish_proposal,
+    resolve_store,
+    store_hint,
+    store_relpath,
+    write_marker,
+)
 from norn.pipelines._preplan import parse_arg_flags
 from norn.profiles import build_write_allowlist_hooks
 
@@ -486,6 +528,11 @@ if MAX_RETRIES < 1:
     raise ValueError(f"--arg max_retries: must be ≥ 1, got {MAX_RETRIES!r}")
 ALLOW_DIRTY_INDEX = _args.get("allow_dirty_index") == "1"
 ALLOW_DIRTY_WORKTREE = _args.get("allow_dirty_worktree") == "1"
+LEARN = _args.get("learn", "on")
+if LEARN not in ("on", "off"):
+    raise ValueError(f"--arg learn: must be 'on' or 'off', got {LEARN!r}")
+LEARN_ON = LEARN == "on"
+LEARN_MODEL = _require_knob_model("learn_model", "light")
 
 
 def _effective_agent_provider(argv: list[str]) -> str:
@@ -1075,6 +1122,11 @@ _CLOSEOUT_PROMPT = (
 # loop body so step N sees exactly N-1 entries.
 completed_in_run: list[str] = []
 
+# Step stem → the snapshot its passing in-loop validation leaves, for every
+# step run in this invocation.  The learn evidence reads it to name the paths
+# the passing fix changed.
+_LEARN_STEP_PROOFS: dict[str, str] = {}
+
 # ---------------------------------------------------------------------------
 # Forbidden git verbs (used verbatim in every agent prompt)
 # ---------------------------------------------------------------------------
@@ -1381,6 +1433,16 @@ def _assert_index_clean(during: str) -> str:
     )
 
 
+def _validation_proof_path(key: str, validation_cmd: str) -> str:
+    """The snapshot a passing in-loop run of *validation_cmd* leaves for *key*.
+
+    The name carries a hash of the command, so a proof never vouches for a
+    command that was edited between runs (see :func:`_proven_validation`).
+    """
+    digest = hashlib.sha1(validation_cmd.encode()).hexdigest()[:12]
+    return os.path.join(snapshot_root, f"{key}.validated.{digest}.json")
+
+
 def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
     """Build the in-loop validation shell and the gate's validation shell.
 
@@ -1407,7 +1469,7 @@ def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
     """
     q = shlex.quote
     digest = hashlib.sha1(validation_cmd.encode()).hexdigest()[:12]
-    proof = os.path.join(snapshot_root, f"{key}.validated.{digest}.json")
+    proof = _validation_proof_path(key, validation_cmd)
     now = proof + ".now"
     delta = proof + ".delta"
     failed = os.path.join(snapshot_root, f"{key}.failed.{digest}.json")
@@ -1923,6 +1985,7 @@ for step_file in step_files:
         validation_timeout = test_timeout
 
     validation_in_loop, validation_at_gate = _proven_validation(name, validation_cmd)
+    _LEARN_STEP_PROOFS[name] = _validation_proof_path(name, validation_cmd)
 
     implement_timeout = TIMEOUT_IMPLEMENT_OPUS if step_model == "deep" else TIMEOUT_IMPLEMENT_SONNET
 
@@ -3077,6 +3140,549 @@ pipeline.stage(
 )
 
 # ===========================================================================
+# Learn phase: at most one grounded learning, proposed — never committed
+#
+# Only a run that passed review gets here.  The pipeline proposes, a human
+# commits (Q1): the proposal goes to the run directory
+# (`<ctx.journal.dir>/learning.md` + `learning-target`), which
+# `prepare_state_isolation` keeps out of git, and no stage below commits,
+# stages or pushes anything.  So the handoff postcondition and the final audit
+# keep their v2 HEAD rule: HEAD must equal `reviewed.head`.
+#
+# Shape (all of it only with --arg learn=on):
+#   clear context
+#   collect learning evidence   LearnOutcomeStage  always
+#   learn                       LearnGenerate      when learn.pre.json exists
+#   learn postcondition         RunCommand         when learn.pre.json exists
+#   decide learning             LearnOutcomeStage  when learn.pre.json exists
+#   publish learning proposal   LearnOutcomeStage  when learn.ready exists
+#   record learning outcome     LearnOutcomeStage  always
+#
+# Decision 5: none of them fails a run that passed review — every failure
+# becomes the `learn.failed` marker and `record learning outcome` reports it —
+# except `learn postcondition` (on_failure=fail).  That one fails only when
+# the repository itself changed during the learn stages, which only a learn
+# agent writing outside its scratch dir can cause (possible under opencode,
+# which has no write-allowlist hook): an unreviewed change in a reviewed tree,
+# which the final audit would also catch later with a less specific message.
+#
+# `learn.pre.json` exists only when collection finished without writing a
+# marker, so it gates the agent, the postcondition and the decision: an early
+# marker (no journal, an unusable docs_root, a collection error) skips all
+# three, and `decide learning` never overwrites it with "wrote neither".
+# ===========================================================================
+
+LEARN_PATHS = LearnPaths(snapshot_root)
+LEARN_EVIDENCE = os.path.join(snapshot_root, "learn-evidence.md")
+LEARN_POST_JSON = os.path.join(snapshot_root, "learn.post.json")
+
+LEARN_COLLECT_STAGE = "collect learning evidence"
+LEARN_AGENT_STAGE = "learn"
+LEARN_POSTCONDITION_STAGE = "learn postcondition"
+LEARN_DECIDE_STAGE = "decide learning"
+LEARN_PUBLISH_STAGE = "publish learning proposal"
+LEARN_RECORD_STAGE = "record learning outcome"
+LEARN_STAGE_NAMES = (
+    LEARN_COLLECT_STAGE,
+    LEARN_AGENT_STAGE,
+    LEARN_POSTCONDITION_STAGE,
+    LEARN_DECIDE_STAGE,
+    LEARN_PUBLISH_STAGE,
+    LEARN_RECORD_STAGE,
+)
+
+TIMEOUT_LEARN = 300   # applied inside LearnGenerate, never by the runner
+MAX_TURNS_LEARN = 4
+
+LEARN_NO_JOURNAL = "no journal to hold the proposal"
+
+# Evidence caps.
+LEARN_REVIEW_MAX_CHARS = 20_000      # each review, triage or verdict file
+LEARN_FAIL_TAIL_LINES = 40           # tail of each failed validation run
+LEARN_FIX_RESPONSE_LINES = 30        # each fix's response (its last lines)
+LEARN_FIX_DIFF_LINES = 150           # git diff of the passing fix's paths
+LEARN_COMMITS_LINES = 200            # git log --stat of the run's commits
+LEARN_RELATED_FULL = 3               # related learnings quoted in full
+LEARN_RELATED_FULL_LINES = 300       # cap on each of those
+LEARN_RELATED_HEADS = 7              # related learnings shown by their head
+LEARN_RELATED_HEAD_LINES = 30
+
+_EVIDENCE_FENCE = "~~~~~~"
+_resume_skipped_stems = {Path(f).stem for f in skipped_for_resume}
+
+
+def _fenced(text: str) -> list[str]:
+    body = text.rstrip("\n")
+    return [_EVIDENCE_FENCE, body if body else "(empty)", _EVIDENCE_FENCE, ""]
+
+
+def _cap_chars(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip("\n") + f"\n… (cut at {limit} characters)"
+
+
+def _cap_lines(text: str, limit: int, *, keep: str = "head") -> str:
+    """Keep the first (``head``) or last (``tail``) *limit* lines of *text*."""
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return text
+    cut = len(lines) - limit
+    if keep == "tail":
+        return f"… ({cut} earlier lines cut)\n" + "\n".join(lines[-limit:])
+    return "\n".join(lines[:limit]) + f"\n… ({cut} more lines cut)"
+
+
+def _learn_git(*args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", GIT_TOPLEVEL, *args], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed (exit {proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc.stdout
+
+
+def _snapshot_changed(pre: str, post: str) -> list[str]:
+    """The paths ``_step_snapshot.py diff`` reports between two snapshots."""
+    proc = subprocess.run(
+        ["python3", SNAPSHOT_HELPER, "diff", pre, post, *shlex.split(NORN_STATE_IGNORE_FLAGS)],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"_step_snapshot.py diff {pre} {post} failed (exit {proc.returncode}): "
+            f"{proc.stderr.decode(errors='replace').strip()}"
+        )
+    return [p.decode("utf-8", errors="surrogateescape") for p in proc.stdout.split(b"\0") if p]
+
+
+def _snapshot_repo(out: str) -> None:
+    """Take a ``_step_snapshot.py`` snapshot of the repository into *out*."""
+    proc = subprocess.run(
+        ["python3", SNAPSHOT_HELPER, "snapshot", "--root", GIT_TOPLEVEL, out],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        Path(out).unlink(missing_ok=True)
+        raise RuntimeError(
+            f"_step_snapshot.py snapshot failed (exit {proc.returncode}): "
+            f"{proc.stderr.decode(errors='replace').strip()}"
+        )
+
+
+def _stage_ran(ctx: PipelineContext, name: str) -> bool:
+    """True when *name* ran in this invocation (a skipped stage leaves output None)."""
+    result = ctx.results.get(name)
+    return result is not None and result.output is not None
+
+
+def _read(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8", errors="replace")
+
+
+def _evidence_review(ctx: PipelineContext) -> list[str]:
+    """``## Review``: the final review, the archived rounds, triage and verdicts.
+
+    A round's files count only when that round ran in this invocation: an
+    archive or triage file left by an earlier run of the same feature
+    directory is not this run's review.
+    """
+    rounds = [n for n in (1, 2, 3) if _stage_ran(ctx, f"review manifest {n}")]
+    files: list[tuple[str, str]] = [("final review", REVIEW_MD)]
+    files += [
+        (f"round {n - 1} review, archived by round {n}", _review_paths[n]["prev_review"])
+        for n in rounds if n > 1
+    ]
+    for n in rounds:
+        for kind, label in (("triage", "fixer triage"), ("validated", "validator verdicts")):
+            for directory in (feature_dir, snapshot_root):
+                files.append((f"round {n} {label}", os.path.join(directory, f"review-{n}.{kind}.md")))
+    out = ["## Review", ""]
+    for label, path in files:
+        if os.path.isfile(path):
+            out += [f"### {label}: `{path}`", ""]
+            out += _fenced(_cap_chars(_read(path), LEARN_REVIEW_MAX_CHARS))
+    return out
+
+
+def _evidence_fix(label: str, response: str, pre: str, post: str) -> tuple[list[str], list[str] | None]:
+    """One fix: the paths it changed (``diff(pre, post)``) and its response."""
+    changed = _snapshot_changed(pre, post) if os.path.exists(pre) and os.path.exists(post) else None
+    out = [f"#### {label}", ""]
+    if changed is None:
+        out += ["Paths it changed: not recorded (a snapshot is missing).", ""]
+    else:
+        out += ["Paths it changed: " + (", ".join(f"`{p}`" for p in changed) or "none"), ""]
+    out += ["Response:", ""] + _fenced(_cap_lines(response, LEARN_FIX_RESPONSE_LINES, keep="tail"))
+    return out, changed
+
+
+def _step_commit(stem: str) -> str | None:
+    """The short sha the step's facts file records, or None for a no-op step."""
+    first = _read(os.path.join(snapshot_root, f"{stem}.facts")).splitlines()[0]
+    match = re.match(r"^Commit: ([0-9a-f]{4,40}) ", first)
+    return match.group(1) if match else None
+
+
+def _evidence_attempts(ctx: PipelineContext, stem: str) -> list[str]:
+    """One step's validation attempts, from its retry ledger (step 09).
+
+    ``attempt-<n>.*`` files are keyed by attempt only, so a later round
+    overwrites an earlier round's: the earlier rounds are listed by their fail
+    sets from ``ledger.json`` alone.  In the latest round, ``fix.txt`` of
+    attempt *a* is the response of the fix that ran just before failed run *a*,
+    and that fix changed ``diff(pre-fix a, pre-fix a+1)``.  The fix before the
+    passing run *K* changed ``diff(pre-fix K, <step>.validated.<digest>.json)``.
+    """
+    ledger_file = _ledger_paths(snapshot_root, stem)["ledger"]
+    entries: list[dict[str, Any]] = (
+        json.loads(_read(ledger_file)) if os.path.exists(ledger_file) else []
+    )
+    if not entries:
+        return ["No failed attempts.", ""]
+
+    def attempt_file(n: int, kind: str) -> str:
+        return _ledger_attempt_path(snapshot_root, stem, n, kind)
+
+    out: list[str] = []
+    last_round = entries[-1]["round"]
+    earlier = [e for e in entries if e["round"] != last_round]
+    if earlier:
+        out += ["Earlier rounds (an operator restarted the loop; their logs were overwritten):", ""]
+        out += [
+            f"- round {e['round']}, failed run {e['attempt']}: fail set {_format_failset(e['failset'])}"
+            for e in earlier
+        ]
+        out.append("")
+    current = [e for e in entries if e["round"] == last_round]
+    for entry in current:
+        a = entry["attempt"]
+        if os.path.exists(attempt_file(a, "fix.txt")):
+            fix_lines, _ = _evidence_fix(
+                f"Fix before run {a} (the run failed)",
+                _read(attempt_file(a, "fix.txt")),
+                attempt_file(a, "pre-fix.json"),
+                attempt_file(a + 1, "pre-fix.json"),
+            )
+            out += fix_lines
+        out += [
+            f"#### Failed run {a} (round {last_round})",
+            "",
+            f"Fail set: {_format_failset(entry['failset'])}",
+            "",
+        ]
+        tail = _read(attempt_file(a, "fail.txt")) if os.path.exists(attempt_file(a, "fail.txt")) else ""
+        out += _fenced(_cap_lines(tail, LEARN_FAIL_TAIL_LINES, keep="tail"))
+
+    k = current[-1]["attempt"] + 1
+    proof = _LEARN_STEP_PROOFS[stem]
+    fix = ctx.results.get(f"fix {stem}")
+    if not (os.path.exists(proof) and fix is not None and fix.output is not None):
+        return out + [
+            "The loop's last run did not pass inside the loop; the step passed its "
+            "validation gate afterwards.",
+            "",
+        ]
+    fix_lines, changed = _evidence_fix(
+        f"Fix before run {k} (validation passed)",
+        str(fix.output),
+        attempt_file(k, "pre-fix.json"),
+        proof,
+    )
+    out += fix_lines
+    if not changed:
+        return out
+    commit = _step_commit(stem)
+    if commit is None:
+        return out + ["The step made no commit, so there is no diff of the passing fix.", ""]
+    head = _read(os.path.join(snapshot_root, f"{stem}.head")).strip()
+    diff = _learn_git("diff", head, commit, "--", *changed)
+    out += [
+        "The passing fix's paths in the step commit "
+        "(`git diff <step head> <step commit> -- <paths>`):",
+        "",
+    ]
+    return out + _fenced(_cap_lines(diff, LEARN_FIX_DIFF_LINES))
+
+
+def _evidence_validation(ctx: PipelineContext) -> list[str]:
+    out = ["## Validation attempts", ""]
+    for sf in _all_step_files:
+        stem = Path(sf).stem
+        out += [f"### {stem}", ""]
+        if stem in _resume_skipped_stems:
+            out += ["Committed in an earlier run; its attempts are not part of this run.", ""]
+        else:
+            out += _evidence_attempts(ctx, stem)
+    return out
+
+
+def _evidence_oscillations() -> list[str]:
+    found = sorted(glob(os.path.join(snapshot_root, "*.oscillation.md")))
+    out = ["## Oscillations", ""]
+    if not found:
+        return out + ["none", ""]
+    for path in found:
+        out += [_read(path).rstrip("\n"), ""]
+    return out
+
+
+def _evidence_closeouts(ctx: PipelineContext) -> list[str]:
+    out = ["## Step closeouts", ""]
+    for sf in _all_step_files:
+        stem = Path(sf).stem
+        out += [f"### {stem}", ""]
+        if stem in _resume_skipped_stems:
+            out += ["committed in an earlier run", ""]
+            continue
+        result = ctx.results.get(f"closeout {stem}")
+        text = str(result.output) if result is not None and result.output else "no closeout was recorded"
+        out += [text, ""]
+    return out
+
+
+def _evidence_commits(base: str, reviewed: str) -> list[str]:
+    log_text = _learn_git("log", "--stat", "--format=%h %s", f"{base}..{reviewed}")
+    return ["## Commits", ""] + _fenced(_cap_lines(log_text, LEARN_COMMITS_LINES))
+
+
+def _evidence_related(store: Path, base: str, reviewed: str) -> list[str]:
+    changed = [p for p in _learn_git("diff", "--name-only", base, reviewed).splitlines() if p]
+    keywords = keywords_from([Path(sf).stem for sf in _all_step_files], changed)
+    categories = existing_categories(store)
+    out = [
+        "## Related learnings",
+        "",
+        f"Store: `{store_relpath(GIT_TOPLEVEL, store)}`",
+        "Keywords: " + (", ".join(keywords) or "none"),
+        "Existing category directories: " + (", ".join(f"`{c}`" for c in categories) or "none"),
+        "",
+    ]
+    if not store.is_dir():
+        return out + ["store does not exist", ""]
+    candidates = find_related(store, keywords)[: LEARN_RELATED_FULL + LEARN_RELATED_HEADS]
+    if not candidates:
+        return out + ["none found", ""]
+    for i, cand in enumerate(candidates):
+        rel = os.path.relpath(cand.path, GIT_TOPLEVEL)
+        matched = ", ".join(cand.matched)
+        if i < LEARN_RELATED_FULL:
+            lines = _read(str(cand.path)).splitlines()
+            if len(lines) <= LEARN_RELATED_FULL_LINES:
+                out += [f"### `{rel}` — full text (matched: {matched})", ""]
+                out += _fenced("\n".join(lines))
+            else:
+                out += [
+                    f"### `{rel}` — first {LEARN_RELATED_FULL_LINES} lines only, not the "
+                    f"full text (matched: {matched})",
+                    "",
+                ]
+                out += _fenced("\n".join(lines[:LEARN_RELATED_FULL_LINES]))
+        else:
+            out += [
+                f"### `{rel}` — first {LEARN_RELATED_HEAD_LINES} lines only (matched: {matched})",
+                "",
+            ]
+            out += _fenced("\n".join(cand.head[:LEARN_RELATED_HEAD_LINES]))
+    return out
+
+
+def _learning_evidence(ctx: PipelineContext, store: Path) -> str:
+    """Assemble the learn agent's evidence (blocking: run it in a thread)."""
+    base = _read(BASE_SHA).strip()
+    reviewed = _read(REVIEWED_HEAD).strip()
+    parts = ["# Learning evidence", "", f"Base: {base}", f"Reviewed head: {reviewed}", ""]
+    parts += _evidence_review(ctx)
+    parts += _evidence_validation(ctx)
+    parts += _evidence_oscillations()
+    parts += _evidence_closeouts(ctx)
+    parts += _evidence_commits(base, reviewed)
+    parts += _evidence_related(store, base, reviewed)
+    return "\n".join(parts).rstrip("\n") + "\n"
+
+
+class _CollectLearningEvidence(LearnOutcomeStage):
+    """``collect learning evidence``: reset, resolve the store, build the evidence.
+
+    An unusable ``docs_root`` writes ``learn.failed`` and a run without a
+    journal writes ``learn.skipped``; either way collection stops and writes
+    no ``learn.pre.json``, so the agent, the postcondition and the decision
+    skip.  Otherwise it writes ``learn-evidence.md`` under the snapshot root
+    (its output is the same text) and, as its last action, the repo snapshot
+    ``learn.pre.json`` — so "the baseline exists" means "collection finished
+    and the agent may run".
+    """
+
+    async def _run(self, ctx: PipelineContext) -> str:
+        paths = self.paths
+        paths.reset()
+        try:
+            store = resolve_store(GIT_TOPLEVEL)
+        except StoreConfigError as exc:
+            reason = f"the learning store is unusable: {exc}"
+            write_marker(paths.marker_failed, reason)
+            return f"failed: {reason}"
+        if ctx.journal is None:
+            write_marker(paths.marker_skipped, LEARN_NO_JOURNAL)
+            return f"skipped: {LEARN_NO_JOURNAL}"
+        evidence = await asyncio.to_thread(_learning_evidence, ctx, store)
+        Path(LEARN_EVIDENCE).write_text(evidence, encoding="utf-8")
+        paths.scratch.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(_snapshot_repo, str(paths.pre_json))
+        return evidence
+
+
+def _learn_prompt_now() -> str:
+    """The learn prompt for the store as it is when the agent runs."""
+    store = resolve_store(GIT_TOPLEVEL)
+    return learn_prompt(
+        evidence_stage=LEARN_COLLECT_STAGE,
+        paths=LEARN_PATHS,
+        store_rel=store_relpath(GIT_TOPLEVEL, store),
+        categories=existing_categories(store),
+        today=date.today().isoformat(),
+    )
+
+
+class _LearnAgent(LearnGenerate):
+    """``learn``: the prompt is built when the stage runs, not at import.
+
+    The store's category directories are read after the steps committed (a
+    step may add the store or a category), and an unusable ``docs_root`` must
+    not stop the module from importing: collection reports it as the
+    outcome.  ``prompt`` holds a preview with those values shown as ``<…>``.
+    """
+
+    def _resolve_prompt(self, ctx: PipelineContext) -> str:
+        return self._resolve(_learn_prompt_now(), ctx)
+
+
+_LEARN_PROMPT_PREVIEW = learn_prompt(
+    evidence_stage=LEARN_COLLECT_STAGE,
+    paths=LEARN_PATHS,
+    store_rel="<store>",
+    categories=["<the store's category directories when the stage runs>"],
+    today="<today>",
+)
+
+# The learn agent may write only its three scratch files.  Claude Code only,
+# like _REVIEW_WRITE_GUARD; under another provider `learn postcondition` is
+# what catches a write into the repository.
+_LEARN_WRITE_GUARD = (
+    build_write_allowlist_hooks([str(p) for p in LEARN_PATHS.writable])
+    if AGENT_PROVIDER == "claude-code"
+    else None
+)
+
+_learn_postcondition_cmd = (
+    f"cd {shlex.quote(GIT_TOPLEVEL)} && "
+    f'{_assert_head_unchanged(REVIEWED_HEAD, "the learn stages")} && '
+    f'{_assert_index_clean("the learn stages")} && '
+    f"{_assert_no_changes_outside(str(LEARN_PATHS.pre_json), LEARN_POST_JSON, '', 'the learn stages', 'the learn scratch files outside the repository')}"
+)
+
+
+class _DecideLearning(LearnOutcomeStage):
+    """``decide learning``: validate the agent's result; note the instruction file."""
+
+    async def _run(self, ctx: PipelineContext) -> str:
+        store = resolve_store(GIT_TOPLEVEL)
+        store_rel = store_relpath(GIT_TOPLEVEL, store)
+        outcome = await asyncio.to_thread(
+            decide_learning,
+            self.paths,
+            repo=GIT_TOPLEVEL,
+            store_rel=store_rel,
+            base_sha=_read(BASE_SHA).strip(),
+        )
+        if outcome == "ready":
+            hint = store_hint(GIT_TOPLEVEL, store_rel)
+            if hint is not None:
+                self.paths.store_hint.write_text(hint + "\n", encoding="utf-8")
+        marker = {
+            "ready": self.paths.marker_ready,
+            "skipped": self.paths.marker_skipped,
+            "failed": self.paths.marker_failed,
+        }[outcome]
+        return f"{outcome}: {marker_reason(marker)}"
+
+
+class _PublishLearningProposal(LearnOutcomeStage):
+    """``publish learning proposal``: copy it into the run directory."""
+
+    async def _run(self, ctx: PipelineContext) -> str:
+        return f"proposed at {publish_proposal(self.paths, ctx.journal.dir)}"
+
+
+class _RecordLearningOutcome(LearnOutcomeStage):
+    """``record learning outcome``: ``outcome.md``, whichever marker exists."""
+
+    async def _run(self, ctx: PipelineContext) -> str:
+        text = outcome_text(self.paths)
+        self.paths.outcome.write_text(text + "\n", encoding="utf-8")
+        return text
+
+
+if LEARN_ON:
+    _learn_baseline = str(LEARN_PATHS.pre_json)
+
+    pipeline.clear_context()
+
+    pipeline.stage(
+        LEARN_COLLECT_STAGE,
+        _CollectLearningEvidence(paths=LEARN_PATHS, name=LEARN_COLLECT_STAGE),
+        on_failure=fail,   # never fails: LearnOutcomeStage
+    )
+
+    # No runner timeout: LearnGenerate applies TIMEOUT_LEARN itself and turns
+    # a timeout into an outcome, which a runner timeout could not do.
+    pipeline.stage(
+        LEARN_AGENT_STAGE,
+        _LearnAgent(
+            paths=LEARN_PATHS,
+            timeout=TIMEOUT_LEARN,
+            prompt=_LEARN_PROMPT_PREVIEW,
+            allowed_tools=["Write"],
+            permission_mode="acceptEdits",
+            add_dirs=[str(LEARN_PATHS.scratch)],
+            max_turns=MAX_TURNS_LEARN,
+            model=LEARN_MODEL,
+            hooks=_LEARN_WRITE_GUARD,
+        ),
+        when=file_exists(_learn_baseline),
+        on_failure=fail,   # never fails: LearnGenerate
+    )
+
+    pipeline.stage(
+        LEARN_POSTCONDITION_STAGE,
+        RunCommand(cmd=_learn_postcondition_cmd),
+        when=file_exists(_learn_baseline),
+        on_failure=fail,   # the one integrity exception to decision 5
+    )
+
+    pipeline.stage(
+        LEARN_DECIDE_STAGE,
+        _DecideLearning(paths=LEARN_PATHS, name=LEARN_DECIDE_STAGE),
+        when=file_exists(_learn_baseline),
+        on_failure=fail,   # never fails: LearnOutcomeStage
+    )
+
+    pipeline.stage(
+        LEARN_PUBLISH_STAGE,
+        _PublishLearningProposal(paths=LEARN_PATHS, name=LEARN_PUBLISH_STAGE),
+        when=file_exists(str(LEARN_PATHS.marker_ready)),
+        on_failure=fail,   # never fails: LearnOutcomeStage
+    )
+
+    pipeline.stage(
+        LEARN_RECORD_STAGE,
+        _RecordLearningOutcome(paths=LEARN_PATHS, name=LEARN_RECORD_STAGE),
+        on_failure=fail,   # never fails: LearnOutcomeStage
+    )
+
+# ===========================================================================
 # Handoff phase: deterministic write from a pipeline-assembled manifest
 #
 # The handoff is unreachable without the `review passed` gate above.
@@ -3141,6 +3747,9 @@ def _handoff_prompt() -> str:
     """
     prior_ctx = _build_prior_context(completed_in_run, skipped_for_resume, _done, window=0)
     prior_section = f"{prior_ctx}\n\n" if prior_ctx else ""
+    # With --arg learn=off there is no `record learning outcome` stage, so the
+    # literal stands in for its placeholder rather than leaving it unresolved.
+    learning_outcome = f"{{{LEARN_RECORD_STAGE}.output}}" if LEARN_ON else "Learning: off"
     return (
         f"## Objective\n\n"
         f"Write the handoff document for this feature at `{HANDOFF_MD}`.\n\n"
@@ -3159,14 +3768,21 @@ def _handoff_prompt() -> str:
         "- **Known limitations**: what is explicitly deferred or not covered\n"
         "- **Dependencies**: new or changed dependencies (see `## Dependency and configuration "
         "changes` in the manifest below)\n"
-        "- **Review**: quote the verdict line exactly from the review document\n\n"
+        "- **Review**: quote the verdict line exactly from the review document\n"
+        "- **Learning**: quote the first line of the learning outcome below exactly\n"
+        "- **For the human**: the `Copy to commit:` command and the "
+        "`Instruction-file note:` line of the learning outcome below, verbatim, "
+        "when it has them; `nothing` otherwise. The learning is a proposal: "
+        "nothing in this run committed it\n\n"
         "Build the document from the manifest and review provided below. "
         "Do not explore the repository — everything you need is in the manifest, "
-        "the review, and the step facts that follow.\n\n"
+        "the review, the learning outcome, and the step facts that follow.\n\n"
         "## Manifest\n\n"
         "{read handoff manifest.output}\n\n"
         "## Review\n\n"
         "{read review.output}\n\n"
+        "## Learning outcome\n\n"
+        f"{learning_outcome}\n\n"
         f"{shared_context}"
         f"{prior_section}"
         "## Completion\n\n"

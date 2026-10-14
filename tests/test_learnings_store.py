@@ -2,25 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from git import Repo
 
+from norn.models import PipelineContext, StageResult, UsageRecord
 from norn.pipelines import _find_related, _learnings
 from norn.pipelines._learnings import (
     CATEGORY_DEFAULTS,
+    DURABLE_BAR,
+    LearnGenerate,
+    LearnOutcomeStage,
+    LearnPaths,
     StoreConfigError,
+    decide_learning,
     existing_categories,
     keywords_from,
+    learn_prompt,
+    outcome_text,
+    publish_proposal,
     resolve_store,
+    store_hint,
     store_relpath,
     validate_learning,
 )
+from norn.stages.generate import Generate
 
 FIXTURES = Path(__file__).parent / "fixtures" / "learnings"
 STORE_REL = "docs/solutions"
@@ -641,3 +654,452 @@ def test_cli_validates_an_update_of_an_existing_target(tmp_path):
     doc.write_text(existing)
     proc = _cli(str(doc), "--repo", str(repo), "--target", "docs/solutions/root-note.md")
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# learn building blocks (step 11): LearnPaths, LearnOutcomeStage, LearnGenerate,
+# learn_prompt, decide_learning, publish_proposal, store_hint, outcome_text
+# ---------------------------------------------------------------------------
+
+# A CE skill or command name: `ce-`/`ce_` not glued to a longer word, so the
+# `ce-issues` inside `performance-issues` is not one.
+_CE_NAME = re.compile(r"(?<![A-Za-z0-9_-])ce[-_][a-z]")
+
+
+def _learn_paths(tmp_path: Path) -> LearnPaths:
+    paths = LearnPaths(tmp_path / "root")
+    paths.scratch.mkdir(parents=True)
+    return paths
+
+
+def _prompt(paths: LearnPaths, **kwargs) -> str:
+    kwargs.setdefault("evidence_stage", "collect learning evidence")
+    kwargs.setdefault("store_rel", "docs/solutions")
+    kwargs.setdefault("categories", ["integration-issues", "skill-design"])
+    kwargs.setdefault("today", "2026-10-14")
+    return learn_prompt(paths=paths, **kwargs)
+
+
+def test_learn_paths_layout(tmp_path):
+    paths = LearnPaths(str(tmp_path))
+    assert paths.scratch == tmp_path / "learn"
+    assert [p.name for p in paths.writable] == ["learning.md", "target", "skipped"]
+    assert all(p.parent == paths.scratch for p in paths.writable)
+    assert paths.store_hint == tmp_path / "learn" / "store-hint.md"
+    assert paths.agent_error == tmp_path / "learn" / "agent-error"
+    assert [p.name for p in paths.markers] == [
+        "learn.ready", "learn.skipped", "learn.failed", "learn.proposed",
+    ]
+    assert all(p.parent == tmp_path for p in paths.markers)
+    assert paths.pre_json == tmp_path / "learn.pre.json"
+    assert paths.pre_head == tmp_path / "learn.pre-head"
+    assert paths.outcome == tmp_path / "outcome.md"
+
+
+def test_learn_paths_reset_removes_scratch_markers_and_baselines(tmp_path):
+    paths = _learn_paths(tmp_path)
+    for p in (*paths.writable, paths.store_hint, paths.agent_error, *paths.markers,
+              paths.pre_json, paths.pre_head, paths.outcome):
+        p.write_text("stale\n")
+    keep = paths.root / "learn-evidence.md"
+    keep.write_text("evidence\n")
+    paths.reset()
+    assert not paths.scratch.exists()
+    for p in (*paths.markers, paths.pre_json, paths.pre_head, paths.outcome):
+        assert not p.exists(), p
+    assert keep.exists(), "reset touches only the learn scratch, markers and baselines"
+    paths.reset()  # idempotent on an empty root
+
+
+# -- learn_prompt --------------------------------------------------------------
+
+
+def test_learn_prompt_names_only_the_three_writable_paths(tmp_path):
+    paths = LearnPaths(tmp_path / "root")
+    prompt = _prompt(paths)
+    named = set(re.findall(re.escape(str(paths.root)) + r"[^\s`]*", prompt))
+    assert named == {str(p) for p in paths.writable}
+
+
+def test_learn_prompt_quotes_the_durable_bar_verbatim(tmp_path):
+    assert DURABLE_BAR in _prompt(LearnPaths(tmp_path))
+
+
+def test_learn_prompt_has_no_ce_name_except_the_refresh_hint(tmp_path):
+    prompt = _prompt(LearnPaths(tmp_path))
+    hint = "refresh it interactively with /ce-compound-refresh <path>"
+    assert hint in prompt
+    assert _CE_NAME.findall(prompt.replace(hint, "")) == []
+
+
+def test_learn_prompt_only_brace_is_the_evidence_placeholder(tmp_path):
+    prompt = _prompt(LearnPaths(tmp_path), evidence_stage="collect learning evidence")
+    assert prompt.count("{collect learning evidence.output}") == 1
+    rest = prompt.replace("{collect learning evidence.output}", "")
+    assert "{" not in rest and "}" not in rest
+
+
+def test_learn_prompt_states_its_rules_in_order(tmp_path):
+    paths = LearnPaths(tmp_path)
+    prompt = _prompt(paths)
+    anchors = [
+        "You write at most one learning from the evidence below, or a skip.",
+        "You have only the Write tool and cannot read the repository.",
+        "{collect learning evidence.output}",
+        DURABLE_BAR,
+        f"write `{paths.skipped}` with one line giving the reason, and nothing else",
+        "Choose `problem_type`",
+        "Existing store directories: `integration-issues`, `skill-design`",
+        "Reuse the `component` and `root_cause` values",
+        "problem, root cause, solution, referenced files and prevention",
+        "add `last_updated: 2026-10-14`",
+        "`date: 2026-10-14`",
+        "contains `: `",
+        "What Didn't Work",
+        "`## Related`",
+        "Never cite a commit SHA from this run",
+        f"`{paths.learning}`",
+        "`docs/solutions/<category>/<slug>.md`",
+        "`learned: <target>` or `skipped: <reason>`",
+    ]
+    positions = [prompt.index(a) for a in anchors]
+    assert positions == sorted(positions)
+    for value in (*_learnings.BUG_PROBLEM_TYPES, *_learnings.KNOWLEDGE_PROBLEM_TYPES,
+                  *_learnings.COMPONENT_SUGGESTED, *_learnings.ROOT_CAUSE_SUGGESTED):
+        assert f"`{value}`" in prompt
+    for ptype, category in CATEGORY_DEFAULTS.items():
+        assert f"`{ptype}` → `{category}`" in prompt
+    for section in (*_learnings.BUG_SECTIONS, *_learnings.KNOWLEDGE_SECTIONS):
+        assert section in prompt
+
+
+def test_learn_prompt_without_categories_says_so(tmp_path):
+    prompt = _prompt(LearnPaths(tmp_path), categories=[])
+    assert "Existing store directories: none" in prompt
+
+
+# -- LearnOutcomeStage ---------------------------------------------------------
+
+
+class _Boom(LearnOutcomeStage):
+    def __init__(self, exc: BaseException, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.exc = exc
+
+    async def _run(self, ctx):
+        raise self.exc
+
+
+class _Fine(LearnOutcomeStage):
+    async def _run(self, ctx):
+        return "all good"
+
+
+@pytest.mark.asyncio
+async def test_learn_outcome_stage_passes_its_output_through(tmp_path):
+    paths = _learn_paths(tmp_path)
+    result = await _Fine(paths=paths, name="fine").run(PipelineContext())
+    assert result.success and result.output == "all good"
+    assert not paths.marker_failed.exists()
+
+
+@pytest.mark.asyncio
+async def test_learn_outcome_stage_turns_an_exception_into_learn_failed(tmp_path):
+    paths = _learn_paths(tmp_path)
+    stage = _Boom(RuntimeError("disk on fire\nsecond line"), paths=paths, name="decide learning")
+    result = await stage.run(PipelineContext())
+    assert result.success
+    assert result.output == "failed: decide learning: disk on fire; second line"
+    assert paths.marker_failed.read_text() == "decide learning: disk on fire; second line\n"
+
+
+@pytest.mark.asyncio
+async def test_learn_outcome_stage_succeeds_when_the_root_is_not_writable(tmp_path):
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a directory\n")
+    paths = LearnPaths(blocker / "root")
+    result = await _Boom(ValueError("bad"), paths=paths, name="record learning outcome").run(
+        PipelineContext()
+    )
+    assert result.success
+    assert result.output == "failed: record learning outcome: bad"
+    assert "marker_write_error" in result.details
+    assert not paths.marker_failed.exists()
+
+
+@pytest.mark.asyncio
+async def test_learn_outcome_stage_lets_cancellation_propagate(tmp_path):
+    paths = _learn_paths(tmp_path)
+    with pytest.raises(asyncio.CancelledError):
+        await _Boom(asyncio.CancelledError(), paths=paths, name="collect").run(PipelineContext())
+    assert not paths.marker_failed.exists()
+
+
+# -- LearnGenerate -------------------------------------------------------------
+
+
+def _learn_generate(paths: LearnPaths, timeout: float = 5.0) -> LearnGenerate:
+    return LearnGenerate(paths=paths, timeout=timeout, prompt="p", model="light",
+                         allowed_tools=["Write"])
+
+
+def test_learn_generate_is_a_generate():
+    """The runner's label preflight finds agent stages by isinstance(impl, Generate)."""
+    assert issubclass(LearnGenerate, Generate)
+
+
+@pytest.mark.asyncio
+async def test_learn_generate_turns_a_timeout_into_agent_error(tmp_path):
+    paths = _learn_paths(tmp_path)
+
+    async def slow(self, ctx, **kwargs):
+        await asyncio.sleep(10)
+
+    with patch.object(Generate, "run", slow):
+        result = await _learn_generate(paths, timeout=0.05).run(PipelineContext())
+    assert result.success
+    assert "timed out after 0.05s" in paths.agent_error.read_text()
+    assert result.output.startswith("agent error: ")
+
+
+@pytest.mark.asyncio
+async def test_learn_generate_turns_an_exception_into_agent_error(tmp_path):
+    paths = _learn_paths(tmp_path)
+
+    async def boom(self, ctx, **kwargs):
+        raise RuntimeError("cli exploded")
+
+    with patch.object(Generate, "run", boom):
+        result = await _learn_generate(paths).run(PipelineContext())
+    assert result.success
+    assert "RuntimeError: cli exploded" in paths.agent_error.read_text()
+
+
+@pytest.mark.asyncio
+async def test_learn_generate_turns_a_failed_result_into_agent_error(tmp_path):
+    paths = _learn_paths(tmp_path)
+    usage = UsageRecord(stage_name="", total_cost_usd=0.12)
+
+    async def failed(self, ctx, **kwargs):
+        return StageResult(name="", success=False, error="max turns", usage=usage)
+
+    with patch.object(Generate, "run", failed):
+        result = await _learn_generate(paths).run(PipelineContext())
+    assert result.success
+    assert paths.agent_error.read_text() == "the learn agent failed: max turns\n"
+    assert result.usage is usage, "the failed attempt's cost is still counted"
+
+
+@pytest.mark.asyncio
+async def test_learn_generate_passes_a_good_result_through(tmp_path):
+    paths = _learn_paths(tmp_path)
+    good = StageResult(name="", success=True, output="learned: docs/solutions/x/y.md")
+
+    async def ok(self, ctx, **kwargs):
+        return good
+
+    with patch.object(Generate, "run", ok):
+        assert await _learn_generate(paths).run(PipelineContext()) is good
+    assert not paths.agent_error.exists()
+
+
+@pytest.mark.asyncio
+async def test_learn_generate_lets_cancellation_propagate(tmp_path):
+    paths = _learn_paths(tmp_path)
+    started = asyncio.Event()
+
+    async def hang(self, ctx, **kwargs):
+        started.set()
+        await asyncio.sleep(10)
+
+    with patch.object(Generate, "run", hang):
+        task = asyncio.create_task(_learn_generate(paths).run(PipelineContext()))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not paths.agent_error.exists()
+
+
+# -- decide_learning -----------------------------------------------------------
+
+
+def _decide(paths: LearnPaths, repo: Path) -> str:
+    return decide_learning(paths, repo=repo, store_rel=STORE_REL, base_sha=None)
+
+
+def test_decide_agent_error_is_failed(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    paths.agent_error.write_text("the learn agent timed out after 300s\n")
+    paths.learning.write_text(_bug())
+    assert _decide(paths, repo) == "failed"
+    assert "timed out after 300s" in paths.marker_failed.read_text()
+    assert not paths.marker_ready.exists()
+
+
+def test_decide_skip_and_learning_is_failed(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    paths.skipped.write_text("nothing durable\n")
+    paths.learning.write_text(_bug())
+    paths.target.write_text(BUG_TARGET + "\n")
+    assert _decide(paths, repo) == "failed"
+    assert "both" in paths.marker_failed.read_text()
+
+
+def test_decide_skip_alone_is_skipped(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    paths.skipped.write_text("the run concluded nothing a reader of the code would miss\n")
+    assert _decide(paths, repo) == "skipped"
+    assert paths.marker_skipped.read_text() == (
+        "the run concluded nothing a reader of the code would miss\n"
+    )
+    assert not paths.marker_failed.exists()
+
+
+def test_decide_skip_without_a_reason_is_failed(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    paths.skipped.write_text("  \n")
+    assert _decide(paths, repo) == "failed"
+    assert "no reason" in paths.marker_failed.read_text()
+    assert not paths.marker_skipped.exists()
+
+
+def test_decide_valid_learning_is_ready(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    paths.learning.write_text(_bug())
+    paths.target.write_text(BUG_TARGET + "\n")
+    assert _decide(paths, repo) == "ready"
+    assert paths.marker_ready.read_text() == BUG_TARGET + "\n"
+    assert not paths.marker_failed.exists()
+
+
+def test_decide_reads_the_existing_text_of_an_update(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    target = str(BUG_FIXTURE.relative_to(FIXTURES / "corpus"))
+    paths.learning.write_text(_bug())
+    paths.target.write_text(target + "\n")
+    assert _decide(paths, repo) == "ready", (
+        paths.marker_failed.read_text() if paths.marker_failed.exists() else ""
+    )
+
+
+def test_decide_invalid_learning_is_failed_with_its_problems(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    paths.learning.write_text(_with_solution(_bug(), "See `norn/nope.py:3`."))
+    paths.target.write_text(BUG_TARGET + "\n")
+    assert _decide(paths, repo) == "failed"
+    reason = paths.marker_failed.read_text()
+    assert reason.startswith("the learning failed validation: ")
+    assert "norn/nope.py:3" in reason
+    assert reason.count("\n") == 1, "the reason stays one line"
+
+
+def test_decide_learning_without_target_is_failed(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    paths.learning.write_text(_bug())
+    assert _decide(paths, repo) == "failed"
+    assert "no target" in paths.marker_failed.read_text()
+
+
+def test_decide_neither_file_is_failed(tmp_path):
+    repo = _make_repo(tmp_path)
+    paths = _learn_paths(tmp_path)
+    assert _decide(paths, repo) == "failed"
+    assert paths.marker_failed.read_text() == (
+        "the learn agent wrote neither a learning nor a skip\n"
+    )
+
+
+# -- publish_proposal and outcome_text -----------------------------------------
+
+
+def _ready(tmp_path: Path) -> tuple[LearnPaths, Path]:
+    paths = _learn_paths(tmp_path)
+    paths.learning.write_text(_bug())
+    paths.target.write_text(BUG_TARGET + "\n")
+    paths.marker_ready.write_text(BUG_TARGET + "\n")
+    run_dir = tmp_path / "state.runs" / "7"
+    run_dir.mkdir(parents=True)
+    return paths, run_dir
+
+
+def test_publish_proposal_copies_into_the_run_dir(tmp_path):
+    paths, run_dir = _ready(tmp_path)
+    proposal = publish_proposal(paths, run_dir)
+    assert proposal == run_dir / "learning.md"
+    assert proposal.read_text() == _bug()
+    assert (run_dir / "learning-target").read_text() == BUG_TARGET + "\n"
+    assert paths.marker_proposed.read_text() == f"{proposal}\n"
+
+
+def test_outcome_text_for_a_proposal(tmp_path):
+    paths, run_dir = _ready(tmp_path)
+    proposal = publish_proposal(paths, run_dir)
+    lines = outcome_text(paths).splitlines()
+    assert lines == [
+        f"proposed at {proposal}",
+        "Copy to commit: mkdir -p docs/solutions/integration-issues && "
+        f"cp {proposal} {BUG_TARGET}",
+    ]
+
+
+def test_outcome_text_adds_the_instruction_file_note(tmp_path):
+    paths, run_dir = _ready(tmp_path)
+    publish_proposal(paths, run_dir)
+    paths.store_hint.write_text("`docs/solutions/` — documented solutions\n")
+    lines = outcome_text(paths).splitlines()
+    assert len(lines) == 3
+    assert lines[2] == "Instruction-file note: `docs/solutions/` — documented solutions"
+
+
+def test_outcome_text_failed_beats_ready_and_proposed(tmp_path):
+    paths, run_dir = _ready(tmp_path)
+    publish_proposal(paths, run_dir)
+    paths.marker_failed.write_text("publish learning proposal: disk full\n")
+    assert outcome_text(paths) == "failed: publish learning proposal: disk full"
+
+
+def test_outcome_text_skipped(tmp_path):
+    paths = _learn_paths(tmp_path)
+    paths.marker_skipped.write_text("no journal to hold the proposal\n")
+    assert outcome_text(paths) == "skipped: no journal to hold the proposal"
+
+
+def test_outcome_text_without_a_marker_is_failed(tmp_path):
+    paths = _learn_paths(tmp_path)
+    assert outcome_text(paths) == "failed: no learning outcome was recorded"
+    paths.marker_ready.write_text(BUG_TARGET + "\n")
+    assert outcome_text(paths) == "failed: no learning outcome was recorded", (
+        "learn.ready without learn.proposed means publication never happened"
+    )
+
+
+# -- store_hint ----------------------------------------------------------------
+
+
+def test_store_hint_none_without_an_instruction_file(tmp_path):
+    assert store_hint(tmp_path, "docs/solutions") is None
+
+
+def test_store_hint_none_when_an_instruction_file_mentions_the_store(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("Rules.\n")
+    (tmp_path / "CLAUDE.md").write_text("Past fixes live in docs/solutions.\n")
+    assert store_hint(tmp_path, "docs/solutions") is None
+
+
+def test_store_hint_when_no_instruction_file_mentions_the_store(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("Rules.\n")
+    hint = store_hint(tmp_path, "kb/solutions")
+    assert hint == (
+        "`kb/solutions/` — documented solutions to past problems (bugs, best practices, "
+        "workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, "
+        "`problem_type`). Relevant when implementing or debugging in documented areas."
+    )

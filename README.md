@@ -438,9 +438,59 @@ then deleted, once both have enough runs to compare with `norn compare`.
 
 A copy of [`implement_features_v2`](#implement_features_v2) (see there for the
 steps, gates and review). It runs the same way:
-`norn run implement_features_v3 <feature-dir>`. What differs is the name; its
-snapshot markers live under their own `implement_features_v3` path, so a v2 run
-and a v3 run of the same feature directory never share state.
+`norn run implement_features_v3 <feature-dir>`. Its snapshot markers live under
+their own `implement_features_v3` path, so a v2 run and a v3 run of the same
+feature directory never share state.
+
+**Learning proposal.** A run that passes review ends with at most one grounded
+learning in Compound Engineering's schema, written as a *proposal*. Nothing is
+committed, staged or pushed: the pipeline proposes, you validate, copy and
+commit it, so it goes through your normal PR review. After `review passed`:
+
+1. `collect learning evidence` gathers the final and archived reviews, the
+   retry ledgers (failed runs, fixes and the paths they changed),
+   oscillations, step closeouts, the run's commits and the related learnings
+   already in the store.
+2. `learn` (an agent with only the Write tool, its own 300 s timeout) writes
+   one learning and its target path, or a one-line skip. It is asked to skip
+   unless the learning holds reasoning a future reader of the code could not
+   recover from the code itself.
+3. `learn postcondition` fails the run if the repository changed during the
+   learn stages (HEAD moved, the index is dirty, or a repo file changed).
+4. `decide learning` checks the result with the same validator you use below;
+   `publish learning proposal` copies it into the run directory;
+   `record learning outcome` writes the one-line outcome the handoff quotes.
+
+Apart from the postcondition, no learn stage fails a run that passed review:
+a timeout, an agent error or a learning that fails validation becomes
+`failed: <reason>` in the handoff, and the run still finishes.
+
+Knobs: `--arg learn=on|off` (default `on`; `off` adds no learn stages and the
+handoff says `Learning: off`) and `--arg learn_model=<label>` (default `light`).
+
+Where the proposal goes, in the launch directory:
+
+- `<state-key>.runs/<n>/learning.md`: the proposed document;
+- `<state-key>.runs/<n>/learning-target`: the repo-relative path it belongs at,
+  under the store (`<docs_root>/solutions/`, `docs/solutions/` by default).
+
+The handoff's **Learning** and **For the human** sections give the outcome and
+the exact copy command. To check, copy and commit a proposal:
+
+```bash
+# validate it (norn's environment; --repo is the target repository)
+uv run python norn/pipelines/_validate_learning.py <doc> --repo . --target <target>
+# from another repository, point uv at the norn checkout:
+uv run --project <norn checkout> python <norn checkout>/norn/pipelines/_validate_learning.py \
+  <doc> --repo . --target <target>
+
+mkdir -p "$(dirname <target>)" && cp <doc> <target>
+git add <target> && git commit -m "docs(solutions): <slug>"
+```
+
+When the repository's `AGENTS.md`/`CLAUDE.md` does not mention the store yet,
+the outcome adds an `Instruction-file note:` line suggesting what to add; norn
+never edits an instruction file itself.
 
 ### plan_with_review_v2
 

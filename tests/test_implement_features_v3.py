@@ -682,9 +682,21 @@ def test_no_generate_lists_task_tool() -> None:
 
 
 def test_every_generate_has_timeout() -> None:
-    """Every Generate stage must carry a stage-level timeout."""
+    """Every Generate stage carries a timeout.
+
+    The learn agent is the one stage whose timeout is applied inside the stage
+    (LearnGenerate) rather than by the runner, because a runner timeout would
+    fail a run that passed review (decision 5).
+    """
+    from norn.pipelines._learnings import LearnGenerate
+
     mod = _import_v2(GOOD_DIR)
     for s in _all_generates(mod):
+        if isinstance(s.impl, LearnGenerate):
+            assert s.timeout is None and s.impl.timeout == 300, (
+                f"{s.name!r}: the learn agent's timeout belongs inside the stage"
+            )
+            continue
         assert s.timeout is not None, (
             f"Generate stage {s.name!r} has no timeout"
         )
@@ -3438,23 +3450,33 @@ def test_handoff_and_final_audit_are_last_items() -> None:
 
 
 def test_no_generate_between_review_passed_and_handoff_except_handoff() -> None:
-    """No Generate stage exists between review passed and handoff other than handoff itself."""
-    from norn.dsl import Loop, Stage
+    """Between review passed and handoff the only agent is the learn stage.
+
+    `learn` is a LearnGenerate restricted to the Write tool on its scratch
+    files; with --arg learn=off there is no agent there at all.
+    """
+    from norn.dsl import Stage
+    from norn.pipelines._learnings import LearnGenerate
     from norn.stages.generate import Generate
 
-    mod = _import_v2(GOOD_DIR)
-    items = mod.config.items
-    names = [getattr(i, "name", None) for i in items]
+    for extra in ((), ("--arg", "learn=off")):
+        mod = _import_v2(GOOD_DIR, *extra)
+        items = mod.config.items
+        names = [getattr(i, "name", None) for i in items]
 
-    rp_idx = names.index("review passed")
-    handoff_idx = names.index("handoff")
+        rp_idx = names.index("review passed")
+        handoff_idx = names.index("handoff")
 
-    # Between review passed and handoff, there must be no Generate stages
-    for item in items[rp_idx + 1 : handoff_idx]:
-        if isinstance(item, Stage) and isinstance(item.impl, Generate):
-            pytest.fail(
-                f"Unexpected Generate between 'review passed' and 'handoff': {item.name!r}"
-            )
+        agents = [
+            item for item in items[rp_idx + 1 : handoff_idx]
+            if isinstance(item, Stage) and isinstance(item.impl, Generate)
+        ]
+        if extra:
+            assert agents == [], f"learn=off: unexpected agents {[a.name for a in agents]}"
+        else:
+            assert [a.name for a in agents] == ["learn"]
+            assert isinstance(agents[0].impl, LearnGenerate)
+            assert agents[0].impl.allowed_tools == ["Write"]
 
 
 def test_handoff_follows_review_passed_with_only_non_generate_between() -> None:
@@ -5217,3 +5239,637 @@ async def test_record_baseline_resets_the_step_ledger(tmp_path, monkeypatch) -> 
         assert not f.exists(), f"{f.name} must be cleared by record baseline"
     assert other_step.exists(), "another step's ledger must be left alone"
     assert osc.read_text() == "history\n", "oscillation.md is append-only"
+
+
+# ---------------------------------------------------------------------------
+# Learn stages, proposal only (step 11)
+# ---------------------------------------------------------------------------
+
+_LEARN_STAGES = [
+    "collect learning evidence",
+    "learn",
+    "learn postcondition",
+    "decide learning",
+    "publish learning proposal",
+    "record learning outcome",
+]
+
+
+def _import_v3_in(feature_dir: Path, *extra_argv: str):
+    """Reload implement_features_v3 for *feature_dir* (cwd must be its repo)."""
+    saved = list(sys.argv)
+    sys.argv = [saved[0], str(feature_dir), *extra_argv]
+    try:
+        from norn.pipelines import implement_features_v3
+        return importlib.reload(implement_features_v3)
+    finally:
+        sys.argv = saved
+
+
+def _learn_items(mod) -> list:
+    """The pipeline items between `review passed` and `handoff manifest`."""
+    items = mod.config.items
+    names = [getattr(i, "name", None) for i in items]
+    return items[names.index("review passed") + 1 : names.index("handoff manifest")]
+
+
+def test_learn_stages_sit_between_review_passed_and_handoff_manifest() -> None:
+    from norn.dsl import ClearContext, Stage
+
+    mod = _import_v2(GOOD_DIR)
+    between = _learn_items(mod)
+    assert isinstance(between[0], ClearContext), "the learn phase starts in a fresh session"
+    assert isinstance(between[-1], ClearContext), "the handoff phase starts in a fresh session"
+    stages = [i for i in between if isinstance(i, Stage)]
+    assert [s.name for s in stages] == _LEARN_STAGES
+    assert mod.LEARN_STAGE_NAMES == tuple(_LEARN_STAGES)
+
+
+def test_learn_off_removes_every_learn_stage() -> None:
+    from norn.dsl import Stage
+
+    mod = _import_v2(GOOD_DIR, "--arg", "learn=off")
+    assert mod.LEARN_ON is False
+    names = {i.name for i in mod.config.items if isinstance(i, Stage)}
+    assert names.isdisjoint(_LEARN_STAGES)
+    assert all(not isinstance(i, Stage) for i in _learn_items(mod))
+
+
+def test_learn_knob_defaults() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.LEARN == "on" and mod.LEARN_ON is True
+    assert mod.LEARN_MODEL == "light"
+    assert _stage(mod, "learn").impl.model == "light"
+
+
+def test_learn_model_knob_lands_on_the_learn_stage() -> None:
+    mod = _import_v2(GOOD_DIR, "--arg", "learn_model=standard")
+    assert _stage(mod, "learn").impl.model == "standard"
+
+
+def test_bad_learn_knob_raises() -> None:
+    with pytest.raises(ValueError, match="--arg learn: must be 'on' or 'off'"):
+        _import_v2(GOOD_DIR, "--arg", "learn=bogus")
+
+
+def test_bad_learn_model_raises() -> None:
+    with pytest.raises(ValueError, match="--arg learn_model"):
+        _import_v2(GOOD_DIR, "--arg", "learn_model=bogus")
+
+
+def test_learn_knobs_are_documented_but_not_required_args() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert "--arg learn=on|off" in mod.__doc__
+    assert "--arg learn_model=<label>" in mod.__doc__
+    assert list(mod.metadata["args"]) == ["args"]
+
+
+def test_learn_agent_stage_config() -> None:
+    from norn.dsl import OnFailure
+    from norn.pipelines._learnings import LearnGenerate
+
+    mod = _import_v2(GOOD_DIR)
+    s = _stage(mod, "learn")
+    assert isinstance(s.impl, LearnGenerate)
+    assert s.timeout is None, "a runner timeout would fail a run that passed review"
+    assert s.impl.timeout == mod.TIMEOUT_LEARN == 300
+    assert s.on_failure == OnFailure.FAIL
+    assert s.impl.allowed_tools == ["Write"]
+    assert s.impl.permission_mode == "acceptEdits"
+    assert s.impl.add_dirs == [str(mod.LEARN_PATHS.scratch)]
+    assert s.impl.max_turns == 4
+    assert s.impl.paths.root == Path(mod.snapshot_root)
+    assert s.impl.setting_sources is None, "the learn agent cannot read the repository"
+
+
+@pytest.mark.asyncio
+async def test_learn_write_guard_allows_only_the_three_scratch_files() -> None:
+    mod = _import_v2(GOOD_DIR)
+    hook = _stage(mod, "learn").impl.hooks["PreToolUse"][0]["hooks"][0]
+    for path in mod.LEARN_PATHS.writable:
+        assert await hook({"tool_input": {"file_path": str(path)}}, "t", None) == {}
+    for path in (mod.LEARN_PATHS.store_hint, mod.LEARN_PATHS.agent_error,
+                 Path(mod.PROJECT_DIR) / "README.md", mod.LEARN_PATHS.scratch / "slug.md"):
+        denied = await hook({"tool_input": {"file_path": str(path)}}, "t", None)
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", path
+
+
+def test_learn_write_guard_is_claude_code_only() -> None:
+    mod = _import_v2(GOOD_DIR, "--agent-provider", "opencode")
+    assert _stage(mod, "learn").impl.hooks is None
+
+
+def test_learn_stage_whens_match_the_table() -> None:
+    """collect and record always run; the agent, postcondition and decision need
+    learn.pre.json; publish needs learn.ready.  Every learn stage is on_failure=fail."""
+    from norn.dsl import OnFailure
+    from norn.models import PipelineContext
+
+    mod = _import_v2(GOOD_DIR)
+    paths = mod.LEARN_PATHS
+    gates = {
+        "collect learning evidence": None,
+        "learn": paths.pre_json,
+        "learn postcondition": paths.pre_json,
+        "decide learning": paths.pre_json,
+        "publish learning proposal": paths.marker_ready,
+        "record learning outcome": None,
+    }
+    ctx = PipelineContext()
+    try:
+        for p in (paths.pre_json, paths.marker_ready):
+            p.unlink(missing_ok=True)
+        for name, gate in gates.items():
+            s = _stage(mod, name)
+            assert s.on_failure == OnFailure.FAIL, name
+            if gate is None:
+                assert s.when is None, name
+            else:
+                assert s.when(ctx) is False, name
+        paths.pre_json.write_text("{}")
+        for name, gate in gates.items():
+            if gate is not None:
+                assert _stage(mod, name).when(ctx) is (gate == paths.pre_json), name
+        paths.pre_json.unlink()
+        paths.marker_ready.write_text("t\n")
+        for name, gate in gates.items():
+            if gate is not None:
+                assert _stage(mod, name).when(ctx) is (gate == paths.marker_ready), name
+    finally:
+        for p in (paths.pre_json, paths.marker_ready):
+            p.unlink(missing_ok=True)
+
+
+def test_no_learn_stage_commits_stages_or_pushes() -> None:
+    import inspect
+    import re
+
+    mod = _import_v2(GOOD_DIR)
+    forbidden = re.compile(r"git\s+(add|commit|push)\b")
+    for name in _LEARN_STAGES:
+        cmd = getattr(_stage(mod, name).impl, "cmd", "") or ""
+        assert not forbidden.search(cmd), f"{name}: {cmd}"
+    source = inspect.getsource(mod)
+    learn_block = source[source.index("# Learn phase:"):source.index("# Handoff phase:")]
+    assert not forbidden.search(learn_block)
+    assert not re.search(r"""_learn_git\(\s*["'](add|commit|push)["']""", learn_block)
+    from norn.pipelines import _learnings
+    tail = inspect.getsource(_learnings)
+    tail = tail[tail.index("# Learn building blocks"):]
+    assert not forbidden.search(tail)
+    assert "subprocess" not in tail, "the learn building blocks run no commands"
+
+
+def test_learn_postcondition_checks_head_index_and_tree() -> None:
+    mod = _import_v2(GOOD_DIR)
+    cmd = _stage(mod, "learn postcondition").impl.cmd
+    assert mod._assert_head_unchanged(mod.REVIEWED_HEAD, "the learn stages") in cmd
+    assert mod._assert_index_clean("the learn stages") in cmd
+    assert str(mod.LEARN_PATHS.pre_json) in cmd
+
+
+def test_handoff_and_audit_keep_the_reviewed_head_rule() -> None:
+    """Q1: no learn stage moves HEAD, so the v2 HEAD rule stays exactly as it was."""
+    for extra in ((), ("--arg", "learn=off")):
+        mod = _import_v2(GOOD_DIR, *extra)
+        assert (
+            mod._assert_head_unchanged(mod.REVIEWED_HEAD, "handoff")
+            in mod._handoff_postcondition_cmd
+        )
+        assert (
+            mod._assert_head_unchanged(mod.REVIEWED_HEAD, "the post-review phase")
+            in mod._final_audit_cmd
+        )
+        assert "learn" not in " ".join(mod._all_changed_for_audit)
+
+
+def test_handoff_prompt_quotes_the_learning_outcome() -> None:
+    import re
+
+    mod = _import_v2(GOOD_DIR)
+    prompt = _stage(mod, "handoff").impl.prompt
+    assert "{record learning outcome.output}" in prompt
+    assert "**Learning**" in prompt and "**For the human**" in prompt
+    assert "`Copy to commit:`" in prompt and "`Instruction-file note:`" in prompt
+    assert "Learning: off" not in prompt
+
+    off = _stage(_import_v2(GOOD_DIR, "--arg", "learn=off"), "handoff").impl.prompt
+    assert "Learning: off" in off
+    assert "{record learning outcome" not in off
+    assert not re.search(r"\{[^{}]*learn[^{}]*\.output\}", off)
+
+
+def test_learn_prompt_preview_is_the_shared_prompt() -> None:
+    from norn.pipelines._learnings import DURABLE_BAR
+
+    mod = _import_v2(GOOD_DIR)
+    preview = _stage(mod, "learn").impl.prompt
+    assert DURABLE_BAR in preview
+    assert "{collect learning evidence.output}" in preview
+    assert "<store>/<category>/<slug>.md" in preview
+
+
+# -- learn stages against a temp repo ------------------------------------------
+
+
+_LEARN_STEP = "step-01-v2-fixture-alpha"
+_LEARN_LEARNING = Path(__file__).parent / "fixtures" / "learnings" / "corpus" / "docs" \
+    / "solutions" / "integration-issues" / "portable-structured-output-schemas.md"
+_LEARN_TARGET = "docs/solutions/integration-issues/portable-schemas.md"
+
+
+def _learn_repo(tmp_path: Path, monkeypatch, *extra_argv: str, docs_root: str | None = None,
+                agents_md: str | None = None):
+    """A temp repo whose run passed review: base, one step commit, review.md, reviewed.head.
+
+    Returns (repo, repo_path, mod).
+    """
+    repo_path = tmp_path / "repo"
+    repo = _init_temp_repo(repo_path)
+    (repo_path / "norn").mkdir()
+    (repo_path / "norn" / "real.py").write_text("".join(f"x{i} = {i}\n" for i in range(1, 6)))
+    note = repo_path / "docs" / "solutions" / "best-practices" / "fixture-notes.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        "---\ntitle: Fixture notes\ndate: 2026-01-01\ncategory: best-practices\n"
+        "module: tests\nproblem_type: best_practice\ncomponent: testing_framework\n"
+        "severity: low\ntags:\n  - fixture\n---\n\n# Fixture notes\n\nKeep fixtures small.\n"
+    )
+    added = ["norn/real.py", "docs/solutions/best-practices/fixture-notes.md"]
+    if docs_root is not None:
+        cfg = repo_path / ".compound-engineering" / "config.yaml"
+        cfg.parent.mkdir()
+        cfg.write_text(f"docs_root: {docs_root}\n")
+        added.append(".compound-engineering/config.yaml")
+    if agents_md is not None:
+        (repo_path / "AGENTS.md").write_text(agents_md)
+        added.append("AGENTS.md")
+    repo.index.add(added)
+    repo.index.commit("base")
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+    monkeypatch.chdir(repo_path)
+    mod = _import_v3_in(feat_dir, *extra_argv)
+
+    root = Path(mod.snapshot_root)
+    for stale in list(root.glob("learn*")) + list(root.glob("*.oscillation.md")):
+        shutil.rmtree(stale) if stale.is_dir() else stale.unlink()
+    Path(mod.BASE_SHA).write_text(repo.head.commit.hexsha + "\n")
+    (repo_path / "feature.py").write_text("def feature():\n    return 1\n")
+    repo.index.add(["feature.py"])
+    repo.index.commit(f"refactor: {_LEARN_STEP} — Alpha")
+    Path(mod.REVIEWED_HEAD).write_text(repo.head.commit.hexsha + "\n")
+    Path(mod.REVIEW_MD).write_text("VERDICT: PASS\nBase: x\nHead: y\n\n## Blocking findings\n\nnone\n")
+    return repo, repo_path, mod
+
+
+def _journal(tmp_path: Path):
+    from norn.journal import RunJournal
+
+    run_dir = tmp_path / "state.runs" / "1"
+    (run_dir / "stages").mkdir(parents=True)
+    return RunJournal(run_dir)
+
+
+def _learn_ctx(journal=None):
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    ctx.journal = journal
+    return ctx
+
+
+def _write_snapshot(path: Path, data: dict) -> None:
+    import json
+
+    path.write_text(json.dumps(data))
+
+
+@pytest.mark.asyncio
+async def test_collect_learning_evidence_sections_caps_and_baseline(tmp_path, monkeypatch) -> None:
+    import json
+
+    from norn.models import StageResult
+
+    repo, repo_path, mod = _learn_repo(tmp_path, monkeypatch)
+    root = Path(mod.snapshot_root)
+    paths = mod.LEARN_PATHS
+    step = _LEARN_STEP
+
+    # The final review is longer than the cap.
+    Path(mod.REVIEW_MD).write_text("VERDICT: PASS\n" + "r" * 25_000 + "\n")
+
+    # Step 01: runs 1 and 2 failed, the fix before run 2 failed, the fix before run 3 passed.
+    (root / f"{step}.ledger.json").write_text(json.dumps([
+        {"attempt": 1, "round": 1, "failset": ["tests/t.py::test_a"]},
+        {"attempt": 2, "round": 1, "failset": ["tests/t.py::test_b"]},
+    ]))
+    for n in (1, 2):
+        (root / f"{step}.attempt-{n}.fail.txt").write_text(
+            "".join(f"fail{n} line {i:02d}\n" for i in range(60))
+        )
+    (root / f"{step}.attempt-2.fix.txt").write_text("".join(f"fix2 line {i:02d}\n" for i in range(50)))
+    _write_snapshot(root / f"{step}.attempt-2.pre-fix.json", {})
+    _write_snapshot(root / f"{step}.attempt-3.pre-fix.json", {"a.py": ["??", "1"]})
+    _write_snapshot(Path(mod._LEARN_STEP_PROOFS[step]),
+                    {"a.py": ["??", "1"], "feature.py": ["??", "2"]})
+    (root / f"{step}.head").write_text(Path(mod.BASE_SHA).read_text())
+    short = repo.head.commit.hexsha[:7]
+    (root / f"{step}.facts").write_text(
+        f"Commit: {short} refactor: {step} — Alpha\nChanged: feature.py\nValidation: PASS - x\n"
+    )
+    # Step 02 failed nothing; its ledger must not linger from another test.
+    (root / "step-02-v2-fixture-beta.ledger.json").unlink(missing_ok=True)
+
+    ctx = _learn_ctx(_journal(tmp_path))
+    ctx.results[f"fix {step}"] = StageResult(
+        name="", success=True, output="the passing fix\nNEW HYPOTHESIS: the import order"
+    )
+    ctx.results[f"closeout {step}"] = StageResult(
+        name="", success=True, output="EVIDENCE: test_a failed first"
+    )
+
+    seen_at_snapshot: list[bool] = []
+    real_snapshot = mod._snapshot_repo
+
+    def spy(out: str) -> None:
+        seen_at_snapshot.append(Path(mod.LEARN_EVIDENCE).exists() and paths.scratch.is_dir())
+        real_snapshot(out)
+
+    monkeypatch.setattr(mod, "_snapshot_repo", spy)
+    result = await _stage(mod, "collect learning evidence").impl.run(ctx)
+    assert result.success, result.output
+    text = result.output
+    assert Path(mod.LEARN_EVIDENCE).read_text() == text
+    assert not any(p.exists() for p in paths.markers), "a finished collection writes no marker"
+    assert paths.pre_json.exists()
+    assert seen_at_snapshot == [True], "learn.pre.json is collection's last action"
+
+    sections = ["## Review", "## Validation attempts", "## Oscillations", "## Step closeouts",
+                "## Commits", "## Related learnings"]
+    positions = [text.index(s) for s in sections]
+    assert positions == sorted(positions)
+
+    review = text[text.index("## Review"):text.index("## Validation attempts")]
+    kept = 20_000 - len("VERDICT: PASS\n")
+    assert "r" * kept in review and "r" * (kept + 1) not in review
+    assert "cut at 20000 characters" in review
+
+    attempts = text[text.index(f"### {step}"):text.index("### step-02-v2-fixture-beta")]
+    assert "fail1 line 59" in attempts and "fail1 line 20" in attempts
+    assert "fail1 line 19" not in attempts, "only the last 40 lines of a failed run"
+    assert "fix2 line 49" in attempts and "fix2 line 20" in attempts
+    assert "fix2 line 19" not in attempts, "only the last 30 lines of a fix response"
+    assert "Paths it changed: `a.py`" in attempts
+    assert "Paths it changed: `feature.py`" in attempts
+    assert "NEW HYPOTHESIS: the import order" in attempts
+    assert "+def feature():" in attempts, "the passing fix's diff in the step commit"
+    assert attempts.index("Fix before run 2") < attempts.index("Failed run 2")
+    validation = text[text.index("## Validation attempts"):text.index("## Oscillations")]
+    assert "### step-02-v2-fixture-beta\n\nNo failed attempts." in validation
+
+    assert "## Oscillations\n\nnone" in text
+    assert "EVIDENCE: test_a failed first" in text
+    commits = text[text.index("## Commits"):text.index("## Related learnings")]
+    assert f"refactor: {step}" in commits and "feature.py" in commits
+    related = text[text.index("## Related learnings"):]
+    assert "`docs/solutions/best-practices/fixture-notes.md` — full text" in related
+    assert "Keep fixtures small." in related
+    assert "Existing category directories: `best-practices`" in related
+
+
+@pytest.mark.asyncio
+async def test_collect_learning_evidence_caps_the_commit_log(tmp_path, monkeypatch) -> None:
+    repo, repo_path, mod = _learn_repo(tmp_path, monkeypatch)
+    for i in range(80):
+        (repo_path / f"f{i}.py").write_text(f"x = {i}\n")
+        repo.index.add([f"f{i}.py"])
+        repo.index.commit(f"commit {i}")
+    Path(mod.REVIEWED_HEAD).write_text(repo.head.commit.hexsha + "\n")
+    result = await _stage(mod, "collect learning evidence").impl.run(_learn_ctx(_journal(tmp_path)))
+    text = result.output
+    commits = text[text.index("## Commits"):text.index("## Related learnings")]
+    body = commits.split(mod._EVIDENCE_FENCE)[1].strip("\n").splitlines()
+    assert len(body) == mod.LEARN_COMMITS_LINES + 1
+    assert body[-1].endswith("more lines cut)")
+
+
+@pytest.mark.asyncio
+async def test_collect_without_a_journal_skips(tmp_path, monkeypatch) -> None:
+    _, _, mod = _learn_repo(tmp_path, monkeypatch)
+    paths = mod.LEARN_PATHS
+    paths.pre_json.write_text("{}")  # stale from an earlier run
+    result = await _stage(mod, "collect learning evidence").impl.run(_learn_ctx(None))
+    assert result.success
+    assert result.output == "skipped: no journal to hold the proposal"
+    assert paths.marker_skipped.read_text() == "no journal to hold the proposal\n"
+    assert not paths.pre_json.exists()
+
+
+@pytest.mark.asyncio
+async def test_collect_with_an_unusable_docs_root_fails_the_outcome(tmp_path, monkeypatch) -> None:
+    _, _, mod = _learn_repo(tmp_path, monkeypatch, docs_root="../outside")
+    paths = mod.LEARN_PATHS
+    result = await _stage(mod, "collect learning evidence").impl.run(_learn_ctx(_journal(tmp_path)))
+    assert result.success
+    assert result.output.startswith("failed: the learning store is unusable: docs_root=")
+    assert "../outside" in paths.marker_failed.read_text()
+    assert not paths.pre_json.exists()
+
+
+@pytest.mark.asyncio
+async def test_learn_postcondition_fails_when_a_repo_file_changed(tmp_path, monkeypatch) -> None:
+    repo, repo_path, mod = _learn_repo(tmp_path, monkeypatch)
+    ctx = _learn_ctx(_journal(tmp_path))
+    assert (await _stage(mod, "collect learning evidence").impl.run(ctx)).success
+    post = _stage(mod, "learn postcondition").impl
+
+    ok = await post.run(ctx)
+    assert ok.success, ok.output
+
+    (repo_path / "README.md").write_text("# changed by the learn agent\n")
+    bad = await post.run(ctx)
+    assert not bad.success
+    assert "README.md" in bad.output["stderr"]
+    assert "changed during the learn stages" in bad.output["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_learn_postcondition_fails_when_head_moved(tmp_path, monkeypatch) -> None:
+    repo, repo_path, mod = _learn_repo(tmp_path, monkeypatch)
+    ctx = _learn_ctx(_journal(tmp_path))
+    assert (await _stage(mod, "collect learning evidence").impl.run(ctx)).success
+    (repo_path / "x.md").write_text("x\n")
+    repo.index.add(["x.md"])
+    repo.index.commit("docs(solutions): sneaked in")
+    bad = await _stage(mod, "learn postcondition").impl.run(ctx)
+    assert not bad.success
+    assert "HEAD moved during the learn stages" in bad.output["stderr"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_name, target", [
+    ("collect learning evidence", "_learning_evidence"),
+    ("decide learning", "decide_learning"),
+    ("publish learning proposal", "publish_proposal"),
+    ("record learning outcome", "outcome_text"),
+])
+async def test_learn_outcome_stages_turn_errors_into_learn_failed(
+    tmp_path, monkeypatch, stage_name, target
+) -> None:
+    import asyncio
+
+    _, _, mod = _learn_repo(tmp_path, monkeypatch)
+    paths = mod.LEARN_PATHS
+    paths.scratch.mkdir(parents=True, exist_ok=True)
+    ctx = _learn_ctx(_journal(tmp_path))
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mod, target, boom)
+    result = await _stage(mod, stage_name).impl.run(ctx)
+    assert result.success, f"{stage_name} must never fail the run"
+    assert result.output == f"failed: {stage_name}: disk full"
+    assert paths.marker_failed.read_text() == f"{stage_name}: disk full\n"
+    assert not paths.pre_json.exists()
+
+    def cancel(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(mod, target, cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await _stage(mod, stage_name).impl.run(ctx)
+
+
+def _learn_pipeline(mod):
+    from norn.dsl import Pipeline
+
+    pipeline = Pipeline("learn-harness")
+    pipeline.items.extend(_learn_items(mod))
+    return pipeline
+
+
+def _statuses(ctx) -> dict[str, str]:
+    return {e.name: e.status for e in ctx.stage_log}
+
+
+async def _no_agent(self, ctx, **kwargs):
+    raise AssertionError("the learn agent must not run")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["no journal", "invalid docs_root"])
+async def test_early_learn_markers_through_run_pipeline(tmp_path, monkeypatch, case) -> None:
+    from norn.runner import run_pipeline
+    from norn.stages.generate import Generate
+
+    docs_root = "../outside" if case == "invalid docs_root" else None
+    _, _, mod = _learn_repo(tmp_path, monkeypatch, docs_root=docs_root)
+    paths = mod.LEARN_PATHS
+    journal = _journal(tmp_path) if case == "invalid docs_root" else None
+
+    with patch.object(Generate, "run", _no_agent):
+        ctx = await run_pipeline(_learn_pipeline(mod), journal=journal)
+
+    assert not paths.pre_json.exists()
+    status = _statuses(ctx)
+    for name in ("learn", "learn postcondition", "decide learning", "publish learning proposal"):
+        assert status[name] == "skipped_condition", f"{name}: {status[name]}"
+    for name in ("collect learning evidence", "record learning outcome"):
+        assert status[name] == "passed"
+    outcome = ctx.results["record learning outcome"].output
+    if case == "no journal":
+        assert paths.marker_skipped.exists()
+        assert outcome == "skipped: no journal to hold the proposal"
+    else:
+        assert paths.marker_failed.exists()
+        assert outcome.startswith("failed: the learning store is unusable: ")
+    assert paths.outcome.read_text() == outcome + "\n"
+
+
+@pytest.mark.asyncio
+async def test_learn_proposal_end_to_end_through_run_pipeline(tmp_path, monkeypatch) -> None:
+    from norn.models import StageResult
+    from norn.runner import run_pipeline
+    from norn.stages.generate import Generate
+
+    repo, repo_path, mod = _learn_repo(tmp_path, monkeypatch, agents_md="# Rules\n")
+    paths = mod.LEARN_PATHS
+    journal = _journal(tmp_path)
+    head_before = repo.head.commit.hexsha
+    prompts: list[str] = []
+
+    async def agent(self, ctx, **kwargs):
+        prompts.append(self._resolve_prompt(ctx))
+        paths.learning.write_text(_LEARN_LEARNING.read_text())
+        paths.target.write_text(_LEARN_TARGET + "\n")
+        return StageResult(name="", success=True, output=f"learned: {_LEARN_TARGET}")
+
+    with patch.object(Generate, "run", agent):
+        ctx = await run_pipeline(_learn_pipeline(mod), journal=journal)
+
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert "# Learning evidence" in prompt, "the evidence is resolved into the prompt"
+    assert "`docs/solutions/<category>/<slug>.md`" in prompt
+    assert "`best-practices`" in prompt
+
+    status = _statuses(ctx)
+    assert all(status[n] == "passed" for n in _LEARN_STAGES), status
+    proposal = journal.dir / "learning.md"
+    assert proposal.read_text() == _LEARN_LEARNING.read_text()
+    assert (journal.dir / "learning-target").read_text() == _LEARN_TARGET + "\n"
+    outcome = ctx.results["record learning outcome"].output.splitlines()
+    assert outcome[0] == f"proposed at {proposal}"
+    assert outcome[1] == (
+        f"Copy to commit: mkdir -p docs/solutions/integration-issues && "
+        f"cp {proposal} {_LEARN_TARGET}"
+    )
+    assert outcome[2].startswith("Instruction-file note: `docs/solutions/` — documented solutions")
+
+    # Q1: nothing was committed, staged or written into the repository.
+    assert repo.head.commit.hexsha == head_before
+    assert not (repo_path / _LEARN_TARGET).exists()
+    assert repo.git.diff("--cached", "--name-only") == ""
+
+
+@pytest.mark.asyncio
+async def test_learn_agent_writing_into_the_repo_fails_the_run(tmp_path, monkeypatch) -> None:
+    """The one fatal learn stage: an unreviewed change in a reviewed tree."""
+    from norn.models import StageResult
+    from norn.runner import PipelineError, run_pipeline
+    from norn.stages.generate import Generate
+
+    repo, repo_path, mod = _learn_repo(tmp_path, monkeypatch)
+
+    async def rogue(self, ctx, **kwargs):
+        (repo_path / _LEARN_TARGET).parent.mkdir(parents=True, exist_ok=True)
+        (repo_path / _LEARN_TARGET).write_text(_LEARN_LEARNING.read_text())
+        return StageResult(name="", success=True, output="learned")
+
+    with patch.object(Generate, "run", rogue), pytest.raises(PipelineError) as exc_info:
+        await run_pipeline(_learn_pipeline(mod), journal=_journal(tmp_path))
+    assert exc_info.value.stage_name == "learn postcondition"
+
+
+@pytest.mark.asyncio
+async def test_learn_agent_timeout_is_a_failed_outcome_not_a_failed_run(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from norn.runner import run_pipeline
+    from norn.stages.generate import Generate
+
+    _, _, mod = _learn_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(_stage(mod, "learn").impl, "timeout", 0.05)
+
+    async def slow(self, ctx, **kwargs):
+        await asyncio.sleep(5)
+
+    with patch.object(Generate, "run", slow):
+        ctx = await run_pipeline(_learn_pipeline(mod), journal=_journal(tmp_path))
+
+    status = _statuses(ctx)
+    assert status["publish learning proposal"] == "skipped_condition"
+    outcome = ctx.results["record learning outcome"].output
+    assert outcome == "failed: the learn agent timed out after 0.05s"
