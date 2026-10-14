@@ -532,14 +532,15 @@ def test_loop_max_retries_and_exhaust() -> None:
         assert lp.on_exhaust == OnFailure.ASK_USER, f"{stem}: on_exhaust mismatch"
 
 
-def test_loop_has_three_stages() -> None:
-    """Each validation loop must have exactly: compress, fix, run validation."""
+def test_loop_body_order_is_compress_ledger_fix_run() -> None:
+    """Each validation loop is exactly: compress, retry ledger, fix, run validation."""
     mod = _import_v2(GOOD_DIR)
     for stem in _GOOD_STEMS:
         lp = _loop(mod, f"validate {stem}")
         names = [s.name for s in lp.stages]
         assert names == [
             f"compress {stem}",
+            f"retry ledger {stem}",
             f"fix {stem}",
             f"run validation {stem}",
         ], f"{stem}: loop stage names {names!r}"
@@ -4716,3 +4717,481 @@ def test_write_guard_is_omitted_for_providers_without_hook_support() -> None:
     assert mod._effective_agent_provider(["--agent-provider", "codex"]) == "codex"
     assert mod._effective_agent_provider(["--agent-provider=codex"]) == "codex"
     assert mod._effective_agent_provider([]) == "claude-code"
+
+
+# ---------------------------------------------------------------------------
+# Retry ledger, oscillation stop and retry prompt (step 09)
+# ---------------------------------------------------------------------------
+
+_LEDGER_STEP = "step-01-v2-fixture-alpha"
+
+
+def test_failing_tests_pytest() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = (
+        "tests/test_a.py F.E                                     [100%]\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_a.py::test_one - AssertionError: assert 1 == 2\n"
+        "ERROR tests/test_b.py::test_two - RuntimeError: boom\n"
+        "ERROR: file or directory not found: tests/missing.py\n"
+        "========================= 1 failed, 1 error in 0.12s =========================\n"
+    )
+    result = mod.failing_tests(text)
+    assert isinstance(result, frozenset)
+    assert result == {"tests/test_a.py::test_one", "tests/test_b.py::test_two"}
+
+
+def test_failing_tests_bats() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = (
+        "1..3\n"
+        "ok 1 greets the user\n"
+        "not ok 2 rejects an empty name\n"
+        "# (in test file bats/greet.bats, line 12)\n"
+        "not ok 3 prints the version\r\n"
+    )
+    assert mod.failing_tests(text) == {"rejects an empty name", "prints the version"}
+
+
+def test_failing_tests_go() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = (
+        "=== RUN   TestParse\n"
+        "--- FAIL: TestParse (0.00s)\n"
+        "    parse_test.go:12: got 1, want 2\n"
+        "=== RUN   TestFormat\n"
+        "--- PASS: TestFormat (0.00s)\n"
+        "--- FAIL: TestRender (0.01s)\n"
+        "FAIL\n"
+    )
+    assert mod.failing_tests(text) == {"TestParse", "TestRender"}
+
+
+def test_failing_tests_maven() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = (
+        "[ERROR] Failures: \n"
+        "[ERROR]   CalculatorTest.testAdd:15 expected:<3> but was:<4>\n"
+        "[ERROR]   com.acme.ParserTest.testEmpty:42 NullPointer\n"
+        "[ERROR] Tests run: 9, Failures: 2, Errors: 0, Skipped: 0\n"
+        "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test\n"
+    )
+    assert mod.failing_tests(text) == {"CalculatorTest.testAdd", "com.acme.ParserTest.testEmpty"}
+
+
+def test_failing_tests_unknown_output_is_empty() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.failing_tests("") == frozenset()
+    assert mod.failing_tests(
+        "Traceback (most recent call last):\n  File \"x.py\", line 1\nSyntaxError: bad\nexit 1\n"
+    ) == frozenset()
+
+
+def _ledger_entries(*failsets, rnd: int = 1, start: int = 1) -> list[dict]:
+    return [
+        {"attempt": start + i, "round": rnd, "failset": sorted(fs)}
+        for i, fs in enumerate(failsets)
+    ]
+
+
+_A = {"tests/test_x.py::test_a"}
+_B = {"tests/test_x.py::test_b"}
+_C = {"tests/test_x.py::test_c"}
+
+
+def test_detect_oscillation_a_b_a() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.detect_oscillation(_ledger_entries(_A, _B, _A)) == (frozenset(_A), frozenset(_B))
+    # Only the trailing window counts, so a longer round still detects.
+    assert mod.detect_oscillation(_ledger_entries(_C, _A, _B, _A)) == (frozenset(_A), frozenset(_B))
+
+
+@pytest.mark.parametrize("failsets", [
+    (_A, _A, _A),
+    (_A, _B, _C),
+    (_A, _B),
+    (_A,),
+    (),
+    (_A, set(), _A),
+    (set(), _B, set()),
+], ids=["AAA", "ABC", "too-short", "one", "empty-ledger", "empty-middle", "empty-ends"])
+def test_detect_oscillation_negative(failsets) -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.detect_oscillation(_ledger_entries(*failsets)) is None
+
+
+def test_detect_oscillation_round_boundary_resets() -> None:
+    mod = _import_v2(GOOD_DIR)
+    entries = _ledger_entries(_A, _B) + _ledger_entries(_A, rnd=2, start=0)
+    assert mod.detect_oscillation(entries) is None
+    entries = _ledger_entries(_A) + _ledger_entries(_B, _A, rnd=2, start=0)
+    assert mod.detect_oscillation(entries) is None
+    # A full A,B,A inside the new round still detects.
+    entries = _ledger_entries(_C, _C) + _ledger_entries(_A, _B, _A, rnd=2, start=0)
+    assert mod.detect_oscillation(entries) == (frozenset(_A), frozenset(_B))
+
+
+def test_detect_oscillation_requires_consecutive_attempts() -> None:
+    mod = _import_v2(GOOD_DIR)
+    entries = [
+        {"attempt": 1, "round": 1, "failset": sorted(_A)},
+        {"attempt": 2, "round": 1, "failset": sorted(_B)},
+        {"attempt": 4, "round": 1, "failset": sorted(_A)},
+    ]
+    assert mod.detect_oscillation(entries) is None
+
+
+def _ledger_harness(mod, root: Path, git_root: Path, max_retries: int, run_failsets: list):
+    """Build a real loop: mock compress, real retry ledger, mock fix, mock run.
+
+    ``run_failsets[i]`` is the set of test names attempt i+1's run reports as
+    FAILED; ``None`` makes that run pass.  Returns (pipeline, ledger, fix_calls,
+    run_calls).
+    """
+    from norn.dsl import OnFailure, Pipeline, Stage, stage_failed
+    from norn.models import StageResult
+    from norn.stages.base import BaseStage
+
+    step = _LEDGER_STEP
+    run_name = f"run validation {step}"
+    ledger_name = f"retry ledger {step}"
+
+    class _Compress(BaseStage):
+        async def run(self, ctx, **kwargs):
+            prev = ctx.results.get(run_name)
+            if prev is None or prev.success:
+                return StageResult(name="", success=True, output="")
+            return StageResult(name="", success=True, output=prev.output["stdout"])
+
+    class _Fix(BaseStage):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def run(self, ctx, **kwargs):
+            self.calls.append(ctx.results[ledger_name].output)
+            return StageResult(name="", success=True, output=f"fix response {len(self.calls)}")
+
+    class _Run(BaseStage):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self, ctx, **kwargs):
+            failset = run_failsets[self.calls]
+            self.calls += 1
+            if failset is None:
+                return StageResult(name="", success=True,
+                                   output={"stdout": "1 passed", "stderr": "", "returncode": 0})
+            filler = "".join(f"progress line {i}\n" for i in range(80))
+            failed = "".join(f"FAILED {t} - AssertionError\n" for t in sorted(failset))
+            return StageResult(
+                name="", success=False, error="Command exited with code 1",
+                output={"stdout": f"run {self.calls}\n{filler}{failed}", "stderr": "",
+                        "returncode": 1},
+            )
+
+    class _SpyLedger(mod._RetryLedger):
+        def __init__(self, **kw) -> None:
+            super().__init__(**kw)
+            self.calls: list[tuple[int, bool, bool]] = []
+
+        async def run(self, ctx, *, node_id, attempt, **kw):
+            r = await super().run(ctx, node_id=node_id, attempt=attempt, **kw)
+            self.calls.append((attempt, r.success, os.path.exists(self.paths["needs_human"])))
+            return r
+
+    ledger = _SpyLedger(step=step, root=str(root), git_root=str(git_root),
+                        max_retries=max_retries)
+    fix, run = _Fix(), _Run()
+    pipeline = Pipeline("ledger-harness").loop(
+        f"validate {step}",
+        max_retries=max_retries,
+        on_exhaust=OnFailure.FAIL,
+        stages=[
+            Stage(f"compress {step}", _Compress()),
+            Stage(ledger_name, ledger, when=stage_failed(run_name)),
+            Stage(f"fix {step}", fix, when=stage_failed(run_name)),
+            Stage(run_name, run),
+        ],
+    )
+    return pipeline, ledger, fix, run
+
+
+@pytest.mark.asyncio
+async def test_retry_ledger_through_a_real_loop(tmp_path) -> None:
+    """Three failed runs then a pass, max_retries=4, via run_pipeline."""
+    import json
+
+    from norn.runner import run_pipeline
+
+    mod = _import_v2(GOOD_DIR)
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    _init_temp_repo(tmp_path / "repo")
+    pipeline, ledger, fix, run = _ledger_harness(
+        mod, root, tmp_path / "repo", 4, [_A, _B, _C, None]
+    )
+
+    ctx = await run_pipeline(pipeline)
+
+    step = _LEDGER_STEP
+    assert [c[0] for c in ledger.calls] == [2, 3, 4], "ledger must run at attempts 2, 3 and 4"
+    assert all(ok for _, ok, _ in ledger.calls)
+    assert run.calls == 4
+    assert len(fix.calls) == 3
+    assert ctx.results[f"run validation {step}"].success
+
+    def p(name: str) -> Path:
+        return root / f"{step}.{name}"
+
+    for n in (1, 2, 3):
+        assert p(f"attempt-{n}.fail.txt").exists(), f"attempt-{n}.fail.txt missing"
+    assert not p("attempt-4.fail.txt").exists()
+    # The fix does not run in attempt 1.
+    assert not p("attempt-1.fix.txt").exists()
+    assert p("attempt-2.fix.txt").read_text() == "fix response 1"
+    assert p("attempt-3.fix.txt").read_text() == "fix response 2"
+    for n in (2, 3, 4):
+        snap = p(f"attempt-{n}.pre-fix.json")
+        assert snap.exists(), f"attempt-{n}.pre-fix.json missing"
+        assert isinstance(json.loads(snap.read_text()), dict)
+    assert not p("attempt-1.pre-fix.json").exists()
+
+    # The fail tail is the last 60 lines of the compressed log.
+    tail = p("attempt-1.fail.txt").read_text().splitlines()
+    assert len(tail) == mod.LEDGER_FAIL_TAIL_LINES == 60
+    assert tail[-1] == "FAILED tests/test_x.py::test_a - AssertionError"
+    assert "run 1" not in tail
+
+    entries = json.loads(p("ledger.json").read_text())
+    assert [e["attempt"] for e in entries] == [1, 2, 3]
+    assert [e["round"] for e in entries] == [1, 1, 1]
+    assert [e["failset"] for e in entries] == [sorted(_A), sorted(_B), sorted(_C)]
+
+    # Output reaches the fix: attempt 2 has no "two fixes" paragraph, attempt 3 does.
+    at2, at3, at4 = fix.calls
+    assert at2.startswith("Validation attempt 2 of 4.")
+    assert "Two fixes have failed" not in at2
+    assert "Validation attempt 3 of 4" in at3
+    assert mod.LEDGER_TWO_FIXES_FAILED in at3
+    assert "Two fixes have failed. Before editing, name the assumption" in at3
+    assert "tests/test_x.py::test_a" in at3 and "tests/test_x.py::test_b" in at3
+    assert "Validation attempt 4 of 4" in at4
+    assert not p("needs-human").exists()
+    assert not p("oscillation.md").exists()
+
+
+def test_retry_ledger_sets_emits_events_for_the_attempt_kwarg(tmp_path) -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod._RetryLedger.emits_events is True
+    assert mod._RetryLedger.needs_agent is False
+
+
+@pytest.mark.asyncio
+async def test_retry_ledger_run_without_attempt_raises_type_error(tmp_path) -> None:
+    from norn.models import PipelineContext
+
+    mod = _import_v2(GOOD_DIR)
+    stage = mod._RetryLedger(step=_LEDGER_STEP, root=str(tmp_path), git_root=str(tmp_path),
+                             max_retries=3)
+    with pytest.raises(TypeError):
+        await stage.run(PipelineContext())
+    with pytest.raises(TypeError):
+        await stage.run(PipelineContext(), node_id="loop:x/stage:y")
+
+
+@pytest.mark.asyncio
+async def test_retry_ledger_stops_on_oscillation_through_a_real_loop(tmp_path) -> None:
+    """A,B,A with max_retries=5: needs-human at attempt 4, attempt 5 fails at the ledger."""
+    import json
+
+    from norn.runner import RetriesExhaustedError, run_pipeline
+
+    mod = _import_v2(GOOD_DIR)
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    _init_temp_repo(tmp_path / "repo")
+    pipeline, ledger, fix, run = _ledger_harness(
+        mod, root, tmp_path / "repo", 5, [_A, _B, _A, None, None]
+    )
+
+    with pytest.raises(RetriesExhaustedError) as exc_info:
+        await run_pipeline(pipeline)
+
+    assert ledger.calls == [
+        (2, True, False),
+        (3, True, False),
+        (4, False, True),   # oscillation detected: needs-human written
+        (5, False, True),   # fails at once, no fix
+    ]
+    assert len(fix.calls) == 2, "the fix runs only at attempts 2 and 3"
+    assert run.calls == 3
+
+    step = _LEDGER_STEP
+    last = exc_info.value.result
+    assert last.name == f"retry ledger {step}"
+    assert "stopped before another fix; needs a human" in last.error
+
+    entries = json.loads((root / f"{step}.ledger.json").read_text())
+    assert [e["attempt"] for e in entries] == [1, 2, 3]
+
+    osc = (root / f"{step}.oscillation.md").read_text()
+    assert "tests/test_x.py::test_a" in osc and "tests/test_x.py::test_b" in osc
+    assert "FAILED tests/test_x.py::test_b - AssertionError" in osc
+    assert sum(1 for line in osc.splitlines() if line.startswith("### ")) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_ledger_detection_error_names_both_sets(tmp_path) -> None:
+    """The stop's error names both fail sets; attempt 1 (a new round) clears it."""
+    from norn.models import PipelineContext, StageResult
+
+    mod = _import_v2(GOOD_DIR)
+    _init_temp_repo(tmp_path / "repo")
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    step = _LEDGER_STEP
+    stage = mod._RetryLedger(step=step, root=str(root), git_root=str(tmp_path / "repo"),
+                             max_retries=6)
+    ctx = PipelineContext()
+
+    async def call(attempt: int, failset: set) -> StageResult:
+        text = "".join(f"FAILED {t}\n" for t in sorted(failset))
+        ctx.results[f"compress {step}"] = StageResult(name="c", success=True, output=text)
+        ctx.results[f"run validation {step}"] = StageResult(
+            name="r", success=False, output={"stdout": text, "stderr": "", "returncode": 1}
+        )
+        ctx.results[f"fix {step}"] = StageResult(name="f", success=True, output="a fix")
+        result = await stage.run(ctx, node_id="n", attempt=attempt)
+        ctx.results[f"retry ledger {step}"] = result
+        return result
+
+    assert (await call(2, _A)).success
+    assert (await call(3, _B)).success
+    stopped = await call(4, _A)
+    assert not stopped.success
+    assert "tests/test_x.py::test_a" in stopped.error
+    assert "tests/test_x.py::test_b" in stopped.error
+    assert "stopped before another fix; needs a human" in stopped.error
+    assert (root / f"{step}.needs-human").exists()
+
+    # An operator [r]etry restarts the loop at attempt 1: a new round.
+    resumed = await call(1, _C)
+    assert resumed.success, resumed.error
+    assert not (root / f"{step}.needs-human").exists()
+    assert "round 2" in resumed.output
+    import json
+    entries = json.loads((root / f"{step}.ledger.json").read_text())
+    assert entries[-1] == {"attempt": 0, "round": 2, "failset": sorted(_C)}
+
+
+def test_fix_prompt_has_retry_discipline() -> None:
+    mod = _import_v2(GOOD_DIR)
+    for stem in _GOOD_STEMS:
+        prompt = _get_fix_prompt(mod, stem)
+        assert "## Retry discipline" in prompt
+        assert f"{{retry ledger {stem}.output}}" in prompt
+        for label in ("PREVIOUS HYPOTHESIS:", "EVIDENCE:", "NEW HYPOTHESIS:"):
+            assert label in prompt, f"{stem}: fix prompt missing {label!r}"
+        assert "invalidated" in prompt
+        assert "End your response with the same three lines" in prompt
+
+
+def test_fix_prompt_template_has_no_stray_braces() -> None:
+    """Outside the placeholders it means, the fix prompt template has no braces."""
+    import re
+
+    mod = _import_v2(GOOD_DIR)
+    prompt = mod._fix_prompt("step-x", "/abs/step-x.md", "BODY", "CMD", 3)
+    stripped = re.sub(r"\{(compress|retry ledger) step-x\.output\}", "", prompt)
+    assert "{" not in stripped and "}" not in stripped
+
+
+def test_max_retries_still_defaults_to_three() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.MAX_RETRIES == 3
+    for stem in _GOOD_STEMS:
+        ledger = _stage(mod, f"retry ledger {stem}")
+        assert ledger.impl.max_retries == 3
+        assert ledger.impl.root == mod.snapshot_root
+        assert ledger.impl.git_root == mod.GIT_TOPLEVEL
+
+
+def test_retry_ledger_stage_runs_only_after_a_failed_run() -> None:
+    from norn.models import PipelineContext, StageResult
+
+    mod = _import_v2(GOOD_DIR)
+    stem = _LEDGER_STEP
+    ledger = _stage(mod, f"retry ledger {stem}")
+    ctx = PipelineContext()
+    assert ledger.when(ctx) is False
+    ctx.results[f"run validation {stem}"] = StageResult(name="r", success=True)
+    assert ledger.when(ctx) is False
+    ctx.results[f"run validation {stem}"] = StageResult(name="r", success=False)
+    assert ledger.when(ctx) is True
+
+
+def test_handoff_manifest_cmd_has_oscillations_section() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert "## Oscillations" in mod._handoff_manifest_cmd()
+
+
+@pytest.mark.asyncio
+async def test_handoff_manifest_lists_oscillations_or_none(tmp_path, monkeypatch) -> None:
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
+    manifest = Path(mod.snapshot_root) / "handoff-manifest.md"
+    for stale in Path(mod.snapshot_root).glob("*.oscillation.md"):
+        stale.unlink()
+
+    r = await _stage(mod, "handoff manifest").impl.run(ctx)
+    assert r.success, r.output
+    text = manifest.read_text()
+    section = text[text.index("## Oscillations"):]
+    assert section.split("\n", 2)[2].strip() == "none"
+
+    osc = Path(mod.snapshot_root) / f"{_LEDGER_STEP}.oscillation.md"
+    osc.write_text(f"### {_LEDGER_STEP}: round 1, attempts 1-3\n\nfail set A\n")
+    try:
+        r = await _stage(mod, "handoff manifest").impl.run(ctx)
+        assert r.success, r.output
+        text = manifest.read_text()
+        section = text[text.index("## Oscillations"):]
+        assert f"### {_LEDGER_STEP}: round 1, attempts 1-3" in section
+        assert "none" not in section
+    finally:
+        osc.unlink()
+
+
+@pytest.mark.asyncio
+async def test_record_baseline_resets_the_step_ledger(tmp_path, monkeypatch) -> None:
+    """A stale ledger from an earlier run is cleared; oscillation.md is kept."""
+    from norn.models import PipelineContext
+
+    repo_path = tmp_path / "repo"
+    _init_temp_repo(repo_path)
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    root = Path(mod.snapshot_root)
+    stale = [
+        root / f"{_LEDGER_STEP}.ledger.json",
+        root / f"{_LEDGER_STEP}.needs-human",
+        root / f"{_LEDGER_STEP}.attempt-1.fail.txt",
+        root / f"{_LEDGER_STEP}.attempt-2.fix.txt",
+        root / f"{_LEDGER_STEP}.attempt-2.pre-fix.json",
+    ]
+    for f in stale:
+        f.write_text("stale\n")
+    other_step = root / "step-02-v2-fixture-beta.ledger.json"
+    other_step.write_text("[]\n")
+    osc = root / f"{_LEDGER_STEP}.oscillation.md"
+    osc.write_text("history\n")
+
+    r = await _stage(mod, f"record baseline {_LEDGER_STEP}").impl.run(PipelineContext())
+    assert r.success, r.output
+    for f in stale:
+        assert not f.exists(), f"{f.name} must be cleared by record baseline"
+    assert other_step.exists(), "another step's ledger must be left alone"
+    assert osc.read_text() == "history\n", "oscillation.md is append-only"
