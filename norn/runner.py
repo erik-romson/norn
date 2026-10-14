@@ -1034,7 +1034,7 @@ def _write_run_metrics(ctx: PipelineContext) -> None:
     try:
         from norn.metrics import compute_metrics, find_issues, load_prior_metrics, write_metrics
 
-        run_dir = ctx.journal._dir
+        run_dir = ctx.journal.dir
         metrics = compute_metrics(run_dir)
         prior = load_prior_metrics(run_dir.parent, int(run_dir.name))
         findings = find_issues(metrics, prior)

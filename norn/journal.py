@@ -186,6 +186,11 @@ class RunJournal:
         self._run_path = directory / "run.json"
         self._stage_seq = 0
 
+    @property
+    def dir(self) -> Path:
+        """The run directory this journal writes to."""
+        return self._dir
+
     @classmethod
     def open(cls, state_key: str, journal_run_id: int) -> RunJournal:
         """Create a journal for a new run, creating the directory."""

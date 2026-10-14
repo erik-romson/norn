@@ -437,3 +437,11 @@ def test_runner_records_the_history_run_id(tmp_path):
     recorded = _json.loads((rd / "run.json").read_text())["history_run_id"]
     assert recorded == 1
     assert history_run_id(rd) == 1
+
+
+def test_run_journal_dir_property(tmp_path):
+    """The public ``dir`` property returns the run directory."""
+    from norn.journal import RunJournal
+
+    journal = RunJournal(tmp_path / "7")
+    assert journal.dir == tmp_path / "7"
