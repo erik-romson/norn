@@ -98,3 +98,18 @@ def test_bundled_pipeline_names_are_versioned() -> None:
     """Every bundled pipeline name carries a ``_v<N>`` suffix."""
     for info in list_pipelines():
         assert re.match(r"^[a-z0-9_]+_v[0-9]+$", info.name), info.name
+
+
+def test_every_copy_has_its_original() -> None:
+    """Every ``<base>_v<N>`` with N > 1 is listed alongside ``<base>_v<N-1>``."""
+    names = {info.name for info in list_pipelines()}
+    copies = 0
+    for name in names:
+        m = re.match(r"^(?P<base>[a-z0-9_]+)_v(?P<n>[0-9]+)$", name)
+        assert m, name
+        n = int(m.group("n"))
+        if n > 1:
+            copies += 1
+            predecessor = f"{m.group('base')}_v{n - 1}"
+            assert predecessor in names, f"{name} has no predecessor {predecessor}"
+    assert copies > 0

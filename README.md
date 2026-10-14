@@ -428,6 +428,56 @@ A few halts are structural, not bugs to route around:
 | `base_build_red`, `base_build_timeout` | The merge landed and the base build is red. Fix the base. |
 | `unexpected_failure` | Read `## Why it stopped` in the summary. Transient (gh 5xx, network)? Rerun. Else fix the cause. `Status` in the summary says whether the merge landed. |
 
+## Versioned copies
+
+Pipelines that were changed get a new copy with a higher version number; the
+original stays frozen as the control. Each copy replaces its original, which is
+then deleted, once both have enough runs to compare with `norn compare`.
+
+### implement_features_v3
+
+A copy of [`implement_features_v2`](#implement_features_v2) (see there for the
+steps, gates and review). It runs the same way:
+`norn run implement_features_v3 <feature-dir>`. What differs is the name; its
+snapshot markers live under their own `implement_features_v3` path, so a v2 run
+and a v3 run of the same feature directory never share state.
+
+### plan_with_review_v2
+
+A copy of [`plan_with_review_v1`](#plan_with_review_v1) (see there for the flow
+and knobs), built on its own `_plan_review_v2.py`/`_plan_gates_v2.py`. It splits
+the finished plan into step files for `implement_features_v3`.
+
+### fix_jira_issue_v2
+
+A copy of [`fix_jira_issue_v1`](#fix_jira_issue_v1) (see there for the flow and
+knobs). It shares the v2 plan-review builder with `plan_with_review_v2` and runs
+`implement_features_v3` as its child implementation run.
+
+### check_and_fix_ci_v2
+
+Pushes the current branch, waits for CI, and feeds the failing GitHub Actions
+logs back to Claude until the run is green. It works on whatever is already
+committed on the current branch; it has no plan-step loop. It runs the local
+tests first (`--arg test_cmd=...` overrides the command, `--arg skip_local=true`
+skips them).
+
+```bash
+norn run check_and_fix_ci_v2
+# Check more than one workflow, in order (default: ci.yml)
+norn run check_and_fix_ci_v2 --arg workflow=ci.yml,release.yml
+```
+
+`--arg workflow=` takes a comma-separated list of workflow filenames; the first
+one that is not green is the one that gets fixed. It is a copy of
+`check_and_fix_ci_v1`.
+
+### merge_branch_v2
+
+A copy of [`merge_branch_v1`](#merge_branch_v1) (see there for the stages, halts
+and knobs). The one difference in this step is the child: red PR checks start a
+`check_and_fix_ci_v2` run instead of `check_and_fix_ci_v1`.
+
 ## Renamed pipelines
 
 Every bundled pipeline now carries a version suffix. The `_v1` pipelines are the
