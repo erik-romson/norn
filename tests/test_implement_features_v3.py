@@ -6962,7 +6962,8 @@ def test_build_followups_with_nothing_writes_none() -> None:
 
 @pytest.mark.asyncio
 async def test_write_followups_stage_reads_the_round_artifacts(tmp_path, monkeypatch) -> None:
-    mod = _import_v2(GOOD_DIR)
+    from norn.models import PipelineContext, StageResult
+    mod = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
     feature = tmp_path / "feat"
     feature.mkdir()
     snap = tmp_path / "snap"
@@ -6981,7 +6982,11 @@ async def test_write_followups_stage_reads_the_round_artifacts(tmp_path, monkeyp
     monkeypatch.setitem(mod._review_paths[3], "prev_review", str(prev3))
     monkeypatch.setitem(mod._review_paths[1], "validated", str(validated))
 
-    result = await _stage(mod, "write followups").impl.run(None)
+    ctx = PipelineContext()
+    for name in ("review manifest 2", "review manifest 3", "record validated findings 1"):
+        ctx.results[name] = StageResult(name="", success=True, output="ran")
+
+    result = await _stage(mod, "write followups").impl.run(ctx)
 
     assert result.success
     assert result.output == "followups.md: 7 items"
@@ -7003,10 +7008,45 @@ async def test_write_followups_stage_always_writes_the_file(tmp_path, monkeypatc
         monkeypatch.setitem(mod._review_paths[n], "prev_review", str(tmp_path / f"none{n}.md"))
     monkeypatch.setitem(mod._review_paths[1], "validated", str(tmp_path / "none.md"))
 
-    result = await _stage(mod, "write followups").impl.run(None)
+    from norn.models import PipelineContext
+    result = await _stage(mod, "write followups").impl.run(PipelineContext())
 
     assert result.success and result.output == "followups.md: 0 items"
     assert (feature / "followups.md").read_text(encoding="utf-8").endswith("\n- none\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("validator", [(), _VALIDATOR_ON])
+async def test_write_followups_ignores_files_left_by_an_earlier_run(
+    tmp_path, monkeypatch, validator
+) -> None:
+    """Round 1 passed in this run: stale archives and verdicts from an old run are not read."""
+    from norn.models import PipelineContext
+    mod = _import_v2(GOOD_DIR, *validator)
+    feature = tmp_path / "feat"
+    feature.mkdir()
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    prev2, prev3 = snap / "p2.md", snap / "p3.md"
+    prev2.write_text(_ROUND1_REVIEW, encoding="utf-8")
+    prev3.write_text(_ROUND2_REVIEW, encoding="utf-8")
+    validated = snap / "v.md"
+    validated.write_text("B1: unresolved — no repro\nB2: rejected — wrong\n", encoding="utf-8")
+    review = feature / "review.md"
+    review.write_text(_FINAL_REVIEW, encoding="utf-8")
+    monkeypatch.setattr(mod, "FOLLOWUPS_MD", str(feature / "followups.md"))
+    monkeypatch.setattr(mod, "REVIEW_MD", str(review))
+    monkeypatch.setattr(mod, "feature_dir", str(feature))
+    monkeypatch.setitem(mod._review_paths[2], "prev_review", str(prev2))
+    monkeypatch.setitem(mod._review_paths[3], "prev_review", str(prev3))
+    monkeypatch.setitem(mod._review_paths[1], "validated", str(validated))
+
+    result = await _stage(mod, "write followups").impl.run(PipelineContext())
+
+    assert result.success and result.output == "followups.md: 0 items"
+    body = (feature / "followups.md").read_text(encoding="utf-8")
+    assert body.endswith("\n- none\n")
+    assert "deploy runbook" not in body and "unresolved by the validator" not in body
 
 
 @pytest.mark.parametrize("extra", [(), ("--arg", "learn=off")])

@@ -4675,16 +4675,23 @@ class _WriteFollowups(BaseStage):
             p = Path(path)
             return p.read_text(encoding="utf-8") if p.is_file() else None
 
-        sources = [
-            _review_paths[2]["prev_review"],   # round 1's review
-            _review_paths[3]["prev_review"],   # round 2's review
-            REVIEW_MD,                          # the final round
-        ]
+        # A round's archive counts only when that round ran in this
+        # invocation: the snapshot root persists across runs of one feature
+        # directory, so an archive or verdict file may belong to an earlier run.
+        sources: list[str] = []
+        for n in (2, 3):
+            if _stage_ran(ctx, f"review manifest {n}"):
+                sources.append(_review_paths[n]["prev_review"])  # round n-1's review
+        sources.append(REVIEW_MD)  # the final round
         texts = [t for t in (read_if_exists(p) for p in sources) if t is not None]
-        round1 = read_if_exists(_review_paths[2]["prev_review"])
+        round1 = None
+        if _stage_ran(ctx, "review manifest 2"):
+            round1 = read_if_exists(_review_paths[2]["prev_review"])
         if round1 is None:
             round1 = read_if_exists(REVIEW_MD) or ""
-        validated = read_if_exists(_review_paths[1]["validated"])
+        validated = None
+        if REVIEW_VALIDATOR_ON and _stage_ran(ctx, "record validated findings 1"):
+            validated = read_if_exists(_review_paths[1]["validated"])
         text, count = build_followups(Path(feature_dir).name, texts, validated, round1)
         target = Path(FOLLOWUPS_MD)
         target.parent.mkdir(parents=True, exist_ok=True)
