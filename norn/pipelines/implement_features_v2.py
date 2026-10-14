@@ -1410,7 +1410,8 @@ def _compute_aggregate_cmd_and_timeout() -> tuple[str, float]:
     """Compute AGGREGATE_CMD and AGGREGATE_TIMEOUT at import time.
 
     When ``index.md`` declares ``final_test_cmd``, that command is the aggregate
-    command and the timeout is ``DEFAULT_TEST_TIMEOUT``.  Otherwise, collect the
+    command and the timeout is the index ``test_timeout`` (``DEFAULT_TEST_TIMEOUT`` when
+    unset).  Otherwise, collect the
     unique ``validation_cmd`` values from ALL step files (including any that are
     resume-skipped), in file order, and join them with ``&&``, each preceded by
     an ``echo "=== <stem> ==="`` marker.  Duplicate commands are omitted so a
@@ -1419,7 +1420,7 @@ def _compute_aggregate_cmd_and_timeout() -> tuple[str, float]:
     ``DEFAULT_TEST_TIMEOUT``).
     """
     if FINAL_TEST_CMD is not None:
-        return FINAL_TEST_CMD, DEFAULT_TEST_TIMEOUT
+        return FINAL_TEST_CMD, feature_test_timeout or DEFAULT_TEST_TIMEOUT
 
     seen_cmds: set[str] = set()
     parts: list[str] = []
