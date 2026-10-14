@@ -5268,7 +5268,9 @@ def _learn_items(mod) -> list:
     """The pipeline items between `review passed` and `handoff manifest`."""
     items = mod.config.items
     names = [getattr(i, "name", None) for i in items]
-    return items[names.index("review passed") + 1 : names.index("handoff manifest")]
+    between = items[names.index("review passed") + 1 : names.index("handoff manifest")]
+    # `write followups` follows the learn stages and is not one of them.
+    return [i for i in between if getattr(i, "name", None) != "write followups"]
 
 
 def test_learn_stages_sit_between_review_passed_and_handoff_manifest() -> None:
@@ -6837,3 +6839,203 @@ def test_validated_check_does_not_confuse_b1_with_b10(tmp_path) -> None:
     assert proc.returncode != 0
     assert "B10" in proc.stderr
     assert _run_validated_check(tmp_path, "- B10: accepted\n", "B10: confirmed — real\n", review=review).returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Step 15: followups.md
+# ---------------------------------------------------------------------------
+
+_ROUND1_REVIEW = """VERDICT: NEEDS_FIXES
+Base: a
+Head: b
+
+## Blocking findings
+
+### B1 — Off by one in the loop
+Severity: major
+Confidence: 75
+Where: `src/a.py:10`
+Quote: for i in range(n + 1):
+
+### B2 — Missing guard
+Severity: critical
+Where: `src/b.py:4`
+
+## Non-blocking
+
+- minor: rename the helper (src/a.py:3)
+- nit: stray blank line (src/b.py:9)
+- a free-form worry about the docs
+
+## For the human
+
+- Update the deploy runbook
+"""
+
+_ROUND2_REVIEW = """VERDICT: NEEDS_FIXES
+
+## Blocking findings
+
+### B1 — Still wrong
+Severity: major
+
+## Non-blocking
+
+- nit: stray blank line (src/b.py:9)
+- major-50: maybe racy (src/c.py:7)
+
+## For the human
+
+- Update the deploy runbook
+- Check the quota with ops
+"""
+
+_FINAL_REVIEW = """VERDICT: PASS
+
+## Non-blocking
+
+- none
+
+## For the human
+
+- none
+"""
+
+
+def test_nonblocking_items_use_the_step_12_format_and_carry_free_form_lines() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.nonblocking_items(_ROUND1_REVIEW) == [
+        "- [ ] minor rename the helper (src/a.py:3)",
+        "- [ ] nit stray blank line (src/b.py:9)",
+        "- [ ] a free-form worry about the docs",
+    ]
+    assert mod.nonblocking_items(_FINAL_REVIEW) == []
+
+
+def test_human_items() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.human_items(_ROUND2_REVIEW) == [
+        "- [ ] human Update the deploy runbook",
+        "- [ ] human Check the quota with ops",
+    ]
+    assert mod.human_items(_FINAL_REVIEW) == []
+
+
+def test_build_followups_dedupes_across_three_rounds() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text, count = mod.build_followups(
+        "my-feature", [_ROUND1_REVIEW, _ROUND2_REVIEW, _FINAL_REVIEW], None, _ROUND1_REVIEW
+    )
+    assert text.startswith("# Follow-ups — my-feature\n\n## Unapplied review findings\n\n")
+    items = [line for line in text.splitlines() if line.startswith("- ")]
+    assert items == [
+        "- [ ] minor rename the helper (src/a.py:3)",
+        "- [ ] nit stray blank line (src/b.py:9)",
+        "- [ ] a free-form worry about the docs",
+        "- [ ] human Update the deploy runbook",
+        "- [ ] major-50 maybe racy (src/c.py:7)",
+        "- [ ] human Check the quota with ops",
+    ]
+    assert count == 6
+
+
+def test_build_followups_lists_unresolved_validator_items() -> None:
+    mod = _import_v2(GOOD_DIR)
+    validated = (
+        "B1: confirmed — reproduced\n"
+        "B2: unresolved — could not reach the code path\n"
+    )
+    text, count = mod.build_followups("f", [_FINAL_REVIEW], validated, _ROUND1_REVIEW)
+    assert count == 1
+    assert (
+        "- [ ] critical Missing guard (src/b.py:4) — unresolved by the validator: "
+        "could not reach the code path"
+    ) in text
+
+
+def test_build_followups_with_nothing_writes_none() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text, count = mod.build_followups("f", [_FINAL_REVIEW], None, "")
+    assert count == 0
+    assert text == "# Follow-ups — f\n\n## Unapplied review findings\n\n- none\n"
+
+
+@pytest.mark.asyncio
+async def test_write_followups_stage_reads_the_round_artifacts(tmp_path, monkeypatch) -> None:
+    mod = _import_v2(GOOD_DIR)
+    feature = tmp_path / "feat"
+    feature.mkdir()
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    prev2, prev3 = snap / "p2.md", snap / "p3.md"
+    prev2.write_text(_ROUND1_REVIEW, encoding="utf-8")
+    prev3.write_text(_ROUND2_REVIEW, encoding="utf-8")
+    review = feature / "review.md"
+    review.write_text(_FINAL_REVIEW, encoding="utf-8")
+    validated = snap / "v.md"
+    validated.write_text("B1: unresolved — no repro\nB2: rejected — wrong\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "FOLLOWUPS_MD", str(feature / "followups.md"))
+    monkeypatch.setattr(mod, "REVIEW_MD", str(review))
+    monkeypatch.setattr(mod, "feature_dir", str(feature))
+    monkeypatch.setitem(mod._review_paths[2], "prev_review", str(prev2))
+    monkeypatch.setitem(mod._review_paths[3], "prev_review", str(prev3))
+    monkeypatch.setitem(mod._review_paths[1], "validated", str(validated))
+
+    result = await _stage(mod, "write followups").impl.run(None)
+
+    assert result.success
+    assert result.output == "followups.md: 7 items"
+    body = (feature / "followups.md").read_text(encoding="utf-8")
+    assert body.startswith("# Follow-ups — feat\n")
+    assert "- [ ] major Off by one in the loop (src/a.py:10) — unresolved by the validator: no repro" in body
+    assert "Missing guard" not in body
+
+
+@pytest.mark.asyncio
+async def test_write_followups_stage_always_writes_the_file(tmp_path, monkeypatch) -> None:
+    mod = _import_v2(GOOD_DIR)
+    feature = tmp_path / "feat"
+    feature.mkdir()
+    monkeypatch.setattr(mod, "FOLLOWUPS_MD", str(feature / "followups.md"))
+    monkeypatch.setattr(mod, "REVIEW_MD", str(feature / "review.md"))
+    monkeypatch.setattr(mod, "feature_dir", str(feature))
+    for n in (2, 3):
+        monkeypatch.setitem(mod._review_paths[n], "prev_review", str(tmp_path / f"none{n}.md"))
+    monkeypatch.setitem(mod._review_paths[1], "validated", str(tmp_path / "none.md"))
+
+    result = await _stage(mod, "write followups").impl.run(None)
+
+    assert result.success and result.output == "followups.md: 0 items"
+    assert (feature / "followups.md").read_text(encoding="utf-8").endswith("\n- none\n")
+
+
+@pytest.mark.parametrize("extra", [(), ("--arg", "learn=off")])
+def test_write_followups_sits_after_the_learn_stages_before_handoff_manifest(extra) -> None:
+    from norn.dsl import Stage
+
+    mod = _import_v2(GOOD_DIR, *extra)
+    names = [i.name for i in mod.config.items if isinstance(i, Stage)]
+    idx = names.index("write followups")
+    assert names[idx + 1] == "handoff manifest"
+    if extra:
+        assert names[idx - 1] == "review passed"
+    else:
+        assert names[idx - 1] == "record learning outcome"
+    assert _stage(mod, "write followups").on_failure.name == "FAIL"
+
+
+def test_handoff_prompt_links_followups_with_the_stage_output() -> None:
+    for extra in ((), ("--arg", "learn=off")):
+        mod = _import_v2(GOOD_DIR, *extra)
+        prompt = _stage(mod, "handoff").impl.prompt
+        assert "**Follow-ups**" in prompt
+        assert mod.FOLLOWUPS_MD in prompt
+        assert "{write followups.output}" in prompt
+
+
+def test_final_audit_ignores_followups_inside_the_repo() -> None:
+    mod = _import_v2(GOOD_DIR)
+    flag = mod._ignore_flag_for(mod.FOLLOWUPS_MD)
+    assert flag.startswith(" --ignore ")
+    assert flag in mod._extra_ignore_flags
+    assert flag in mod._final_audit_cmd

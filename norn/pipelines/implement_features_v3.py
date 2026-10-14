@@ -138,6 +138,13 @@ moved, the index is dirty, or a repo file changed): an unreviewed change in a
 reviewed tree.  The handoff postcondition and the final audit still require
 HEAD to equal ``reviewed.head``.
 
+Follow-ups
+----------
+``write followups`` (after the learn stages, before ``handoff manifest``) always
+writes ``<feature_dir>/followups.md``: a checklist of the non-blocking findings,
+the ``## For the human`` items and the validator's ``unresolved`` findings no
+round applied.  The handoff links it; the final audit ignores it.
+
 Handoff model
 -------------
 Each step produces two handoff artefacts: a deterministic three-line facts file
@@ -4523,6 +4530,174 @@ if LEARN_ON:
         on_failure=fail,   # never fails: LearnOutcomeStage
     )
 
+
+# ===========================================================================
+# Follow-ups: the review findings nobody applied
+#
+# `write followups` runs after the learn stages (when they exist) and before
+# `handoff manifest`: the handoff links followups.md, and the handoff
+# postcondition lets only handoff.md change during the handoff.
+# ===========================================================================
+
+FOLLOWUPS_MD = os.path.join(feature_dir, "followups.md")
+WRITE_FOLLOWUPS_STAGE = "write followups"
+
+# `- <minor|nit|major-50|critical-50>: <finding> (<file>:<line>)` (step 12 format).
+_NONBLOCKING_LINE_RE = re.compile(
+    r"^-\s+(minor|nit|major-50|critical-50):\s+(.*\S\s*\([^()]*:[^()]*\))\s*$"
+)
+
+
+def review_section(text: str, heading: str) -> list[str]:
+    """The lines of the ``## <heading>`` section of a review document."""
+    out: list[str] = []
+    inside = False
+    for line in (text or "").splitlines():
+        match = re.match(r"^##\s+(.*?)\s*$", line)
+        if match and not line.startswith("###"):
+            inside = match.group(1).lower() == heading.lower()
+        elif inside:
+            out.append(line)
+    return out
+
+
+def _is_none_line(text: str) -> bool:
+    return text.strip().rstrip(".").strip().lower() in {"none", "nothing", "n/a", ""}
+
+
+def nonblocking_items(review_text: str) -> list[str]:
+    """``- [ ] <severity> <finding> (<file>:<line>)`` per ``## Non-blocking`` line.
+
+    A line that does not match the step 12 format is carried verbatim.
+    """
+    items: list[str] = []
+    for raw in review_section(review_text, "Non-blocking"):
+        line = raw.strip()
+        if not line.startswith("-"):
+            continue
+        body = line[1:].strip()
+        if _is_none_line(body):
+            continue
+        match = _NONBLOCKING_LINE_RE.match(line)
+        if match:
+            items.append(f"- [ ] {match.group(1)} {match.group(2).strip()}")
+        else:
+            items.append(f"- [ ] {body}")
+    return items
+
+
+def human_items(review_text: str) -> list[str]:
+    """``- [ ] human <text>`` per entry of the ``## For the human`` section."""
+    items: list[str] = []
+    for raw in review_section(review_text, "For the human"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        body = re.sub(r"^[-*]\s+", "", line).strip()
+        if _is_none_line(body):
+            continue
+        items.append(f"- [ ] human {body}")
+    return items
+
+
+def blocking_finding_fields(review_text: str, fid: str) -> dict[str, str]:
+    """``title``, ``Severity`` and ``Where`` of the ``### <fid>`` finding, when present."""
+    fields: dict[str, str] = {}
+    in_blocking = False
+    in_finding = False
+    for line in (review_text or "").splitlines():
+        if line.startswith("## ") and not line.startswith("###"):
+            in_blocking = re.match(r"^## Blocking findings[ \t]*$", line) is not None
+            in_finding = False
+        elif in_blocking and line.startswith("### "):
+            head = re.match(rf"^### {re.escape(fid)}(?![0-9])\s*(?:—|–|-+|:)?\s*(.*?)\s*$", line)
+            in_finding = head is not None
+            if head:
+                fields["title"] = head.group(1)
+        elif in_blocking and in_finding:
+            kv = re.match(r"^\s*(Severity|Where):\s*(.*?)\s*$", line)
+            if kv and kv.group(1) not in fields:
+                fields[kv.group(1)] = kv.group(2).strip().strip("`").strip()
+    return fields
+
+
+def unresolved_items(validated_text: str, round1_review_text: str) -> list[str]:
+    """Follow-up items for the ``unresolved`` lines of ``review-1.validated.md``."""
+    items: list[str] = []
+    for line in (validated_text or "").splitlines():
+        match = _VERDICT_LINE_RE.match(line)
+        if not match or match.group(2).lower() != "unresolved":
+            continue
+        fid = match.group(1)
+        reason = " ".join(match.group(3).split()) or "no reason given"
+        fields = blocking_finding_fields(round1_review_text, fid)
+        severity = fields.get("Severity") or "blocking"
+        title = fields.get("title") or fid
+        where = f" ({fields['Where']})" if fields.get("Where") else ""
+        items.append(f"- [ ] {severity} {title}{where} — unresolved by the validator: {reason}")
+    return items
+
+
+def render_followups(feature_name: str, items: list[str]) -> tuple[str, int]:
+    """The text of ``followups.md`` and its item count; identical items keep their first place."""
+    unique: list[str] = []
+    for item in items:
+        if item not in unique:
+            unique.append(item)
+    body = "\n".join(unique) if unique else "- none"
+    text = f"# Follow-ups — {feature_name}\n\n## Unapplied review findings\n\n{body}\n"
+    return text, len(unique)
+
+
+def build_followups(
+    feature_name: str,
+    review_texts: list[str],
+    validated_text: str | None,
+    round1_review_text: str,
+) -> tuple[str, int]:
+    """Assemble ``followups.md`` from the review documents, oldest round first."""
+    items: list[str] = []
+    for text in review_texts:
+        items.extend(nonblocking_items(text))
+        items.extend(human_items(text))
+    if validated_text:
+        items.extend(unresolved_items(validated_text, round1_review_text))
+    return render_followups(feature_name, items)
+
+
+class _WriteFollowups(BaseStage):
+    """``write followups``: ``<feature_dir>/followups.md`` from the rounds' reviews."""
+
+    needs_agent = False
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        def read_if_exists(path: str) -> str | None:
+            p = Path(path)
+            return p.read_text(encoding="utf-8") if p.is_file() else None
+
+        sources = [
+            _review_paths[2]["prev_review"],   # round 1's review
+            _review_paths[3]["prev_review"],   # round 2's review
+            REVIEW_MD,                          # the final round
+        ]
+        texts = [t for t in (read_if_exists(p) for p in sources) if t is not None]
+        round1 = read_if_exists(_review_paths[2]["prev_review"])
+        if round1 is None:
+            round1 = read_if_exists(REVIEW_MD) or ""
+        validated = read_if_exists(_review_paths[1]["validated"])
+        text, count = build_followups(Path(feature_dir).name, texts, validated, round1)
+        target = Path(FOLLOWUPS_MD)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return StageResult(name="", success=True, output=f"followups.md: {count} items")
+
+
+pipeline.stage(
+    WRITE_FOLLOWUPS_STAGE,
+    _WriteFollowups(),
+    on_failure=fail,
+)
+
 # ===========================================================================
 # Handoff phase: deterministic write from a pipeline-assembled manifest
 #
@@ -4611,6 +4786,8 @@ def _handoff_prompt() -> str:
         "changes` in the manifest below)\n"
         "- **Review**: quote the verdict line exactly from the review document\n"
         "- **Learning**: quote the first line of the learning outcome below exactly\n"
+        f"- **Follow-ups**: link `{FOLLOWUPS_MD}` and quote its count line "
+        "exactly: {write followups.output}\n"
         "- **For the human**: the `Copy to commit:` command and the "
         "`Instruction-file note:` line of the learning outcome below, verbatim, "
         "when it has them; `nothing` otherwise. The learning is a proposal: "
@@ -4719,10 +4896,13 @@ _handoff_ignore_flag_audit = (
 )
 # The fixer's triage files are written for the pipeline, not committed.
 _triage_ignore_flags_audit = _triage_ignore_flag(1) + _triage_ignore_flag(2)
+# followups.md is written for the human, not committed.
+_followups_ignore_flag_audit = _ignore_flag_for(FOLLOWUPS_MD)
 _extra_ignore_flags = (
     _review_ignore_flag_audit
     + _handoff_ignore_flag_audit
     + _triage_ignore_flags_audit
+    + _followups_ignore_flag_audit
     + NORN_STATE_IGNORE_FLAGS
 )
 
