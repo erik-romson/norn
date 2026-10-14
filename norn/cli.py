@@ -285,6 +285,24 @@ def main() -> None:
         help="Check the '## Pass bar' lines of a feedback digest against one pipeline",
     )
 
+    digest_parser = sub.add_parser(
+        "feedback-digest",
+        help="Turn the evaluation output of the last N runs into ranked change proposals with a pass bar",
+    )
+    digest_parser.add_argument("pipeline", metavar="PIPELINE", help="Pipeline (state key) whose journaled runs to read")
+    digest_parser.add_argument(
+        "--last", type=int, default=10, metavar="N", help="Journaled runs to read (default: 10)"
+    )
+    digest_parser.add_argument(
+        "--model", default="standard", metavar="LABEL", help="Digest model label (default: standard). See `norn models`."
+    )
+    digest_parser.add_argument(
+        "--max-cost", type=float, default=5.0, metavar="USD", help="Maximum digest cost in USD (default: 5.0)"
+    )
+    digest_parser.add_argument(
+        "--agent-provider", default=None, metavar="PROVIDER", help="Agent provider to use for the digest"
+    )
+
     sub.add_parser("orgs", help="List available org configs")
 
     sub.add_parser("list-stages", help="List all registered stage plugins")
@@ -397,6 +415,28 @@ def main() -> None:
             _ui.print_history_comparison(records, run_a, run_b, state_key=_history_state_key)
         else:
             _ui.print_history_table(records, state_key=_history_state_key)
+        return
+
+    if args.command == "feedback-digest":
+        from norn import compare as _compare
+        from norn import feedback_digest as _fd
+
+        if remaining:
+            parser.error(f"feedback-digest: unrecognized arguments: {' '.join(remaining)}")
+        if args.last < 1:
+            parser.error("feedback-digest: --last must be at least 1")
+        try:
+            digest = asyncio.run(_fd.feedback_digest(
+                args.pipeline,
+                last=args.last,
+                model=args.model,
+                max_cost_usd=args.max_cost,
+                provider_name=args.agent_provider,
+            ))
+        except (_fd.FeedbackDigestError, _compare.CompareError) as exc:
+            print(f"feedback-digest: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(_fd.format_digest_summary(digest, args.pipeline))
         return
 
     if args.command == "compare":

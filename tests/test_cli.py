@@ -696,3 +696,24 @@ def test_compare_bar_reads_digest(capsys, tmp_path, monkeypatch):
     with patch("sys.argv", ["norn", "compare", "pa", "--bar", str(digest)]):
         main()
     assert "met" in capsys.readouterr().out
+
+
+# --- feedback-digest subcommand ---
+
+
+def test_feedback_digest_unknown_pipeline_exits_1(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    with patch("sys.argv", ["norn", "feedback-digest", "missing"]):
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code == 1
+    assert "missing" in capsys.readouterr().err
+
+
+def test_feedback_digest_help_lists_options(capsys):
+    with patch("sys.argv", ["norn", "feedback-digest", "--help"]):
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--last" in out and "--max-cost" in out and "--agent-provider" in out

@@ -745,6 +745,18 @@ uv run python -m norn compare implement_features_v3 --bar implement_features_v3.
 
 `norn compare` reads `metrics.json` (and `findings.json`) of each pipeline's journaled runs from the current directory. It prints the run count, success count and the median with min–max of `cost_usd`, `output_tokens`, `retries`, `failed_attempts` and `wall_ms`, then a verdict per metric: `too few runs (need 3)`, `within noise` (either median lies inside the other side's range) or `B lower`/`B higher`. Each `--group NAME=REGEX` adds the group's cost share and executed (not skipped) count. A group regex matches the bare stage name (`review 1`, `fix step-01`), not the journal node id (`stage:review 1`, `loop:…/stage:…`), so anchor it on the stage name. With `--bar <digest>` it checks each `## Pass bar` line as `met`, `unproven` (inside the baseline range, or fewer than 3 post runs) or `not met`. It exits 1 for an unknown pipeline or no journaled runs, and 2 for argument errors.
 
+### Feedback digest
+
+```bash
+# Turn the feedback of the last 10 runs into ranked prompt/AGENTS.md change proposals
+uv run python -m norn feedback-digest implement_features_v3 --last 10
+
+# Later, after the change has been made and enough new runs exist
+uv run python -m norn compare implement_features_v3 --bar implement_features_v3.runs/feedback-digest-1.md
+```
+
+`norn feedback-digest` reads `metrics.json`, `findings.json`, `rating.json` and `feedback.md` (capped at 4,000 characters) of the last N journaled runs (default 10; at least 2 with `metrics.json` and a history id are needed, or it exits 1). One read-only agent pass (`--model` label, default `standard`) deduplicates the feedback, ranks it by how many runs it recurs in and proposes changes, each with `Change:`, `Evidence runs:` and a `Bar: metric=… direction=lower|higher threshold=<number or %>`. A deterministic check validates every proposal (a metric from the `norn compare` vocabulary, evidence runs from the baseline, a parseable threshold); a valid set is written to `<state-key>.runs/feedback-digest-<k>.md` (the next free `k`, never overwriting) with a `## Pass bar` that is fixed before any change is made. An invalid set is kept as `feedback-digest-<k>.rejected.md` and the command exits 1. The digest's cost is printed on exit; it is outside the pipeline budget and history, and `--max-cost` (default `5.0` USD) fails the command when exceeded. `norn compare <pipeline> --bar <digest>` then says whether each bar is `met`, `unproven` or `not met`.
+
 Default labels: **light** for the stage judge, **standard** for the narrative feedback pass. Use `--model deep` to upgrade both. `--max-cost` defaults to `5.0` USD; the command exits with an error if the running evaluation spend would exceed it.
 
 Evaluation cost is reported separately and never added to the pipeline's history totals.
