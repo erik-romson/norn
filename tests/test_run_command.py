@@ -262,7 +262,9 @@ async def test_timeout_returns_the_output_captured_before_the_kill():
     assert not result.success
     assert "timed out" in result.error
     assert "before-hang" in result.output["stdout"]
-    assert [e.text for e in _command_output(seen)] == ["before-hang"]
+    # The shell may report the killed child on stderr, depending on which
+    # process in the group dies first, so only the stdout events are stable.
+    assert [e.text for e in _command_output(seen) if e.stream == "stdout"] == ["before-hang"]
 
 
 @pytest.mark.asyncio
