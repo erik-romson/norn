@@ -1588,6 +1588,28 @@ def test_implement_prompt_step01_has_no_prior_steps() -> None:
     assert "## Prior steps" not in prompt, "Step 01 must not have a '## Prior steps' section"
 
 
+def test_implement_prompt_has_build_what_was_asked_section() -> None:
+    """The implement prompt tells the agent to build only what was asked."""
+    mod = _import_v2(GOOD_DIR)
+    prompt = _get_implement_prompt(mod, "step-01-v2-fixture-alpha")
+    assert "## Build what was asked" in prompt
+    assert "NOT_BUILT" in prompt
+
+
+def test_closeout_prompt_fields_and_limit() -> None:
+    """The closeout prompt asks for the richer fields, in order, capped at 900."""
+    mod = _import_v2(GOOD_DIR)
+    prompt = mod._CLOSEOUT_PROMPT
+    fields = ["EVIDENCE:", "SETTLED:", "DEVIATIONS:", "NOT_BUILT:", "NEXT_CONSTRAINTS:", "RISKS:"]
+    positions = [prompt.index(f) for f in fields]
+    assert positions == sorted(positions)
+    assert "DECISIONS:" not in prompt
+    assert "Maximum 900 characters" in prompt
+    assert "700" not in prompt
+    assert "No preamble. Do not use tools." in prompt
+    assert "{" not in prompt and "}" not in prompt
+
+
 def test_implement_prompt_step02_has_facts_and_closeout_for_step01() -> None:
     """Step 02 prompt includes facts and closeout placeholders for step 01."""
     mod = _import_v2(GOOD_DIR)

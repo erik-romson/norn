@@ -94,7 +94,7 @@ Handoff model
 -------------
 Each step produces two handoff artefacts: a deterministic three-line facts file
 written by the commit shell (commit SHA+subject, changed paths, validation status)
-and a 700-character semantic closeout written by the step's own agent session in
+and a 900-character semantic closeout written by the step's own agent session in
 plan mode with one turn.  The implement prompt of each later step receives both
 artefacts via ``{facts <stem>.output}`` and ``{closeout <stem>.output}``
 placeholders, but only the two most-recent steps carry the closeout field — older
@@ -1060,12 +1060,14 @@ _CLOSEOUT_PROMPT = (
     "Produce the semantic handoff for later plan steps. Do not restate changed files,\n"
     "commit data, tests, or the original step. Output only:\n"
     "\n"
-    "DECISIONS:\n"
+    "EVIDENCE: the check you saw fail first, and the verification command\n"
+    "SETTLED: decisions a reviewer must not relitigate\n"
     "DEVIATIONS:\n"
+    "NOT_BUILT: what you considered and deliberately did not build, one line of reason each\n"
     "NEXT_CONSTRAINTS:\n"
     "RISKS:\n"
     "\n"
-    "Use `none` where appropriate. Maximum 700 characters. No preamble. Do not use tools."
+    "Use `none` where appropriate. Maximum 900 characters. No preamble. Do not use tools."
 )
 
 # Accumulates step stems in run order; used to build the prior-context section
@@ -1130,6 +1132,11 @@ def _implement_prompt(
         "command pass. This command is the acceptance contract — it must pass "
         "on a clean run.\n\n"
         f"{prior_section}"
+        "## Build what was asked\n\n"
+        "Build exactly what the step asks for. Add no guard, fallback, retry "
+        "or option the step did not ask for, unless a contract (AGENTS.md, "
+        "the step file, a test) requires it. Anything you considered and did "
+        "not build goes in the closeout's `NOT_BUILT` field.\n\n"
         f"## Step to implement\n\n"
         f"### Source: {step_file}\n\n"
         f"{step_body}\n\n"
