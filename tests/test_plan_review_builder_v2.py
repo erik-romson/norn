@@ -66,14 +66,18 @@ def test_stage_names_without_approval_pause():
     p = _build(pause_for_approval=False)
     assert _item_names(p) == [
         "preflight",
+        "check learning store",
         "draft plan",
         "resolve open questions",
         "open questions resolved",
+        "complete plan sections",
+        "plan sections present",
         "review plan",
         "review shape ok",
         "ClearContext",
         "apply review",
         "dispositions recorded",
+        "plan sections kept",
         "ClearContext",
         "split plan",
         "step files written",
@@ -85,15 +89,19 @@ def test_stage_names_with_approval_pause():
     p = _build(pause_for_approval=True)
     assert _item_names(p) == [
         "preflight",
+        "check learning store",
         "draft plan",
         "resolve open questions",
         "open questions resolved",
+        "complete plan sections",
+        "plan sections present",
         "wait for plan approval",
         "review plan",
         "review shape ok",
         "ClearContext",
         "apply review",
         "dispositions recorded",
+        "plan sections kept",
         "ClearContext",
         "split plan",
         "step files written",
@@ -179,7 +187,7 @@ def test_every_planning_agent_pins_its_subagents_to_the_standard_label():
     from norn.model_labels import resolve_label
 
     stages = _generate_stages(_build())
-    assert [s.name for s in stages] == ["draft plan", "revise plan", "apply findings", "write step files"]
+    assert [s.name for s in stages] == ["draft plan", "revise plan", "add plan sections", "apply findings", "write step files"]
     for stage in stages:
         assert stage.impl.env == {
             "CLAUDE_CODE_SUBAGENT_MODEL": resolve_label("claude-code", "standard").model,
@@ -288,3 +296,168 @@ async def test_assert_launch_tree_fails_when_working_dir_differs():
     assert result.success is False
     assert "working_dir=/other/tree" in (result.error or "")
     assert "/some/repo" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# Research depth, learnings and the required plan sections
+# ---------------------------------------------------------------------------
+
+_STORE_REL = "docs/solutions"
+_FINDER = "/opt/norn/_find_related.py"
+_RESEARCH = "/tmp/x-final-plan-research"
+
+
+def _draft() -> str:
+    from norn.pipelines._plan_review_v2 import draft_prompt
+
+    return draft_prompt(
+        preplan=_PREPLAN,
+        plan=_PLAN,
+        questions=_QUESTIONS,
+        store_rel=_STORE_REL,
+        finder=_FINDER,
+        research_dir=_RESEARCH,
+    )
+
+
+def test_draft_prompt_keeps_unattended_rules():
+    prompt = _draft()
+    assert "The plan runs unattended." in prompt
+    assert "Write no review gate, pause or approval wait" in prompt
+
+
+def test_draft_prompt_decides_depth_first():
+    prompt = _draft()
+    assert "Lightweight" in prompt and "Standard" in prompt
+    assert "CLI flags, environment variables, CI," in prompt
+    assert "launches no research subagents" in prompt
+    assert f"python3 {_FINDER} {_STORE_REL}" in prompt
+
+
+def test_draft_prompt_names_the_four_research_subagents():
+    prompt = _draft()
+    for name in ("repo-patterns", "learnings", "external-docs", "edge-cases"):
+        assert f"`{name}`" in prompt
+    assert f"{_RESEARCH}/<name>.md" in prompt
+    assert "3-5 line summary" in prompt
+    assert "no build, no test and no background task" in prompt
+    assert "Current code wins" in prompt
+    assert "at most 5" in prompt
+
+
+def test_draft_prompt_external_docs_triggers_and_deprecation_rule():
+    prompt = _draft()
+    for trigger in (
+        "the pre-plan asks for it",
+        "security, money, data loss, concurrency",
+        "adds a dependency or a\n  new major version",
+        "fewer than 3 local examples",
+    ):
+        assert trigger in prompt
+    assert "deprecation check of every API" in prompt
+
+
+def test_draft_prompt_requires_four_sections_and_self_check():
+    prompt = _draft()
+    for name in ("Prior learnings", "Assumptions", "Considered and not built", "Edge cases and flows"):
+        assert f"## {name}" in prompt
+    assert "none found" in prompt
+    assert "nobody asked for only if leaving" in prompt
+    assert "Verify every claim about existing code" in prompt
+    assert "State each rule in exactly one place" in prompt
+    assert "(input, action,\n  expected result)" in prompt
+
+
+def test_prompts_name_no_ce_skill_and_use_no_stray_braces():
+    from norn.pipelines._plan_review_v2 import apply_prompt, revise_prompt, sections_prompt
+
+    for prompt in (
+        _draft(),
+        revise_prompt(questions=_QUESTIONS, plan=_PLAN),
+        apply_prompt(plan=_PLAN, review=_REVIEW, response=_RESPONSE),
+        sections_prompt(plan=_PLAN),
+    ):
+        assert "ce-" not in prompt
+        assert "{" not in prompt.replace("{check plan sections.output}", "")
+        assert "}" not in prompt.replace("{check plan sections.output}", "")
+
+
+def test_revise_and_apply_prompts_keep_the_four_sections():
+    from norn.pipelines._plan_review_v2 import apply_prompt, revise_prompt
+
+    for prompt in (
+        revise_prompt(questions=_QUESTIONS, plan=_PLAN),
+        apply_prompt(plan=_PLAN, review=_REVIEW, response=_RESPONSE),
+    ):
+        assert "Keep the four required sections" in prompt
+        assert "## Considered and not built" in prompt
+
+
+def test_web_tools_are_on_the_draft_stage_only():
+    stages = _generate_stages(_build())
+    for stage in stages:
+        tools = stage.impl.allowed_tools
+        if stage.name == "draft plan":
+            assert "WebSearch" in tools and "WebFetch" in tools
+        else:
+            assert "WebSearch" not in tools and "WebFetch" not in tools, stage.name
+        assert "Task" not in tools
+
+
+def test_draft_stage_prompt_carries_store_finder_and_research_dir():
+    from norn.pipelines._plan_review_v2 import FINDER
+
+    stage = next(s for s in _generate_stages(_build()) if s.name == "draft plan")
+    prompt = stage.impl.prompt
+    assert FINDER in prompt
+    assert "docs/solutions" in prompt
+    assert "/tmp/x-final-plan-research" in prompt
+
+
+def test_plan_sections_wiring():
+    from norn.pipelines._plan_gates_v2 import PlanSectionsGate
+
+    p = _build()
+    loop = next(i for i in p.items if isinstance(i, Loop) and i.name == "complete plan sections")
+    assert [s.name for s in loop.stages] == ["add plan sections", "check plan sections"]
+    assert loop.max_retries == 2
+    assert loop.on_exhaust is OnFailure.ASK_USER
+    add = loop.stages[0]
+    assert "{check plan sections.output}" in add.impl.prompt
+    assert add.impl.model == "deep"
+    assert isinstance(loop.stages[1].impl, PlanSectionsGate)
+    for name in ("plan sections present", "plan sections kept"):
+        gate = next(i for i in p.items if isinstance(i, Stage) and i.name == name)
+        assert isinstance(gate.impl, PlanSectionsGate)
+        assert gate.impl.path == _PLAN
+        assert gate.on_failure is OnFailure.FAIL
+
+
+@pytest.mark.asyncio
+async def test_bad_store_config_fails_the_check_stage_and_does_not_raise(tmp_path):
+    cfg = tmp_path / ".compound-engineering"
+    cfg.mkdir()
+    (cfg / "config.yaml").write_text("docs_root: ../outside\n")
+    p = add_plan_review_stages(
+        Pipeline("t"),
+        preplan=_PREPLAN,
+        plan=_PLAN,
+        questions=_QUESTIONS,
+        review=_REVIEW,
+        response=_RESPONSE,
+        steps_dir=_STEPS_DIR,
+        repo_dir=str(tmp_path),
+        model="deep",
+        split_skill=_SPLIT_SKILL,
+    )
+    stage = next(i for i in p.items if isinstance(i, Stage) and i.name == "check learning store")
+    assert stage.on_failure is OnFailure.FAIL
+    result = await stage.impl.run(PipelineContext())
+    assert not result.success
+    assert "docs_root" in result.error
+
+
+@pytest.mark.asyncio
+async def test_good_store_config_passes_the_check_stage():
+    stage = next(i for i in _build().items if isinstance(i, Stage) and i.name == "check learning store")
+    assert (await stage.impl.run(PipelineContext())).success

@@ -129,14 +129,18 @@ def test_top_level_item_names():
             names.append("ClearContext")
     assert names == [
         "preflight",
+        "check learning store",
         "draft plan",
         "resolve open questions",
         "open questions resolved",
+        "complete plan sections",
+        "plan sections present",
         "review plan",
         "review shape ok",
         "ClearContext",
         "apply review",
         "dispositions recorded",
+        "plan sections kept",
         "ClearContext",
         "split plan",
         "step files written",
@@ -471,3 +475,19 @@ async def test_retry_with_fixed_file_passes_hard_gate(tmp_path):
 
     # The recorder MUST have run — the hard gate passed.
     assert recorder.ran
+
+
+def test_plan_sections_stages_follow_the_open_questions_gate():
+    mod = _import_plan_with_review()
+    names = [i.name for i in mod.config.items if isinstance(i, (Stage, Loop))]
+    assert names.index("open questions resolved") < names.index("complete plan sections")
+    assert names.index("complete plan sections") < names.index("plan sections present")
+    assert names.index("dispositions recorded") < names.index("plan sections kept")
+    assert len(names) == len(set(names))
+
+
+def test_draft_prompt_carries_the_research_contract():
+    mod = _import_plan_with_review()
+    assert mod.PLAN[:-3] + "-research" in mod._DRAFT_PROMPT
+    assert "_find_related.py" in mod._DRAFT_PROMPT
+    assert "## Prior learnings" in mod._DRAFT_PROMPT

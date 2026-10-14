@@ -135,14 +135,18 @@ def test_top_level_stage_names(tmp_path):
         "ClearContext",
         # Builder stages (from add_plan_review_stages):
         "preflight",
+        "check learning store",
         "draft plan",
         "resolve open questions",
         "open questions resolved",
+        "complete plan sections",
+        "plan sections present",
         "review plan",
         "review shape ok",
         "ClearContext",
         "apply review",
         "dispositions recorded",
+        "plan sections kept",
         "ClearContext",
         "split plan",
         "step files written",
@@ -561,3 +565,14 @@ def test_prepare_branch_writes_base_sha_when_it_stays_put(tmp_path):
     assert r.returncode == 0, r.stderr
     base_sha = Path(mod.ART.dir + "base.sha")
     assert base_sha.read_text().strip() == _git(repo, "rev-parse", "HEAD")
+
+
+def test_plan_section_gates_come_through_the_builder(tmp_path):
+    mod = _import_default(tmp_path)
+    names = _collect_top_names(mod.config.items)
+    assert names.index("open questions resolved") < names.index("complete plan sections")
+    assert names.index("complete plan sections") < names.index("plan sections present")
+    assert names.index("dispositions recorded") < names.index("plan sections kept")
+    assert "check learning store" in names
+    real = [n for n in names if n != "ClearContext"]
+    assert len(real) == len(set(real))

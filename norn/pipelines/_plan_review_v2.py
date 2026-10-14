@@ -8,7 +8,13 @@ from typing import Any
 from norn.dsl import Pipeline, Stage, ask_user, fail, stage_failed
 from norn.model_labels import resolve_label
 from norn.models import PipelineContext, StageResult
-from norn.pipelines._plan_gates_v2 import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate
+from norn.pipelines import _learnings
+from norn.pipelines._plan_gates_v2 import (
+    OpenQuestionsGate,
+    PlanSectionsGate,
+    ReviewDispositionGate,
+    StepFilesGate,
+)
 from norn.skills import Skill, resolve_skill_content
 from norn.stages.base import BaseStage
 from norn.stages.generate import Generate
@@ -70,11 +76,54 @@ class WaitForApproval(BaseStage):
 
 
 # ---------------------------------------------------------------------------
+# Learning store
+# ---------------------------------------------------------------------------
+
+
+def resolve_learning_store(repo_dir: str) -> tuple[str, str | None]:
+    """Return ``(store path relative to the repo, config error or None)``.
+
+    A bad ``docs_root`` is returned, not raised: a pipeline that raises at
+    import cannot be listed, so ``check learning store`` reports it instead.
+    """
+    try:
+        store = _learnings.resolve_store(repo_dir)
+    except _learnings.StoreConfigError as exc:
+        return "docs/solutions", str(exc)
+    return _learnings.store_relpath(repo_dir, store), None
+
+
+class CheckLearningStore(BaseStage):
+    """Fail with the store-config error captured at build time, or pass."""
+
+    needs_agent = False
+
+    def __init__(self, *, error: str | None) -> None:
+        super().__init__()
+        self._error = error
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        if self._error is not None:
+            return StageResult(
+                name="", success=False, error=f"learning store config is unusable: {self._error}"
+            )
+        return StageResult(name="", success=True)
+
+
+# ---------------------------------------------------------------------------
 # Prompt constructors
 # ---------------------------------------------------------------------------
 
 
-def draft_prompt(*, preplan: str, plan: str, questions: str) -> str:
+def draft_prompt(
+    *,
+    preplan: str,
+    plan: str,
+    questions: str,
+    store_rel: str,
+    finder: str,
+    research_dir: str,
+) -> str:
     return f"""\
 Read the pre-plan at {preplan} and produce two files:
 
@@ -125,6 +174,67 @@ the pre-plan asks for such a checkpoint, move what it guards out of the run:
   goes into the run report, which the human reviews after the run.
 
 Write no review gate, pause or approval wait into the plan.
+
+## Decide the research depth first
+
+Before any research, classify the work:
+
+- **Lightweight**: the pre-plan names a few files and the local patterns are
+  clear.
+- **Standard**: everything else. Touching CLI flags, environment variables, CI,
+  exported APIs, shared types or persisted data always makes it Standard.
+
+Lightweight launches no research subagents. Read the named files and their
+tests, and run `python3 {finder} {store_rel} <keywords>` (from the repo root)
+to read the titles of the prior learnings.
+
+## Standard research
+
+A Standard run launches research subagents. They run on a cheaper model. Each
+subagent writes its full report to `{research_dir}/<name>.md` and returns a
+3-5 line summary. Open a report only when its summary could change a decision.
+Subagents only read: they run no build, no test and no background task.
+
+- `repo-patterns`: the files to touch, their tests, the conventions, and the
+  real test commands, read from the build files. Report only findings that
+  change the plan.
+- `learnings`, only when the learning store `{store_rel}` holds at least one
+  `.md` file: run `python3 {finder} {store_rel} <keywords>` (it lists title,
+  tags, module, component, problem_type and applies_when for 3-25 candidates),
+  read the 30-line head of each candidate and return at most 5. Flag any
+  learning that conflicts with current code. Current code wins: never let a
+  past learning silently override present evidence.
+- `external-docs`, only when the pre-plan asks for it, the topic is high-risk
+  (security, money, data loss, concurrency), the change adds a dependency or a
+  new major version, or the repo has fewer than 3 local examples. You may use
+  WebSearch and WebFetch for it. When it runs, a deprecation check of every API
+  the plan uses is mandatory.
+- `edge-cases`, in every Standard run: map the flows, unhappy paths and state
+  transitions. Each gap becomes a question in {questions} (with "Why it
+  matters" and "Assumption if unanswered") or a test scenario in the step that
+  owns it.
+
+## Required sections
+
+The plan MUST contain these four sections, each with a body; a gate checks them:
+
+- `## Prior learnings`: the cited learning paths and the decision each one
+  changed, or `none found`.
+- `## Assumptions`: every unconfirmed default. Never fold an assumption
+  silently into a step.
+- `## Considered and not built`: one line of reason per item, plus the evidence
+  that would change the call. Build something nobody asked for only if leaving
+  it out causes harm nobody would catch in time, or adding it later is
+  expensive (stored data, a public interface, money, security). A review
+  concern does not become a new mechanism by default.
+- `## Edge cases and flows`.
+
+## Self-check before you write the plan
+
+- Verify every claim about existing code in the repo.
+- Every step names its test file and concrete scenarios (input, action,
+  expected result).
+- State each rule in exactly one place.
 """
 
 
@@ -140,6 +250,28 @@ The human has filled in some or all `**Answer:**` slots.
      with new or refined questions.
    - Never blank an `**Answer:**` slot the human already filled.
    - Never invent an answer on the human's behalf.
+3. Keep the four required sections in {plan} (`## Prior learnings`,
+   `## Assumptions`, `## Considered and not built`,
+   `## Edge cases and flows`), and add any the plan lacks.
+"""
+
+
+def sections_prompt(*, plan: str) -> str:
+    return f"""\
+The plan at {plan} lacks required sections, or they are empty:
+
+{{check plan sections.output}}
+
+Add each missing section to {plan} as a `## <name>` heading with a real body,
+from what the plan and the repo already say; do not rewrite the rest of the
+plan. The four required sections are:
+
+- `## Prior learnings`: cited learning paths and the decision each one changed,
+  or `none found`.
+- `## Assumptions`: every unconfirmed default.
+- `## Considered and not built`: one line of reason per item, plus the evidence
+  that would change the call.
+- `## Edge cases and flows`.
 """
 
 
@@ -188,6 +320,10 @@ Read the plan at {plan} and the codex review at {review}.
    - Every `F<n>` heading in {review} MUST appear in {response},
      including findings you reject.
    - Each line must contain `accepted`, `rejected`, or `deferred`.
+
+3. Keep the four required sections in {plan} (`## Prior learnings`,
+   `## Assumptions`, `## Considered and not built`,
+   `## Edge cases and flows`), and add any the plan lacks.
 """
 
 
@@ -245,6 +381,14 @@ rejects — a retry lands you back here with the same instructions.
 # ---------------------------------------------------------------------------
 
 _TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+
+# The draft stage alone may fetch external docs.  `Task` is deliberately not
+# listed: allowed_tools only pre-approves tools, and the subagent tool needs no
+# approval.  The web tools do.
+_DRAFT_TOOLS = _TOOLS + ["WebSearch", "WebFetch"]
+
+# The research helper that ranks related learnings (stdlib only; run as a script).
+FINDER = str(Path(__file__).resolve().parent / "_find_related.py")
 
 # Subagents a planning stage spawns (Explore, general-purpose) run on this
 # label, not on the stage's own, usually `deep`, model.  The built-in Explore
@@ -304,11 +448,24 @@ def add_plan_review_stages(
         questions resolved`` so a human can inspect and edit the plan before
         the codex review runs.
     """
-    _draft_p = draft_prompt(preplan=preplan, plan=plan, questions=questions)
+    # A bad store config must not raise here (an unloadable pipeline cannot be
+    # listed); the `check learning store` stage reports it instead.
+    store_rel, store_error = resolve_learning_store(repo_dir)
+    research_dir = (plan[:-3] if plan.endswith(".md") else plan) + "-research"
+
+    _draft_p = draft_prompt(
+        preplan=preplan,
+        plan=plan,
+        questions=questions,
+        store_rel=store_rel,
+        finder=FINDER,
+        research_dir=research_dir,
+    )
     _revise_p = revise_prompt(questions=questions, plan=plan)
     _review_p = review_prompt(plan=plan, preplan=preplan, review=review)
     _apply_p = apply_prompt(plan=plan, review=review, response=response)
     _split_p = split_prompt(plan=plan, steps_dir=steps_dir)
+    _sections_p = sections_prompt(plan=plan)
 
     _subagent_env = {
         "CLAUDE_CODE_SUBAGENT_MODEL": resolve_label("claude-code", _SUBAGENT_LABEL).model,
@@ -334,13 +491,20 @@ def add_plan_review_stages(
         on_failure=fail,
     )
 
+    # 0b. A bad `docs_root` is reported by a stage, never raised at import.
+    pipeline.stage(
+        "check learning store",
+        CheckLearningStore(error=store_error),
+        on_failure=fail,
+    )
+
     # 1. Draft the plan + the questions file.
     pipeline.stage(
         "draft plan",
         Generate(
             prompt=_draft_p,
             model=model,
-            allowed_tools=_TOOLS,
+            allowed_tools=_DRAFT_TOOLS,
             permission_mode="acceptEdits",
             setting_sources=["project"],
             env=_subagent_env,
@@ -374,6 +538,34 @@ def add_plan_review_stages(
     pipeline.stage(
         "open questions resolved",
         OpenQuestionsGate(path=questions),
+        on_failure=fail,
+    )
+
+    # 2b'. The four required sections.  The loop repairs; the top-level gate
+    # after it is the contract (`c` at an exhausted loop counts as success).
+    pipeline.loop(
+        "complete plan sections",
+        max_retries=2,
+        on_exhaust=ask_user,
+        stages=[
+            Stage(
+                "add plan sections",
+                Generate(
+                    prompt=_sections_p,
+                    model=model,
+                    allowed_tools=_TOOLS,
+                    permission_mode="acceptEdits",
+                    setting_sources=["project"],
+                    env=_subagent_env,
+                ),
+                when=stage_failed("check plan sections"),
+            ),
+            Stage("check plan sections", PlanSectionsGate(path=plan)),
+        ],
+    )
+    pipeline.stage(
+        "plan sections present",
+        PlanSectionsGate(path=plan),
         on_failure=fail,
     )
 
@@ -447,6 +639,13 @@ def add_plan_review_stages(
     pipeline.stage(
         "dispositions recorded",
         ReviewDispositionGate(review=review, response=response),
+        on_failure=fail,
+    )
+
+    # 4c. Applying the review must not have dropped a required section.
+    pipeline.stage(
+        "plan sections kept",
+        PlanSectionsGate(path=plan),
         on_failure=fail,
     )
 

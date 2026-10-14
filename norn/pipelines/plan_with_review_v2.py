@@ -17,9 +17,11 @@ from norn.model_labels import ModelLabelError, labels_for, resolve_label
 from norn.pipelines._plan_gates_v2 import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate  # noqa: F401
 from norn.pipelines._plan_review_v2 import (
     WaitForApproval,  # noqa: F401
+    FINDER,
     add_plan_review_stages,
     apply_prompt,
     draft_prompt,
+    resolve_learning_store,
     resolve_split_skill,
     revise_prompt,
     review_prompt,
@@ -57,7 +59,15 @@ _split_skill = resolve_split_skill
 SPLIT_SKILL = _split_skill()
 
 # Prompt constants (re-exported so existing tests can read them via mod._DRAFT_PROMPT etc.)
-_DRAFT_PROMPT = draft_prompt(preplan=PREPLAN, plan=PLAN, questions=QUESTIONS)
+_STORE_REL, _STORE_ERROR = resolve_learning_store(REPO_DIR)  # the error is reported by a stage
+_DRAFT_PROMPT = draft_prompt(
+    preplan=PREPLAN,
+    plan=PLAN,
+    questions=QUESTIONS,
+    store_rel=_STORE_REL,
+    finder=FINDER,
+    research_dir=PLAN[:-3] + "-research",
+)
 _REVISE_PROMPT = revise_prompt(questions=QUESTIONS, plan=PLAN)
 _REVIEW_PROMPT = review_prompt(plan=PLAN, preplan=PREPLAN, review=REVIEW)
 _APPLY_PROMPT = apply_prompt(plan=PLAN, review=REVIEW, response=RESPONSE)

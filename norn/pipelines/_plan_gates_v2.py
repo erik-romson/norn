@@ -286,6 +286,99 @@ class ReviewDispositionGate(BaseStage):
         return StageResult(name="", success=True)
 
 
+# ---------------------------------------------------------------------------
+# Required plan sections
+# ---------------------------------------------------------------------------
+
+REQUIRED_PLAN_SECTIONS = (
+    "Prior learnings",
+    "Assumptions",
+    "Considered and not built",
+    "Edge cases and flows",
+)
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def missing_plan_sections(text: str) -> list[str]:
+    """Return the names in ``REQUIRED_PLAN_SECTIONS`` the plan lacks, in order.
+
+    A section is present when a level 2-4 heading's text starts with its name
+    (case-insensitive) and has a non-empty body: any non-blank line before the
+    next heading of the same or a higher level.  Lines inside fenced code
+    blocks are never headings.
+    """
+    # (line index, level, text) for every real heading
+    headings: list[tuple[int, int, str]] = []
+    lines = text.splitlines()
+    in_fence = False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _HEADING_RE.match(line)
+        if m:
+            headings.append((i, len(m.group(1)), m.group(2)))
+
+    def has_body(pos: int) -> bool:
+        start, level, _ = headings[pos]
+        end = len(lines)
+        for nxt_i, nxt_level, _t in headings[pos + 1:]:
+            if nxt_level <= level:
+                end = nxt_i
+                break
+        return any(line.strip() for line in lines[start + 1:end])
+
+    missing: list[str] = []
+    for name in REQUIRED_PLAN_SECTIONS:
+        lowered = name.lower()
+        found = any(
+            2 <= level <= 4 and title.lower().startswith(lowered) and has_body(pos)
+            for pos, (_i, level, title) in enumerate(headings)
+        )
+        if not found:
+            missing.append(name)
+    return missing
+
+
+class PlanSectionsGate(BaseStage):
+    """Fail when the plan lacks one of the four required sections.
+
+    The missing names are also the stage output, on failure too, so a repair
+    prompt can quote ``{check plan sections.output}``.
+    """
+
+    needs_agent = False
+
+    def __init__(self, *, path: str) -> None:
+        self.path = path
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        resolved = resolve_run_path(ctx, self.path)
+        if not resolved.exists():
+            return StageResult(
+                name="",
+                success=False,
+                error=f"plan file not written: {resolved}",
+            )
+        missing = missing_plan_sections(resolved.read_text())
+        if not missing:
+            return StageResult(name="", success=True)
+        return StageResult(
+            name="",
+            success=False,
+            output="\n".join(missing),
+            error=format_gate_error(
+                f"{len(missing)} required plan sections are missing or empty in {resolved}",
+                missing,
+                "Write each as a `## <name>` section with a body, then [r]etry.",
+            ),
+        )
+
+
 # Values that satisfy the YAML key but never catch a regression.
 _PLACEHOLDER_TEST_CMDS = {"true", "false", ":", "/bin/true"}
 

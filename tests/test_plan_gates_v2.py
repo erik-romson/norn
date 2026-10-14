@@ -705,3 +705,113 @@ def test_gate_key_sets_match_implement_features_v3():
     v2 = _import_v2(GOOD_DIR)
     assert V3_STEP_KEYS == frozenset(v2._STEP_ALLOWED)
     assert V3_INDEX_KEYS == frozenset(v2._INDEX_ALLOWED)
+
+
+# ---------------------------------------------------------------------------
+# Required plan sections
+# ---------------------------------------------------------------------------
+
+from norn.pipelines._plan_gates_v2 import (  # noqa: E402
+    REQUIRED_PLAN_SECTIONS,
+    PlanSectionsGate,
+    missing_plan_sections,
+)
+
+_FULL_PLAN = """\
+# Plan
+
+## Prior learnings
+none found
+
+## Assumptions
+- Python 3.13.
+
+## Considered and not built
+- A cache: no measured need.
+
+## Edge cases and flows
+- Empty input.
+"""
+
+
+def test_required_plan_sections_names():
+    assert REQUIRED_PLAN_SECTIONS == (
+        "Prior learnings",
+        "Assumptions",
+        "Considered and not built",
+        "Edge cases and flows",
+    )
+
+
+def test_missing_plan_sections_all_present():
+    assert missing_plan_sections(_FULL_PLAN) == []
+
+
+def test_missing_plan_sections_one_missing():
+    text = _FULL_PLAN.replace("## Assumptions\n- Python 3.13.\n\n", "")
+    assert missing_plan_sections(text) == ["Assumptions"]
+
+
+def test_missing_plan_sections_empty_body_counts_as_missing():
+    text = _FULL_PLAN.replace("none found\n", "\n")
+    assert missing_plan_sections(text) == ["Prior learnings"]
+
+
+def test_missing_plan_sections_empty_body_before_same_level_heading():
+    text = "## Prior learnings\n\n## Assumptions\nx\n"
+    assert "Prior learnings" in missing_plan_sections(text)
+    assert "Assumptions" not in missing_plan_sections(text)
+
+
+def test_missing_plan_sections_subheading_is_body():
+    text = _FULL_PLAN.replace("none found\n", "### Cited\n")
+    assert missing_plan_sections(text) == []
+
+
+def test_missing_plan_sections_level_one_heading_ignored():
+    text = _FULL_PLAN.replace("## Assumptions", "# Assumptions")
+    assert missing_plan_sections(text) == ["Assumptions"]
+
+
+def test_missing_plan_sections_levels_two_to_four_and_case_insensitive():
+    text = (
+        "### prior LEARNINGS (cited)\nx\n"
+        "#### ASSUMPTIONS\nx\n"
+        "## considered and not built\nx\n"
+        "## Edge cases and flows\nx\n"
+    )
+    assert missing_plan_sections(text) == []
+    assert missing_plan_sections("##### Assumptions\nx\n") != []
+
+
+def test_missing_plan_sections_heading_inside_fence_is_ignored():
+    text = "```\n## Assumptions\nx\n```\n"
+    assert "Assumptions" in missing_plan_sections(text)
+
+
+def test_missing_plan_sections_everything_missing():
+    assert missing_plan_sections("") == list(REQUIRED_PLAN_SECTIONS)
+
+
+@pytest.mark.asyncio
+async def test_plan_sections_gate_passes(tmp_path):
+    (tmp_path / "plan.md").write_text(_FULL_PLAN)
+    result = await PlanSectionsGate(path="plan.md").run(_ctx(tmp_path))
+    assert result.success
+
+
+@pytest.mark.asyncio
+async def test_plan_sections_gate_fails_on_missing_file(tmp_path):
+    result = await PlanSectionsGate(path="plan.md").run(_ctx(tmp_path))
+    assert not result.success
+    assert "plan file not written" in result.error
+
+
+@pytest.mark.asyncio
+async def test_plan_sections_gate_reports_missing_names_in_error_and_output(tmp_path):
+    (tmp_path / "plan.md").write_text("## Assumptions\nx\n")
+    result = await PlanSectionsGate(path="plan.md").run(_ctx(tmp_path))
+    assert not result.success
+    assert result.output == "Prior learnings\nConsidered and not built\nEdge cases and flows"
+    assert "3 required plan sections" in result.error
+    assert "  Prior learnings" in result.error
