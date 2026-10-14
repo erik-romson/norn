@@ -836,14 +836,17 @@ class AssertFreshRun(BaseStage):
 
     needs_agent = False
 
+    def __init__(self, pipeline: str = "merge_branch_v1") -> None:
+        self._pipeline = pipeline
+
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         if ctx.checkpoint_stages:
             return StageResult(
                 name="",
                 success=False,
                 error=(
-                    "merge_branch_v1 does not resume: every stage is idempotent — "
-                    "rerun `norn run merge_branch_v1` without --resume"
+                    f"{self._pipeline} does not resume: every stage is idempotent — "
+                    f"rerun `norn run {self._pipeline}` without --resume"
                 ),
             )
         args = ctx.params.get("args")
@@ -852,7 +855,7 @@ class AssertFreshRun(BaseStage):
                 name="",
                 success=False,
                 error=(
-                    f"merge_branch_v1 takes no positional arguments (got: {args}); "
+                    f"{self._pipeline} takes no positional arguments (got: {args}); "
                     "pass the base as `--arg base=X`"
                 ),
             )

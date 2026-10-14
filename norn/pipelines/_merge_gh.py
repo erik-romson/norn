@@ -1234,7 +1234,13 @@ class WaitForChecks(HaltOnFailure, BaseStage):
 # ---------------------------------------------------------------------------
 
 
-def ci_fix_child_cmd(project_dir: str, workflows: list[str], test_cmd: str, budget: float) -> str:
+def ci_fix_child_cmd(
+    project_dir: str,
+    workflows: list[str],
+    test_cmd: str,
+    budget: float,
+    pipeline: str = "check_and_fix_ci_v1",
+) -> str:
     """Return the POSIX sh fragment that runs one ``check_and_fix_ci`` child.
 
     ``--budget`` (not ``--arg budget=``): ``check_and_fix_ci`` declares no
@@ -1243,7 +1249,7 @@ def ci_fix_child_cmd(project_dir: str, workflows: list[str], test_cmd: str, budg
     """
     return (
         f"cd {shlex.quote(project_dir)} && "
-        f"{shlex.quote(sys.executable)} -m norn run check_and_fix_ci_v1 --non-interactive "
+        f"{shlex.quote(sys.executable)} -m norn run {pipeline} --non-interactive "
         f"--arg workflow={shlex.quote(','.join(workflows))} "
         f"--arg test_cmd={shlex.quote(test_cmd)} --budget {budget}"
     )
@@ -1284,7 +1290,9 @@ class CiFixChild(HaltOnTimeout):
         test_cmd: str,
         timeout: float = CI_FIX_TIMEOUT,
         child_cmd: str | None = None,
+        ci_pipeline: str = "check_and_fix_ci_v1",
     ) -> None:
+        self._ci_pipeline = ci_pipeline
         self._n = n
         self._project_dir = project_dir
         self._pipeline = pipeline
@@ -1308,7 +1316,7 @@ class CiFixChild(HaltOnTimeout):
         return max(round(min(limits) - spent, 2), _MIN_CHILD_BUDGET)
 
     def _runs_dir(self) -> Path:
-        return Path(self._project_dir) / "check_and_fix_ci_v1.runs"
+        return Path(self._project_dir) / f"{self._ci_pipeline}.runs"
 
     def _write_outcome(self, outcome: str, run_dir: Path | None) -> None:
         data = {"outcome": outcome, "journal": str(run_dir) if run_dir else None}
@@ -1319,7 +1327,7 @@ class CiFixChild(HaltOnTimeout):
 
         if run_dir is None:
             return (
-                f"check_and_fix_ci_v1 left no journal under {self._runs_dir()} "
+                f"{self._ci_pipeline} left no journal under {self._runs_dir()} "
                 "— it failed before norn started it"
             )
         run_json_path = run_dir / "run.json"
@@ -1350,7 +1358,9 @@ class CiFixChild(HaltOnTimeout):
             return self._child_cmd
         workflows = [w for w in _read(self._halt_paths.ci_fix_workflows(self._n)).splitlines() if w]
         budget = self._remaining_budget(ctx)
-        return ci_fix_child_cmd(self._project_dir, workflows, self._test_cmd, budget)
+        return ci_fix_child_cmd(
+            self._project_dir, workflows, self._test_cmd, budget, self._ci_pipeline
+        )
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         from norn.pipelines._child_run import latest_run_dir  # stdlib-only helper

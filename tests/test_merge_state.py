@@ -157,6 +157,24 @@ async def test_assert_fresh_run_passes_otherwise():
     assert result.success is True
 
 
+@pytest.mark.asyncio
+async def test_assert_fresh_run_default_names_merge_branch_v1():
+    stage = _merge_state.AssertFreshRun()
+    resume = await stage.run(ctx_for(checkpoint=("resolve branch",)))
+    assert "merge_branch_v1 does not resume" in resume.error
+    assert "`norn run merge_branch_v1` without --resume" in resume.error
+    positional = await stage.run(ctx_for(params={"args": "x"}))
+    assert "merge_branch_v1 takes no positional arguments" in positional.error
+
+
+@pytest.mark.asyncio
+async def test_assert_fresh_run_pipeline_parameter_renames_messages():
+    stage = _merge_state.AssertFreshRun(pipeline="merge_branch_v2")
+    resume = await stage.run(ctx_for(checkpoint=("resolve branch",)))
+    assert "merge_branch_v2 does not resume" in resume.error
+    assert "merge_branch_v1" not in resume.error
+
+
 # ---------------------------------------------------------------------------
 # Escalate
 # ---------------------------------------------------------------------------
