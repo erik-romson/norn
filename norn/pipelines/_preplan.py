@@ -26,7 +26,7 @@ def parse_arg_flags(argv: list[str]) -> dict[str, str]:
     return out
 
 
-def resolve_preplan(argv: list[str], repo_dir: str) -> str:
+def resolve_preplan(argv: list[str], repo_dir: str, *, pipeline: str = "plan_with_review_v1") -> str:
     """Return the absolute path to the pre-plan file named in *argv*.
 
     Filters *argv* rather than indexing it so that both the ``norn run`` shape
@@ -63,14 +63,14 @@ def resolve_preplan(argv: list[str], repo_dir: str) -> str:
 
     if len(candidates) == 0:
         raise ValueError(
-            "plan_with_review_v1 needs the pre-plan markdown path as its positional "
-            "argument, e.g. norn run plan_with_review_v1 tmp/x-preplan.md"
+            f"{pipeline} needs the pre-plan markdown path as its positional "
+            f"argument, e.g. norn run {pipeline} tmp/x-preplan.md"
         )
 
     # More than one candidate — name them all.
     found = ", ".join(candidates)
     raise ValueError(
-        f"plan_with_review_v1 found multiple pre-plan candidates and cannot choose: {found}"
+        f"{pipeline} found multiple pre-plan candidates and cannot choose: {found}"
     )
 
 

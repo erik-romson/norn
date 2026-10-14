@@ -153,3 +153,26 @@ class TestBriefPrompt:
     def test_mentions_project_dir(self, tmp_path):
         prompt = self._make_prompt(tmp_path)
         assert str(tmp_path) in prompt
+
+
+# ---------------------------------------------------------------------------
+# resolve_issue_args: pipeline name in messages
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueArgsPipelineName:
+    def test_default_pipeline_name_is_v1(self):
+        with pytest.raises(ValueError, match="fix_jira_issue_v1 needs"):
+            resolve_issue_args([])
+
+    def test_passed_pipeline_reaches_zero_key_message(self):
+        with pytest.raises(ValueError) as exc:
+            resolve_issue_args([], pipeline="fix_jira_issue_v2")
+        assert "fix_jira_issue_v2 needs" in str(exc.value)
+        assert "norn run fix_jira_issue_v2 CBS-2249" in str(exc.value)
+        assert "fix_jira_issue_v1" not in str(exc.value)
+
+    def test_passed_pipeline_reaches_multiple_keys_message(self):
+        with pytest.raises(ValueError) as exc:
+            resolve_issue_args(["CBS-1", "CBS-2"], pipeline="fix_jira_issue_v2")
+        assert str(exc.value).startswith("fix_jira_issue_v2 found multiple")

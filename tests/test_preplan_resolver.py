@@ -240,3 +240,31 @@ def test_steps_dir_of_drops_the_md_suffix(tmp_path):
 
 def test_steps_dir_of_is_sibling_of_plan():
     assert steps_dir_of("tmp/x-plan.md") == "tmp/x-plan"
+
+
+# ---------------------------------------------------------------------------
+# resolve_preplan: pipeline name in messages
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_preplan_default_pipeline_name_is_v1(tmp_path):
+    with pytest.raises(ValueError, match="plan_with_review_v1 needs"):
+        resolve_preplan([], repo_dir=str(tmp_path))
+
+
+def test_resolve_preplan_passed_pipeline_reaches_zero_candidate_message(tmp_path):
+    with pytest.raises(ValueError) as exc:
+        resolve_preplan([], repo_dir=str(tmp_path), pipeline="plan_with_review_v2")
+    assert "plan_with_review_v2 needs" in str(exc.value)
+    assert "norn run plan_with_review_v2 tmp/x-preplan.md" in str(exc.value)
+    assert "plan_with_review_v1" not in str(exc.value)
+
+
+def test_resolve_preplan_passed_pipeline_reaches_multiple_candidate_message(tmp_path):
+    a = tmp_path / "a-preplan.md"
+    b = tmp_path / "b-preplan.md"
+    a.write_text("a")
+    b.write_text("b")
+    with pytest.raises(ValueError) as exc:
+        resolve_preplan([str(a), str(b)], repo_dir=str(tmp_path), pipeline="plan_with_review_v2")
+    assert str(exc.value).startswith("plan_with_review_v2 found multiple")

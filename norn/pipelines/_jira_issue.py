@@ -32,7 +32,7 @@ class ArtifactPaths(NamedTuple):
     preplan: str
 
 
-def resolve_issue_args(argv: list[str]) -> tuple[str, bool]:
+def resolve_issue_args(argv: list[str], *, pipeline: str = "fix_jira_issue_v1") -> tuple[str, bool]:
     """Return ``(ISSUE_KEY, stop_flag)`` extracted from *argv*.
 
     Token rules:
@@ -80,13 +80,13 @@ def resolve_issue_args(argv: list[str]) -> tuple[str, bool]:
 
     if len(keys) == 0:
         raise ValueError(
-            "fix_jira_issue_v1 needs a Jira issue key as its positional argument, "
-            "e.g. norn run fix_jira_issue_v1 CBS-2249"
+            f"{pipeline} needs a Jira issue key as its positional argument, "
+            f"e.g. norn run {pipeline} CBS-2249"
         )
     if len(keys) > 1:
         found = ", ".join(keys)
         raise ValueError(
-            f"fix_jira_issue_v1 found multiple issue keys and cannot choose: {found}"
+            f"{pipeline} found multiple issue keys and cannot choose: {found}"
         )
 
     return keys[0], stop_flag
