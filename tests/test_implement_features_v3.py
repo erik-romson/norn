@@ -6259,3 +6259,284 @@ async def test_collect_settled_decisions_reads_closeout_results() -> None:
     assert lines[0] == f"- {stems[0]}: use a dict, not a class keep the flat layout"
     assert all("no closeout was recorded" in ln for ln in lines[1:])
     assert len(lines) == len(stems)
+
+
+# ---------------------------------------------------------------------------
+# Fixer triage (step 13)
+# ---------------------------------------------------------------------------
+
+_REVIEW_WITH_THREE_BLOCKERS = (
+    "VERDICT: NEEDS_FIXES\n"
+    "Base: aaaa\n"
+    "Head: bbbb\n"
+    "\n"
+    "## Blocking findings\n"
+    "\n"
+    "### B1 — first\n"
+    "- critical-75: x (a.py:1)\n"
+    "\n"
+    "### B2 — second\n"
+    "- major-75: y (b.py:2)\n"
+    "\n"
+    "## Non-blocking\n"
+    "\n"
+    "### B9 — not a blocker, sits outside the section\n"
+)
+
+
+def _run_triage_check(tmp_path: Path, triage: str | None, review: str = _REVIEW_WITH_THREE_BLOCKERS):
+    mod = _import_v2(GOOD_DIR)
+    review_md = tmp_path / "review.md"
+    review_md.write_text(review, encoding="utf-8")
+    triage_md = tmp_path / "review-1.triage.md"
+    if triage is not None:
+        triage_md.write_text(triage, encoding="utf-8")
+    cmd = mod._triage_check_cmd(str(review_md), str(triage_md))
+    return subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("triage", [
+    "- B1: accepted\n- B2: accepted\n",
+    "- B1: accepted\n- B2: rejected — `a.py:7` already guards this\n",
+    "- B1: rejected - output: 3 passed\n- B2: rejected: see b.py:2\n",
+])
+def test_triage_check_passes_complete_files(tmp_path, triage) -> None:
+    proc = _run_triage_check(tmp_path, triage)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_triage_check_fails_a_missing_file(tmp_path) -> None:
+    proc = _run_triage_check(tmp_path, None)
+    assert proc.returncode != 0
+    assert "no triage file" in proc.stderr
+
+
+def test_triage_check_fails_a_missing_finding(tmp_path) -> None:
+    proc = _run_triage_check(tmp_path, "- B1: accepted\n")
+    assert proc.returncode != 0
+    assert "B2" in proc.stderr
+
+
+@pytest.mark.parametrize("triage", [
+    "- B1: accepted\n- B2: rejected\n",
+    "- B1: accepted\n- B2: rejected — \n",
+    "- B1: accepted\n- B2: rejected -\n",
+    "- B1: accepted\n- B2: maybe\n",
+])
+def test_triage_check_fails_a_bare_rejection(tmp_path, triage) -> None:
+    proc = _run_triage_check(tmp_path, triage)
+    assert proc.returncode != 0
+    assert "B2" in proc.stderr
+
+
+def test_triage_check_fails_a_duplicate_line(tmp_path) -> None:
+    proc = _run_triage_check(tmp_path, "- B1: accepted\n- B1: accepted\n- B2: accepted\n")
+    assert proc.returncode != 0
+    assert "B1" in proc.stderr
+
+
+def test_triage_check_does_not_confuse_b1_with_b10(tmp_path) -> None:
+    review = "VERDICT: NEEDS_FIXES\n\n## Blocking findings\n\n### B10 — ten\n"
+    proc = _run_triage_check(tmp_path, "- B1: accepted\n", review=review)
+    assert proc.returncode != 0
+    assert "B10" in proc.stderr
+
+
+def test_triage_check_ignores_headings_outside_blocking_section(tmp_path) -> None:
+    # B9 sits under ## Non-blocking and needs no line.
+    proc = _run_triage_check(tmp_path, "- B1: accepted\n- B2: accepted\n")
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_check_triage_stage_follows_the_fix_and_gates_the_rest(n: int) -> None:
+    from norn.dsl import OnFailure
+    mod = _import_v2(GOOD_DIR)
+    names = [getattr(i, "name", None) for i in mod.config.items]
+    assert names.index(f"review fix {n}") < names.index(f"check triage {n}")
+    assert names.index(f"check triage {n}") < names.index(f"review fix validated {n}")
+    stage = _stage(mod, f"check triage {n}")
+    assert stage.on_failure == OnFailure.FAIL
+    assert stage.impl.cmd == mod._triage_check_cmd(mod.REVIEW_MD, mod._review_paths[n]["triage"])
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_check_triage_has_the_marker_when_of_the_fix(n: int) -> None:
+    from norn.models import PipelineContext
+    mod = _import_v2(GOOD_DIR)
+    marker = mod._review_paths[n]["needs_fixes"]
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    if os.path.exists(marker):
+        os.unlink(marker)
+    stage = _stage(mod, f"check triage {n}")
+    assert stage.when(PipelineContext()) is False
+    Path(marker).touch()
+    try:
+        assert stage.when(PipelineContext()) is True
+    finally:
+        os.unlink(marker)
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_review_fix_prompt_requires_triage_before_edits(n: int) -> None:
+    mod = _import_v2(GOOD_DIR)
+    prompt = _stage(mod, f"review fix {n}").impl.prompt
+    triage = mod._review_paths[n]["triage"]
+    assert triage.endswith(f"review-{n}.triage.md")
+    assert f"`{triage}`" in prompt
+    assert "- B<k>: accepted" in prompt
+    assert "- B<k>: rejected — <evidence: quoted file:line or command output>" in prompt
+    assert prompt.index("## Triage first") < prompt.index("## Validation contract")
+    assert "fix the accepted findings only" in prompt.lower()
+
+
+def test_review_fix_prompt_has_no_stray_braces() -> None:
+    mod = _import_v2(GOOD_DIR)
+    for n in (1, 2):
+        prompt = _stage(mod, f"review fix {n}").impl.prompt
+        assert "{" not in prompt and "}" not in prompt
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_next_round_reads_the_triage_and_quotes_it(n: int) -> None:
+    mod = _import_v2(GOOD_DIR)
+    read_stage = _stage(mod, f"read triage {n}")
+    assert read_stage.impl.path == mod._review_paths[n]["triage"]
+    prompt = _stage(mod, f"review {n + 1}").impl.prompt
+    assert f"{{read triage {n}.output}}" in prompt
+    assert "accepted" in prompt and "rejected" in prompt
+    assert "evidence" in prompt
+    assert "stays blocking" in prompt
+
+
+def test_round_1_has_no_triage_to_read() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert "triage" not in _stage(mod, "review 1").impl.prompt.lower()
+    with pytest.raises(KeyError):
+        _stage(mod, "read triage 0")
+    with pytest.raises(KeyError):
+        _stage(mod, "read triage 3")
+
+
+@pytest.mark.asyncio
+async def test_review_fix_commit_leaves_the_triage_file_out(tmp_path, monkeypatch) -> None:
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+    triage = Path(mod._review_paths[1]["triage"])
+    assert str(triage).startswith(str(feat_dir.resolve())) or str(triage).startswith(str(feat_dir))
+    assert mod._repo_rel(str(triage)) is not None
+    Path(mod.snapshot_root).mkdir(parents=True, exist_ok=True)
+
+    r = await _stage(mod, "review fix baseline 1").impl.run(ctx)
+    assert r.success, r.output
+    head_before = repo.head.commit.hexsha
+
+    (repo_path / "fixed.py").write_text("# fixed\n")
+    triage.write_text("- B1: accepted\n", encoding="utf-8")
+
+    r = await _stage(mod, "review fix commit 1").impl.run(ctx)
+    assert r.success, r.output
+    assert repo.head.commit.hexsha != head_before
+    committed = repo.git.show("--name-only", "--format=", "HEAD").split()
+    assert committed == ["fixed.py"], committed
+
+
+def test_commit_cmd_extra_ignore_flags_default_is_unchanged() -> None:
+    mod = _import_v2(GOOD_DIR)
+    args = dict(
+        pre_json="/p", head_file="/h", post_json="/q", changed_list="/c",
+        hookfix_list="/f", hookfix_marker="/m", facts_file="/x",
+        subject="s", validation_cmd="true", require_changes=False,
+    )
+    plain = mod._commit_cmd(**args)
+    with_flag = mod._commit_cmd(**args, extra_ignore_flags=" --ignore 'a b.md'")
+    assert " --ignore 'a b.md' > /c" in with_flag
+    assert "--ignore 'a b.md'" not in plain
+
+
+def test_final_audit_ignores_both_triage_files() -> None:
+    mod = _import_v2(GOOD_DIR)
+    for n in (1, 2):
+        rel = mod._repo_rel(mod._review_paths[n]["triage"])
+        assert rel is not None
+        flag = f" --ignore {shlex.quote(rel)}"
+        assert flag in mod._extra_ignore_flags
+        assert flag in _stage(mod, "final audit").impl.cmd
+
+
+@pytest.mark.asyncio
+async def test_final_audit_passes_with_triage_files_present(tmp_path, monkeypatch) -> None:
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+    r = await _stage(mod, "record start").impl.run(ctx)
+    assert r.success
+    Path(mod.REVIEWED_HEAD).parent.mkdir(parents=True, exist_ok=True)
+    Path(mod.REVIEWED_HEAD).write_text(repo.head.commit.hexsha + "\n")
+    for n in (1, 2):
+        Path(mod._review_paths[n]["triage"]).write_text("- B1: accepted\n", encoding="utf-8")
+    r = await _stage(mod, "final audit").impl.run(ctx)
+    assert r.success, r.output
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_nochange_marker_makes_the_validation_skip(n: int) -> None:
+    from norn.models import PipelineContext
+    mod = _import_v2(GOOD_DIR)
+    needs_fixes = mod._review_paths[n]["needs_fixes"]
+    nochange = mod._review_paths[n]["fix_nochange"]
+    os.makedirs(os.path.dirname(needs_fixes), exist_ok=True)
+    stage = _stage(mod, f"review fix validated {n}")
+    Path(needs_fixes).touch()
+    try:
+        if os.path.exists(nochange):
+            os.unlink(nochange)
+        assert stage.when(PipelineContext()) is True
+        Path(nochange).touch()
+        assert stage.when(PipelineContext()) is False
+    finally:
+        for p in (needs_fixes, nochange):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_review_fix_changed_sits_between_the_fix_and_the_validation(n: int) -> None:
+    from norn.dsl import OnFailure
+    mod = _import_v2(GOOD_DIR)
+    names = [getattr(i, "name", None) for i in mod.config.items]
+    assert names.index(f"check triage {n}") < names.index(f"review fix changed {n}")
+    assert names.index(f"review fix changed {n}") < names.index(f"review fix validated {n}")
+    assert _stage(mod, f"review fix changed {n}").on_failure == OnFailure.FAIL
+
+
+@pytest.mark.asyncio
+async def test_review_fix_changed_writes_the_marker_only_for_an_empty_fix(tmp_path, monkeypatch) -> None:
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+    Path(mod.snapshot_root).mkdir(parents=True, exist_ok=True)
+    nochange = Path(mod._review_paths[1]["fix_nochange"])
+
+    r = await _stage(mod, "review fix baseline 1").impl.run(ctx)
+    assert r.success, r.output
+    # Only the triage file appears: that is not a change to the repository.
+    Path(mod._review_paths[1]["triage"]).write_text("- B1: accepted\n", encoding="utf-8")
+    r = await _stage(mod, "review fix changed 1").impl.run(ctx)
+    assert r.success, r.output
+    assert nochange.exists()
+
+    # A real edit clears the marker a previous pass left behind.
+    (repo_path / "fixed.py").write_text("# fixed\n")
+    r = await _stage(mod, "review fix changed 1").impl.run(ctx)
+    assert r.success, r.output
+    assert not nochange.exists()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_baseline_clears_a_stale_marker_and_triage(tmp_path, monkeypatch) -> None:
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+    Path(mod.snapshot_root).mkdir(parents=True, exist_ok=True)
+    nochange = Path(mod._review_paths[1]["fix_nochange"])
+    triage = Path(mod._review_paths[1]["triage"])
+    nochange.touch()
+    triage.write_text("- B1: accepted\n", encoding="utf-8")
+    r = await _stage(mod, "review fix baseline 1").impl.run(ctx)
+    assert r.success, r.output
+    assert not nochange.exists()
+    assert not triage.exists()

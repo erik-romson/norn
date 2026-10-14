@@ -1579,8 +1579,13 @@ def _commit_cmd(
     subject: str,
     validation_cmd: str,
     require_changes: bool,
+    extra_ignore_flags: str = "",
 ) -> str:
     """Build a single POSIX shell string that commits exactly the owned set.
+
+    *extra_ignore_flags* (``" --ignore <rel>"`` pieces) are appended to the
+    snapshot diff, so a file the stage's agent writes for the pipeline's own
+    use (the review fixer's triage file) is never committed.
 
     The commit protocol:
     1. cd to GIT_TOPLEVEL.
@@ -1642,7 +1647,8 @@ def _commit_cmd(
         # Take a post-snapshot, diff against pre to find step-owned changes.
         f'python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(post_json)} || exit 1; '
         f'python3 {q(SNAPSHOT_HELPER)} diff {q(pre_json)} {q(post_json)} '
-        f'--root {q(GIT_TOPLEVEL)}{NORN_STATE_IGNORE_FLAGS} > {q(changed_list)} || exit 1; '
+        f'--root {q(GIT_TOPLEVEL)}{NORN_STATE_IGNORE_FLAGS}{extra_ignore_flags} '
+        f'> {q(changed_list)} || exit 1; '
         # If nothing changed, branch on require_changes.
         f'if [ ! -s {q(changed_list)} ]; then {no_change_branch}; fi; '
         # Stage exactly the owned paths (NUL-separated from diff).
@@ -2640,7 +2646,35 @@ for _n in range(1, 3):  # fix rounds only for 1, 2
         "fix_hookfix":       os.path.join(snapshot_root, f"review-fix-{_n}.hookfix"),
         "fix_hookfix_marker": os.path.join(snapshot_root, f"review-fix-{_n}.hookfix.marker"),
         "fix_facts":         os.path.join(snapshot_root, f"review-fix-{_n}.facts"),
+        # The fixer's triage of round N's blocking findings.  It lives beside
+        # review.md, where the next round's reader and the learn evidence find it.
+        "triage":            os.path.join(feature_dir, f"review-{_n}.triage.md"),
+        # `review fix changed N`: a snapshot of the tree after the fix, its
+        # diff against fix_pre, and the marker meaning "the fix changed nothing".
+        "fix_probe_post":    os.path.join(snapshot_root, f"review-fix-{_n}.probe.json"),
+        "fix_probe_changed": os.path.join(snapshot_root, f"review-fix-{_n}.probe.changed"),
+        "fix_nochange":      os.path.join(snapshot_root, f"review-fix-{_n}.nochange"),
     })
+
+
+def _repo_rel(path: str) -> str | None:
+    """*path* relative to GIT_TOPLEVEL, or None when it lies outside the repo."""
+    try:
+        rel = os.path.relpath(path, GIT_TOPLEVEL)
+    except ValueError:  # different drives on Windows
+        return None
+    return None if rel.startswith("..") else rel
+
+
+def _ignore_flag_for(path: str) -> str:
+    """``" --ignore <rel>"`` for a path inside the repo, else the empty string."""
+    rel = _repo_rel(path)
+    return f" --ignore {shlex.quote(rel)}" if rel is not None else ""
+
+
+def _triage_ignore_flag(n: int) -> str:
+    """The snapshot-diff ignore flag for round *n*'s triage file."""
+    return _ignore_flag_for(_review_paths[n]["triage"])
 
 REVIEWED_HEAD = os.path.join(snapshot_root, "reviewed.head")
 
@@ -3049,6 +3083,14 @@ def _review_prompt(n: int, lite: bool = False) -> str:
         + (
             f"## Round {n - 1} review\n\n"
             f"{{{f'read previous review {n}'}.output}}\n\n"
+            f"## Round {n - 1} fixer triage\n\n"
+            f"The fixer triaged each blocking finding above before editing anything. "
+            f"Use its answer like this:\n\n"
+            f"- Re-check every **accepted** finding: it should now be fixed.\n"
+            f"- For a **rejected** finding, check only whether the evidence quoted in "
+            f"the rejection holds. A rejection whose evidence holds closes the finding. "
+            f"One whose evidence does not hold stays blocking.\n\n"
+            f"{{{f'read triage {n - 1}'}.output}}\n\n"
             if n > 1 else ""
         )
         + f"{shared_context}"
@@ -3064,13 +3106,27 @@ def _review_fix_prompt(n: int) -> str:
     Module-level so tests can inspect the contract without running an agent.
     """
     forbidden = ", ".join(f"`{v}`" for v in _GIT_FORBIDDEN_VERBS)
+    triage = _review_paths[n]["triage"]
     return (
         f"## Objective\n\n"
-        f"Apply every required change under `## Blocking findings` in `{REVIEW_MD}` "
+        f"Triage, then fix, the findings under `## Blocking findings` in `{REVIEW_MD}` "
         f"(read it first).\n\n"
         f"Its other sections are not yours to act on: `## Non-blocking` findings are "
         f"handed to the human as they are, and `## For the human` lists work this run "
         f"cannot do. Changing either one is an unrelated change.\n\n"
+        f"## Triage first\n\n"
+        f"Before you edit any file, write `{triage}` with exactly one line for each "
+        f"`### B<k>` blocking finding, in one of these two forms:\n\n"
+        "```\n"
+        "- B<k>: accepted\n"
+        "- B<k>: rejected — <evidence: quoted file:line or command output>\n"
+        "```\n\n"
+        "Check each finding against the code before you answer. Accept it when the "
+        "problem is real. Reject it only with evidence: the quoted `file:line` or the "
+        "command output that shows the finding is wrong. A rejection with no evidence "
+        "fails the pipeline's check, and the next review round re-checks every "
+        "rejection against the evidence you give.\n\n"
+        "Then fix the accepted findings only. Leave the rejected ones alone.\n\n"
         f"Working directory: `{PROJECT_DIR}`\n\n"
         f"IMPORTANT: When creating or editing files, always use absolute paths "
         f"based on `{PROJECT_DIR}`.\n\n"
@@ -3119,6 +3175,53 @@ _BLOCKING_HEADING_AWK = (
     "in_blocking && /^### B[0-9]+/{ found = 1 } "
     "END{ exit !found }"
 )
+
+
+# Prints the id (`B1`, `B2`, …) of every `### B<k>` heading under
+# `## Blocking findings`, one per line.
+_BLOCKING_IDS_AWK = (
+    "/^## /{ in_blocking = ($0 ~ /^## Blocking findings[ \\t]*$/) } "
+    "in_blocking && /^### B[0-9]+/{ match($0, /^### B[0-9]+/); "
+    "print substr($0, 5, RLENGTH - 4) }"
+)
+
+
+def _triage_check_cmd(review_md: str, triage_md: str, ids_cmd: str | None = None) -> str:
+    """Shell that checks the fixer's triage file against ``review.md``.
+
+    Passes when the triage file exists and every id has exactly one line that
+    says ``accepted``, or ``rejected`` followed by evidence text (a dash alone
+    is not evidence).  *ids_cmd* is a shell command that prints the ids that
+    need a line; the default is every blocking finding in ``review.md``.  It is
+    a parameter so a later change can narrow the set for round 1 without
+    rewriting the check.
+    """
+    q = shlex.quote
+    if ids_cmd is None:
+        ids_cmd = f"awk {q(_BLOCKING_IDS_AWK)} {q(review_md)}"
+    return (
+        f"REVIEW={q(review_md)}; TRIAGE={q(triage_md)}; "
+        'if [ ! -s "$TRIAGE" ]; then '
+        'echo "ERROR: the fixer wrote no triage file at $TRIAGE" 1>&2; '
+        'echo "It must list every blocking finding as accepted, or rejected with evidence." 1>&2; '
+        "exit 1; fi; "
+        f"IDS=$({ids_cmd}) || exit 1; "
+        'if [ -z "$IDS" ]; then '
+        'echo "ERROR: no blocking findings to triage in $REVIEW" 1>&2; exit 1; fi; '
+        "BAD=0; "
+        "for ID in $IDS; do "
+        'LINES=$(grep -E "^[[:space:]]*-[[:space:]]*$ID:" "$TRIAGE" || true); '
+        'COUNT=$(printf "%s\\n" "$LINES" | grep -c . || true); '
+        'if [ "$COUNT" != "1" ]; then '
+        'echo "ERROR: triage must have exactly one line for $ID, found $COUNT" 1>&2; BAD=1; continue; fi; '
+        'if printf "%s\\n" "$LINES" | grep -Eq ":[[:space:]]*accepted"; then continue; fi; '
+        'EVIDENCE=$(printf "%s\\n" "$LINES" | sed -E '
+        "'s/^[^:]*:[[:space:]]*rejected[[:space:]]*(\u2014|\u2013|-|:)?[[:space:]]*//'); "
+        'if printf "%s\\n" "$LINES" | grep -Eq ":[[:space:]]*rejected" && [ -n "$EVIDENCE" ]; then continue; fi; '
+        'echo "ERROR: triage line for $ID must be \'accepted\' or \'rejected \u2014 <evidence>\': $LINES" 1>&2; BAD=1; '
+        "done; "
+        '[ "$BAD" = "0" ] || exit 1'
+    )
 
 
 def _add_review_round(n: int, when) -> None:
@@ -3211,6 +3314,13 @@ def _add_review_round(n: int, when) -> None:
         pipeline.stage(
             f"read previous review {n}",
             ReadFile(path=paths["prev_review"]),
+            when=when,
+        )
+        # The fixer's triage of those findings: the round re-checks accepted
+        # ones and only the evidence of rejected ones.
+        pipeline.stage(
+            f"read triage {n - 1}",
+            ReadFile(path=_review_paths[n - 1]["triage"]),
             when=when,
         )
 
@@ -3354,10 +3464,15 @@ def _add_review_fix_round(n: int) -> None:
     pipeline.clear_context()
 
     # --- review fix baseline N ---
+    # Clears this round's triage file and nochange marker first, so a rerun
+    # (or a leftover from an earlier run of the feature dir) starts clean: a
+    # stale triage file must not satisfy `check triage`, a stale marker must
+    # not skip validation of a fix that did change something.
     pipeline.stage(
         f"review fix baseline {n}",
         RunCommand(cmd=(
             f"cd {q(GIT_TOPLEVEL)} && "
+            f"rm -f {q(paths['fix_nochange'])} {q(paths['triage'])} && "
             f"git rev-parse HEAD > {q(paths['fix_head'])} && "
             f"python3 {q(SNAPSHOT_HELPER)} snapshot "
             f"--root {q(GIT_TOPLEVEL)} {q(paths['fix_pre'])}"
@@ -3381,10 +3496,45 @@ def _add_review_fix_round(n: int) -> None:
         when=marker_when,
     )
 
+    # --- check triage N ---
+    # Every blocking finding must be accepted, or rejected with evidence,
+    # before anything is validated or committed.
+    pipeline.stage(
+        f"check triage {n}",
+        RunCommand(cmd=_triage_check_cmd(REVIEW_MD, paths["triage"])),
+        on_failure=fail,
+        when=marker_when,
+    )
+
+    # --- review fix changed N ---
+    # A fix that changed nothing leaves the tree as the one that already
+    # passed validation (HEAD is unchanged too, the fixer has no git verbs), so
+    # re-running the aggregate command proves nothing.  The triage file is the
+    # fixer's own output, not a change to the repository, hence the ignore flag.
+    changed_cmd = (
+        f"cd {q(GIT_TOPLEVEL)} && "
+        f"rm -f {q(paths['fix_nochange'])} && "
+        f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(paths['fix_probe_post'])} && "
+        f"python3 {q(SNAPSHOT_HELPER)} diff {q(paths['fix_pre'])} {q(paths['fix_probe_post'])} "
+        f"--root {q(GIT_TOPLEVEL)}{NORN_STATE_IGNORE_FLAGS}{_triage_ignore_flag(n)} "
+        f"> {q(paths['fix_probe_changed'])} && "
+        f'if [ ! -s {q(paths["fix_probe_changed"])} ] && '
+        f'[ "$(git rev-parse HEAD)" = "$(cat {q(paths["fix_head"])})" ]; then '
+        f'echo "review fix {n} changed nothing; validation is skipped" && '
+        f"touch {q(paths['fix_nochange'])}; fi"
+    )
+    pipeline.stage(
+        f"review fix changed {n}",
+        RunCommand(cmd=changed_cmd),
+        on_failure=fail,
+        when=marker_when,
+    )
+
     # --- review fix validated N ---
     # Comment: one fix attempt per round; a fix that breaks aggregate
     # validation stops the run with the output, and a rerun resumes at the
-    # aggregate phase because every step is resume-skipped.
+    # aggregate phase because every step is resume-skipped.  Skipped when the
+    # fix changed nothing: the tree is the one that already passed.
     pipeline.stage(
         f"review fix validated {n}",
         RunCommand(
@@ -3392,7 +3542,7 @@ def _add_review_fix_round(n: int) -> None:
             timeout=AGGREGATE_TIMEOUT,
         ),
         on_failure=fail,
-        when=marker_when,
+        when=_both(marker_when, file_missing(paths["fix_nochange"])),
     )
 
     # --- review fix commit N ---
@@ -3409,6 +3559,7 @@ def _add_review_fix_round(n: int) -> None:
             subject=f"fix: apply review round {n} findings",
             validation_cmd=AGGREGATE_CMD,
             require_changes=False,
+            extra_ignore_flags=_triage_ignore_flag(n),
         )),
         on_failure=fail,
         when=marker_when,
@@ -4250,8 +4401,13 @@ _review_ignore_flag_audit = (
 _handoff_ignore_flag_audit = (
     f" --ignore {shlex.quote(HANDOFF_MD_REL)}" if HANDOFF_MD_REL is not None else ""
 )
+# The fixer's triage files are written for the pipeline, not committed.
+_triage_ignore_flags_audit = _triage_ignore_flag(1) + _triage_ignore_flag(2)
 _extra_ignore_flags = (
-    _review_ignore_flag_audit + _handoff_ignore_flag_audit + NORN_STATE_IGNORE_FLAGS
+    _review_ignore_flag_audit
+    + _handoff_ignore_flag_audit
+    + _triage_ignore_flags_audit
+    + NORN_STATE_IGNORE_FLAGS
 )
 
 # One check per .changed file: skip if the file is absent or empty (step was
