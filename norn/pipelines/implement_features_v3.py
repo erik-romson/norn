@@ -196,6 +196,7 @@ Honest limits
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import os
@@ -2643,13 +2644,323 @@ for _n in range(1, 3):  # fix rounds only for 1, 2
 
 REVIEWED_HEAD = os.path.join(snapshot_root, "reviewed.head")
 
+# Round 1's depth markers: `review depth` touches exactly one of them and the
+# two alternative round-1 review stages are gated on them.
+_review_paths[1].update({
+    "lite": os.path.join(snapshot_root, "review-1.lite"),
+    "full": os.path.join(snapshot_root, "review-1.full"),
+})
+REVIEW_DEPTH_MD = os.path.join(snapshot_root, "review-depth.md")
+
+
+# ---------------------------------------------------------------------------
+# Review depth gate: lite review for small, low-risk diffs
+# ---------------------------------------------------------------------------
+
+# A diff with fewer executable lines than this, and no risk flag, gets the
+# short round-1 review.
+REVIEW_LITE_MAX_LINES = 200
+
+_CODE_EXTENSIONS = frozenset({
+    ".py", ".sh", ".bash", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java",
+    ".kt", ".kts", ".scala", ".rb", ".php", ".cs", ".c", ".h", ".cpp", ".hpp",
+    ".swift", ".sql",
+})
+
+# Tests are not executable code for the depth count.
+_TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec"})
+_TEST_FILE_GLOBS = ("test_*", "*_test.*", "*.test.*", "*.spec.*", "*.bats")
+
+_CI_DIRS = (".github/workflows", ".circleci")
+_CI_FILES = frozenset({".gitlab-ci.yml", "Jenkinsfile", "azure-pipelines.yml"})
+_HARNESS_FILES = frozenset({"conftest.py", "pytest.ini", "tox.ini", "noxfile.py"})
+_HARNESS_GLOBS = ("jest.config.*", "vitest.config.*")
+_PERSISTENCE_DIRS = frozenset({"migration", "migrations", "alembic", "prisma"})
+_PERSISTENCE_GLOBS = ("*.sql", "schema.*")
+_AUTH_PARTS = frozenset({
+    "auth", "login", "session", "permission", "acl", "oauth", "token",
+    "secret", "credential", "crypto",
+})
+_MONEY_PARTS = frozenset({"payment", "billing", "invoice"})
+
+_CONCURRENCY_RE = re.compile(
+    r"threading|asyncio\.Lock|\bLock\(|Semaphore|multiprocessing|"
+    r"concurrent\.futures|synchronized|Mutex|atomic|go func"
+)
+
+
+def _is_test_path(path: str) -> bool:
+    parts = path.split("/")
+    base = parts[-1]
+    if any(part in _TEST_DIR_NAMES for part in parts[:-1]):
+        return True
+    if any(parts[i:i + 2] == ["src", "test"] for i in range(len(parts) - 2)):
+        return True
+    return any(fnmatch.fnmatch(base, g) for g in _TEST_FILE_GLOBS)
+
+
+def _is_code_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _CODE_EXTENSIONS
+
+
+def _part_names(path: str) -> set[str]:
+    """Lower-cased directory names and the file stem, plus singular forms."""
+    parts = path.lower().split("/")
+    parts[-1] = os.path.splitext(parts[-1])[0]
+    names = set(parts)
+    names |= {p[:-1] for p in parts if p.endswith("s")}
+    return names
+
+
+def _path_flags(path: str) -> set[str]:
+    flags: set[str] = set()
+    base = path.split("/")[-1]
+    padded = "/" + path
+    if (
+        any(f"/{d}/" in padded for d in _CI_DIRS)
+        or base in _CI_FILES
+    ):
+        flags.add("ci")
+    if base in _HARNESS_FILES or any(fnmatch.fnmatch(base, g) for g in _HARNESS_GLOBS):
+        flags.add("test-harness")
+    dirs = set(path.split("/")[:-1])
+    if dirs & _PERSISTENCE_DIRS or any(fnmatch.fnmatch(base, g) for g in _PERSISTENCE_GLOBS):
+        flags.add("persistence")
+    names = _part_names(path)
+    if names & _AUTH_PARTS:
+        flags.add("auth")
+    if names & _MONEY_PARTS:
+        flags.add("money")
+    return flags
+
+
+def review_depth(numstat: str, added_lines_by_path: dict[str, list[str]]) -> tuple[str, int, list[str]]:
+    """Decide the round-1 review depth.
+
+    *numstat* is the text of ``git diff --numstat --no-renames BASE HEAD``;
+    *added_lines_by_path* maps a path to the lines the diff added to it.
+    Returns ``(mode, lines, flags)``: ``mode`` is ``"lite"`` or ``"full"``,
+    ``lines`` the executable lines changed (added plus deleted, code files
+    only, tests excluded) and ``flags`` the sorted risk flags that were raised.
+    """
+    lines = 0
+    flags: set[str] = set()
+    for raw in numstat.splitlines():
+        if not raw.strip():
+            continue
+        added, deleted, path = raw.split("\t", 2)
+        flags |= _path_flags(path)
+        if _is_code_path(path) and not _is_test_path(path):
+            if added.isdigit():
+                lines += int(added)
+            if deleted.isdigit():
+                lines += int(deleted)
+    for path, added_lines in added_lines_by_path.items():
+        if not _is_code_path(path) or _is_test_path(path):
+            continue
+        if any(_CONCURRENCY_RE.search(line) for line in added_lines):
+            flags.add("concurrency")
+    mode = "lite" if lines < REVIEW_LITE_MAX_LINES and not flags else "full"
+    return mode, lines, sorted(flags)
+
+
+def parse_added_lines(diff_text: str) -> dict[str, list[str]]:
+    """Group the added lines of a ``git diff -U0 --no-renames`` by path."""
+    out: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:]
+            current = target[2:] if target.startswith("b/") else None
+            if current is not None:
+                out.setdefault(current, [])
+        elif line.startswith("+") and current is not None:
+            out[current].append(line[1:])
+    return out
+
+
+class _ReviewDepth(BaseStage):
+    """Choose lite or full for round 1 and leave exactly one marker file."""
+
+    needs_agent = False
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        def git(*args: str) -> str:
+            proc = subprocess.run(
+                ["git", "-c", "core.quotepath=off", *args],
+                cwd=GIT_TOPLEVEL, capture_output=True, text=True,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+            return proc.stdout
+
+        try:
+            base = Path(BASE_SHA).read_text(encoding="utf-8").strip()
+            head = git("rev-parse", "HEAD").strip()
+            numstat = git("diff", "--numstat", "--no-renames", base, head)
+            added = parse_added_lines(git("diff", "-U0", "--no-renames", base, head))
+        except (RuntimeError, OSError) as exc:
+            return StageResult(name="", success=False, error=f"review depth: {exc}")
+        mode, lines, flags = review_depth(numstat, added)
+        paths = _review_paths[1]
+        other = paths["full"] if mode == "lite" else paths["lite"]
+        Path(REVIEW_DEPTH_MD).write_text(
+            f"mode: {mode}\nlines: {lines}\nflags: {', '.join(flags) or 'none'}\n",
+            encoding="utf-8",
+        )
+        Path(other).unlink(missing_ok=True)
+        Path(paths[mode]).touch()
+        return StageResult(
+            name="", success=True,
+            output=f"review depth: {mode} ({lines} executable lines; flags: {', '.join(flags) or 'none'})",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Settled decisions: what the reviewer must not relitigate
+# ---------------------------------------------------------------------------
+
+_CLOSEOUT_FIELD_RE = re.compile(r"^(EVIDENCE|SETTLED|DEVIATIONS|NOT_BUILT|NEXT_CONSTRAINTS|RISKS):\s*(.*)$")
+SETTLED_RESUME_SKIPPED = "committed in an earlier run; see its commit"
+SETTLED_NO_CLOSEOUT = "no closeout was recorded"
+SETTLED_NO_BLOCK = "no SETTLED block in its closeout"
+
+
+def extract_settled(closeout: str) -> str | None:
+    """The ``SETTLED:`` block of one closeout on a single line, or None."""
+    collected: list[str] | None = None
+    for line in closeout.splitlines():
+        match = _CLOSEOUT_FIELD_RE.match(line.strip())
+        if match:
+            if collected is not None:
+                break
+            if match.group(1) == "SETTLED":
+                collected = [match.group(2).strip()]
+        elif collected is not None:
+            collected.append(line.strip())
+    if collected is None:
+        return None
+    return " ".join(part for part in collected if part) or "none"
+
+
+def settled_decisions(
+    stems: list[str],
+    skipped: set[str],
+    closeouts: dict[str, str | None],
+) -> str:
+    """One bullet per step: its settled decisions, or why there are none."""
+    if not stems:
+        return "none recorded"
+    out = []
+    for stem in stems:
+        if stem in skipped:
+            text = SETTLED_RESUME_SKIPPED
+        else:
+            closeout = closeouts.get(stem)
+            if not closeout:
+                text = SETTLED_NO_CLOSEOUT
+            else:
+                text = extract_settled(closeout) or SETTLED_NO_BLOCK
+        out.append(f"- {stem}: {text}")
+    return "\n".join(out)
+
+
+class _CollectSettledDecisions(BaseStage):
+    """Gather each step closeout's ``SETTLED`` block for the review prompts."""
+
+    needs_agent = False
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        stems = [Path(sf).stem for sf in _all_step_files]
+        closeouts: dict[str, str | None] = {}
+        for stem in stems:
+            result = ctx.results.get(f"closeout {stem}")
+            closeouts[stem] = str(result.output) if result is not None and result.output else None
+        return StageResult(
+            name="", success=True,
+            output=settled_decisions(stems, _resume_skipped_stems, closeouts),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Finding bar, false positives and artifact format (every round's prompt)
+# ---------------------------------------------------------------------------
+
+# Confidence anchors, each defined by what the reviewer did (from CE
+# subagent-template.md).
+_FINDING_BAR = (
+    "## Confidence\n\n"
+    "Give every finding a confidence anchor. Each anchor is defined by what you did:\n\n"
+    "- 0: it does not survive light scrutiny, or it is pre-existing.\n"
+    "- 25: you could not verify it from the diff and the code around it.\n"
+    "- 50: the evidence shows a concern, but it is below the actionable bar.\n"
+    "- 75: you double-checked it, and it will affect users, callers or runtime in "
+    "normal use; you can name a concrete observable consequence.\n"
+    "- 100: it is verifiable from the code itself.\n\n"
+    "A blocking finding needs confidence of at least 75, the verbatim offending line "
+    "with `file:line`, and an observable consequence. Without the quoted line a "
+    "finding is at most 50, and so non-blocking.\n\n"
+)
+
+# Never blocking (from CE subagent-template.md).
+_FALSE_POSITIVES = (
+    "## Not findings\n\n"
+    "These are never blocking. Do not report them as blocking findings:\n\n"
+    "- pre-existing issues the diff does not touch\n"
+    "- lint-level nits\n"
+    "- code that is intentional (check the comments and the commit messages)\n"
+    "- issues handled elsewhere (callers, guards, framework defaults)\n"
+    "- suggestions that restate the code\n"
+    "- generic \"consider adding\" advice with no failure mode\n"
+    "- code that carries a lint-ignore\n"
+    "- quality concerns with no written rule behind them\n"
+    "- speculative future concerns\n\n"
+)
+
+_REVIEW_FORMAT = (
+    "## Finding format\n\n"
+    "Under `## Blocking findings`, write each blocking finding as a `### B<k> — <title>` "
+    "heading (k = 1, 2, ...) followed by these lines:\n\n"
+    "```\n"
+    "Severity: critical|major\n"
+    "Confidence: 75|100\n"
+    "Step: <step name>\n"
+    "Where: `file:line`\n"
+    "Quote: <the verbatim offending line>\n"
+    "Consequence: <the observable consequence>\n"
+    "Required change: <what to change>\n"
+    "```\n\n"
+    "Under `## Non-blocking`, write one line per finding:\n\n"
+    "```\n"
+    "- <minor|nit|major-50|critical-50>: <finding> (<file>:<line>)\n"
+    "```\n\n"
+    "`## For the human` is unchanged.\n\n"
+)
+
+_SETTLED_SECTION = (
+    "## Settled decisions\n\n"
+    "{collect settled decisions.output}\n\n"
+    "A finding that only prefers an alternative to one of these is non-blocking.\n\n"
+)
+
+# Round 1 lite: the short focus list for a small, low-risk diff.
+_LITE_FOCUS = (
+    "## Focus\n\n"
+    "- Correctness against the plan.\n"
+    "- Silent failure: swallowed errors, fallbacks, silent degradation.\n"
+    "- Tests that exercise the change.\n\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Review prompts
 # ---------------------------------------------------------------------------
 
-def _review_prompt(n: int) -> str:
+def _review_prompt(n: int, lite: bool = False) -> str:
     """Build the review prompt for round *n*.
+
+    *lite* (round 1 only) swaps the focus list for the short one the depth
+    gate gives a small, low-risk diff.
 
     Round 1 reviews the whole base..HEAD range.  Later rounds are deliberately
     bounded: they re-check the previous round's blocking findings and review
@@ -2670,11 +2981,17 @@ def _review_prompt(n: int) -> str:
             f"`{feature_dir}`. Do not edit any file except `{REVIEW_MD}`.\n\n"
             f"Start from the manifest below and pull only the hunks you need "
             f"(`git show <sha>`, `git diff <base> <head> -- <path>`).\n\n"
-            "## Focus\n\n"
-            "- Correctness: does the code match the plan's intent?\n"
-            "- Safety: are there fallbacks, swallowed errors, or silent degradation?\n"
-            "- Tests: are the changes tested and do the tests actually verify the behaviour?\n"
-            "- Style: does the code follow the project conventions (AGENTS.md)?\n\n"
+            + (
+                _LITE_FOCUS
+                if lite
+                else (
+                    "## Focus\n\n"
+                    "- Correctness: does the code match the plan's intent?\n"
+                    "- Safety: are there fallbacks, swallowed errors, or silent degradation?\n"
+                    "- Tests: are the changes tested and do the tests actually verify the behaviour?\n"
+                    "- Style: does the code follow the project conventions (AGENTS.md)?\n\n"
+                )
+            )
         )
     else:
         objective = (
@@ -2714,15 +3031,20 @@ def _review_prompt(n: int) -> str:
         "Do not write the reviewed SHAs into the file — the pipeline records "
         "the base and head it reviewed at, immediately after you return.\n\n"
         "After the verdict, use these three sections:\n\n"
-        "- `## Blocking findings` — critical and major only. Each: severity, step name, "
-        "file and line, evidence (quote the code), impact, required change.\n"
+        "- `## Blocking findings` — critical and major only, each in the finding "
+        "format below.\n"
         "- `## Non-blocking` — minor findings and nits, one line each. They are handed "
         "to the human in the handoff; nobody will fix them in this run.\n"
         "- `## For the human` — anything out of scope, per the section above.\n\n"
         "`VERDICT: PASS` when no critical or major finding remains. Minor findings and "
         "nits do **not** hold the verdict: a run that is correct except for nits is a "
-        "run that should finish.\n\n"
-        f"## Manifest\n\n"
+        "run that should finish. `VERDICT: NEEDS_FIXES` needs at least one "
+        "`### B<k>` heading under `## Blocking findings`.\n\n"
+        + _REVIEW_FORMAT
+        + _FINDING_BAR
+        + _FALSE_POSITIVES
+        + _SETTLED_SECTION
+        + f"## Manifest\n\n"
         f"{{{read_manifest_stage}.output}}\n\n"
         + (
             f"## Round {n - 1} review\n\n"
@@ -2778,6 +3100,24 @@ _REVIEW_WRITE_GUARD = (
     build_write_allowlist_hooks([REVIEW_MD])
     if AGENT_PROVIDER == "claude-code"
     else None
+)
+
+
+def _both(first, second):
+    """AND two optional ``when`` predicates; None means no condition."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return lambda ctx: first(ctx) and second(ctx)
+
+
+# NEEDS_FIXES must carry at least one `### B<digits>` heading inside the
+# `## Blocking findings` section; the fix round has nothing to act on otherwise.
+_BLOCKING_HEADING_AWK = (
+    "/^## /{ in_blocking = ($0 ~ /^## Blocking findings[ \\t]*$/) } "
+    "in_blocking && /^### B[0-9]+/{ found = 1 } "
+    "END{ exit !found }"
 )
 
 
@@ -2880,21 +3220,34 @@ def _add_review_round(n: int, when) -> None:
     # spots a real bug fixes it — which the postcondition below then catches
     # after the review is paid for.  The write-guard turns the instruction
     # into a denied permission, so the reviewer reports the fix instead.
-    pipeline.stage(
-        f"review {n}",
-        Generate(
-            prompt=_review_prompt(n),
-            allowed_tools=["Read", "Glob", "Grep", "Bash", "Write"],
-            permission_mode="acceptEdits",
-            setting_sources=["project"],
-            model=REVIEW_MODEL,
-            max_turns=MAX_TURNS_REVIEW,
-            hooks=_REVIEW_WRITE_GUARD,
-        ),
-        on_failure=ask_user,
-        timeout=TIMEOUT_REVIEW,
-        when=when,
-    )
+    #
+    # Round 1 has two alternative stages, chosen by `review depth`: the full
+    # review with `review_model`, and a lite one on `standard` for a small,
+    # low-risk diff.  Rounds 2-3 check the previous round's findings and the
+    # fix commits, which `standard` handles whatever `review_model` says.
+    if n == 1:
+        variants = [
+            (f"review {n}", False, REVIEW_MODEL, file_exists(paths["full"])),
+            (f"review {n} lite", True, "standard", file_exists(paths["lite"])),
+        ]
+    else:
+        variants = [(f"review {n}", False, "standard", None)]
+    for stage_name, lite, model, depth_when in variants:
+        pipeline.stage(
+            stage_name,
+            Generate(
+                prompt=_review_prompt(n, lite=lite),
+                allowed_tools=["Read", "Glob", "Grep", "Bash", "Write"],
+                permission_mode="acceptEdits",
+                setting_sources=["project"],
+                model=model,
+                max_turns=MAX_TURNS_REVIEW,
+                hooks=_REVIEW_WRITE_GUARD,
+            ),
+            on_failure=ask_user,
+            timeout=TIMEOUT_REVIEW,
+            when=_both(when, depth_when),
+        )
 
     # --- review postcondition N ---
     # HEAD unchanged, nothing but review.md changed.
@@ -2974,6 +3327,9 @@ def _add_review_round(n: int, when) -> None:
         f'echo "ERROR: malformed review artifact — line 1 must be exactly '
         f"'VERDICT: PASS' or 'VERDICT: NEEDS_FIXES', got: $LINE1\" 1>&2; exit 1; fi && "
         f'if [ "$LINE1" = "VERDICT: NEEDS_FIXES" ]; then '
+        f"awk {q(_BLOCKING_HEADING_AWK)} {q(REVIEW_MD)} || "
+        f'{{ echo "ERROR: malformed review artifact — VERDICT: NEEDS_FIXES needs at '
+        f"least one '### B<k>' heading under '## Blocking findings'\" 1>&2; exit 1; }}; "
         f"touch {q(paths['needs_fixes'])}; fi && "
         f"exit 0"
     )
@@ -3102,7 +3458,25 @@ pipeline.stage(
     on_failure=fail,
 )
 
-# --- Round 1 (always runs) ---
+# --- review depth ---
+# Decides lite or full for round 1 and touches exactly one marker.  Always
+# re-run on --resume: the marker must describe the tree as it is now.
+pipeline.stage(
+    "review depth",
+    _ReviewDepth(),
+    on_failure=fail,
+    always_run=True,
+)
+
+# --- collect settled decisions ---
+# The SETTLED block of every step's closeout, quoted by every round's prompt.
+pipeline.stage(
+    "collect settled decisions",
+    _CollectSettledDecisions(),
+    on_failure=fail,
+)
+
+# --- Round 1 (always runs; one of two alternative review stages) ---
 _add_review_round(1, when=None)
 _add_review_fix_round(1)
 

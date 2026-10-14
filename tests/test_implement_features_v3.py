@@ -2756,7 +2756,6 @@ def test_round_1_stages_have_when_none() -> None:
     for sn in [
         "review manifest 1",
         "read review manifest 1",
-        "review 1",
         "review postcondition 1",
         "check review 1",
     ]:
@@ -2857,13 +2856,12 @@ def test_review_generate_config() -> None:
 
 
 def test_review_model_follows_review_model_knob() -> None:
-    """review stages model follows --arg review_model=deep."""
+    """Only the full round-1 review follows --arg review_model=deep."""
     from norn.stages.generate import Generate
     mod = _import_v2(GOOD_DIR, "--arg", "review_model=deep")
-    for n in range(1, 4):
-        s = _stage(mod, f"review {n}")
-        assert isinstance(s.impl, Generate)
-        assert s.impl.model == "deep", f"review {n}: model should be deep"
+    s = _stage(mod, "review 1")
+    assert isinstance(s.impl, Generate)
+    assert s.impl.model == "deep"
 
 
 # ---------------------------------------------------------------------------
@@ -3145,7 +3143,7 @@ async def test_check_review_needs_fixes_creates_marker(tmp_path, monkeypatch) ->
         f"VERDICT: NEEDS_FIXES\n"
         f"Base: {base_sha}\n"
         f"Head: {head_sha}\n"
-        f"\n## Findings\n- Fix foo\n"
+        f"\n## Blocking findings\n\n### B1 — Fix foo\nSeverity: major\n"
     )
 
     r = await _stage(mod, "check review 1").impl.run(ctx)
@@ -5873,3 +5871,391 @@ async def test_learn_agent_timeout_is_a_failed_outcome_not_a_failed_run(tmp_path
     assert status["publish learning proposal"] == "skipped_condition"
     outcome = ctx.results["record learning outcome"].output
     assert outcome == "failed: the learn agent timed out after 0.05s"
+
+
+# ---------------------------------------------------------------------------
+# Review depth gate, finding bar, settled decisions
+# ---------------------------------------------------------------------------
+
+
+def _numstat(*rows: tuple[int, int, str]) -> str:
+    return "".join(f"{a}\t{d}\t{p}\n" for a, d, p in rows)
+
+
+def test_review_depth_small_unflagged_diff_is_lite() -> None:
+    mod = _import_v2(GOOD_DIR)
+    mode, lines, flags = mod.review_depth(_numstat((100, 50, "src/app.py")), {})
+    assert (mode, lines, flags) == ("lite", 150, [])
+
+
+def test_review_depth_ci_file_forces_full() -> None:
+    mod = _import_v2(GOOD_DIR)
+    mode, lines, flags = mod.review_depth(
+        _numstat((100, 50, "src/app.py"), (3, 0, ".github/workflows/x.yml")), {}
+    )
+    assert mode == "full"
+    assert lines == 150, "a workflow file is not an executable line"
+    assert flags == ["ci"]
+
+
+def test_review_depth_concurrency_line_forces_full() -> None:
+    mod = _import_v2(GOOD_DIR)
+    mode, _, flags = mod.review_depth(
+        _numstat((10, 0, "src/app.py")), {"src/app.py": ["    lock = asyncio.Lock()"]}
+    )
+    assert mode == "full"
+    assert flags == ["concurrency"]
+    mode, _, flags = mod.review_depth(
+        _numstat((10, 0, "src/app.py")), {"src/app.py": ["    with Lock():"]}
+    )
+    assert (mode, flags) == ("full", ["concurrency"])
+
+
+def test_review_depth_250_lines_is_full() -> None:
+    mod = _import_v2(GOOD_DIR)
+    mode, lines, flags = mod.review_depth(_numstat((200, 50, "src/app.py")), {})
+    assert (mode, lines, flags) == ("full", 250, [])
+
+
+def test_review_depth_boundary_is_exclusive() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.REVIEW_LITE_MAX_LINES == 200
+    assert mod.review_depth(_numstat((199, 0, "a.py")), {})[0] == "lite"
+    assert mod.review_depth(_numstat((200, 0, "a.py")), {})[0] == "full"
+
+
+def test_review_depth_test_only_changes_count_zero() -> None:
+    mod = _import_v2(GOOD_DIR)
+    mode, lines, flags = mod.review_depth(
+        _numstat(
+            (500, 0, "tests/test_a.py"),
+            (500, 0, "src/test_b.py"),
+            (500, 0, "src/b_test.go"),
+            (500, 0, "web/a.spec.ts"),
+            (500, 0, "web/a.test.js"),
+            (500, 0, "bats/x.bats"),
+            (500, 0, "src/test/java/A.java"),
+            (500, 0, "__tests__/a.js"),
+        ),
+        {},
+    )
+    assert (mode, lines, flags) == ("lite", 0, [])
+
+
+def test_review_depth_docs_only_changes_count_zero() -> None:
+    mod = _import_v2(GOOD_DIR)
+    mode, lines, flags = mod.review_depth(
+        _numstat((900, 10, "README.md"), (400, 0, "docs/guide.rst"), (5, 5, "cfg.toml")), {}
+    )
+    assert (mode, lines, flags) == ("lite", 0, [])
+
+
+@pytest.mark.parametrize(
+    ("path", "flag"),
+    [
+        (".gitlab-ci.yml", "ci"),
+        ("Jenkinsfile", "ci"),
+        (".circleci/config.yml", "ci"),
+        ("azure-pipelines.yml", "ci"),
+        ("pkg/conftest.py", "test-harness"),
+        ("tox.ini", "test-harness"),
+        ("jest.config.js", "test-harness"),
+        ("vitest.config.ts", "test-harness"),
+        ("db/migrations/001.txt", "persistence"),
+        ("alembic/env.txt", "persistence"),
+        ("prisma/x.txt", "persistence"),
+        ("schema.graphql", "persistence"),
+        ("src/auth/handler.txt", "auth"),
+        ("src/oauth.txt", "auth"),
+        ("src/crypto/x.txt", "auth"),
+        ("src/billing/x.txt", "money"),
+        ("src/invoice.txt", "money"),
+    ],
+)
+def test_review_depth_path_flags(path: str, flag: str) -> None:
+    mod = _import_v2(GOOD_DIR)
+    mode, _, flags = mod.review_depth(_numstat((1, 0, path)), {})
+    assert mode == "full"
+    assert flag in flags
+
+
+def test_review_depth_concurrency_pattern_ignores_tests_and_docs() -> None:
+    mod = _import_v2(GOOD_DIR)
+    mode, _, _ = mod.review_depth(
+        _numstat((1, 0, "tests/test_a.py"), (1, 0, "README.md")),
+        {"tests/test_a.py": ["import threading"], "README.md": ["atomic writes"]},
+    )
+    assert mode == "lite"
+
+
+def test_review_depth_binary_numstat_row_counts_zero() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.review_depth("-\t-\tsrc/logo.py\n", {}) == ("lite", 0, [])
+
+
+def test_parse_added_lines_groups_by_path() -> None:
+    mod = _import_v2(GOOD_DIR)
+    diff = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n"
+        "-old\n+new one\n+new two\n"
+        "diff --git a/b.go b/b.go\n--- /dev/null\n+++ b/b.go\n@@ -0,0 +1 @@\n+go func() {}\n"
+        "diff --git a/c.py b/c.py\n--- a/c.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n"
+    )
+    assert mod.parse_added_lines(diff) == {
+        "a.py": ["new one", "new two"],
+        "b.go": ["go func() {}"],
+    }
+
+
+def test_review_depth_and_settled_stages_precede_round_1() -> None:
+    from norn.dsl import OnFailure
+    mod = _import_v2(GOOD_DIR)
+    names = [getattr(i, "name", None) for i in mod.config.items]
+    assert names.index("review preflight") < names.index("review depth")
+    assert names.index("review depth") < names.index("review manifest 1")
+    assert names.index("collect settled decisions") < names.index("review manifest 1")
+    assert _stage(mod, "review depth").on_failure == OnFailure.FAIL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("lines", "mode", "other"), [(10, "lite", "full"), (250, "full", "lite")])
+async def test_review_depth_stage_writes_one_marker(tmp_path, monkeypatch, lines, mode, other) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    ctx = PipelineContext()
+    assert (await _stage(mod, "record start").impl.run(ctx)).success
+    (repo_path / "app.py").write_text("x = 1\n" * lines)
+    repo.index.add(["app.py"])
+    repo.index.commit("add app")
+
+    # A marker from an earlier run of the other mode must not survive.
+    Path(mod._review_paths[1][other]).touch()
+
+    result = await _stage(mod, "review depth").impl.run(ctx)
+
+    assert result.success, result.error
+    assert os.path.exists(mod._review_paths[1][mode])
+    assert not os.path.exists(mod._review_paths[1][other])
+    text = Path(mod.REVIEW_DEPTH_MD).read_text()
+    assert f"mode: {mode}" in text
+    assert f"lines: {lines}" in text
+    assert "flags: none" in text
+
+
+def test_round_1_has_two_alternative_review_stages() -> None:
+    from norn.models import PipelineContext
+    from norn.stages.generate import Generate
+    mod = _import_v2(GOOD_DIR)
+    full, lite = _stage(mod, "review 1"), _stage(mod, "review 1 lite")
+    assert isinstance(full.impl, Generate) and isinstance(lite.impl, Generate)
+    assert full.impl.model == "standard" and lite.impl.model == "standard"
+    assert full.on_failure == lite.on_failure
+
+    paths = mod._review_paths[1]
+    ctx = PipelineContext()
+    for marker in (paths["lite"], paths["full"]):
+        Path(marker).unlink(missing_ok=True)
+    try:
+        assert full.when(ctx) is False and lite.when(ctx) is False
+        Path(paths["full"]).touch()
+        assert full.when(ctx) is True and lite.when(ctx) is False
+        Path(paths["full"]).unlink()
+        Path(paths["lite"]).touch()
+        assert full.when(ctx) is False and lite.when(ctx) is True
+    finally:
+        for marker in (paths["lite"], paths["full"]):
+            Path(marker).unlink(missing_ok=True)
+
+
+def test_round_1_review_stages_share_the_downstream_stages() -> None:
+    mod = _import_v2(GOOD_DIR)
+    names = [getattr(i, "name", None) for i in mod.config.items]
+    assert names.count("review postcondition 1") == 1
+    assert names.count("stamp review 1") == 1
+    assert names.count("check review 1") == 1
+    assert names.index("review 1") < names.index("review 1 lite") < names.index("review postcondition 1")
+
+
+def test_lite_review_has_the_short_focus_list_only() -> None:
+    mod = _import_v2(GOOD_DIR)
+    lite = _stage(mod, "review 1 lite").impl.prompt
+    full = _stage(mod, "review 1").impl.prompt
+    assert "Silent failure" in lite and "Tests that exercise the change" in lite
+    assert "Style: does the code follow the project conventions" not in lite
+    assert "Style: does the code follow the project conventions" in full
+
+
+def test_deep_review_model_applies_to_full_round_1_only() -> None:
+    mod = _import_v2(GOOD_DIR, "--arg", "review_model=deep")
+    assert _stage(mod, "review 1").impl.model == "deep"
+    assert _stage(mod, "review 1 lite").impl.model == "standard"
+    assert _stage(mod, "review 2").impl.model == "standard"
+    assert _stage(mod, "review 3").impl.model == "standard"
+
+
+def test_later_rounds_have_no_lite_variant() -> None:
+    mod = _import_v2(GOOD_DIR)
+    for n in (2, 3):
+        with pytest.raises(KeyError):
+            _stage(mod, f"review {n} lite")
+
+
+@pytest.mark.parametrize("name", ["review 1", "review 1 lite", "review 2", "review 3"])
+def test_every_review_prompt_carries_the_bar_the_format_and_settled(name: str) -> None:
+    mod = _import_v2(GOOD_DIR)
+    prompt = _stage(mod, name).impl.prompt
+    assert mod._FINDING_BAR in prompt
+    assert mod._FALSE_POSITIVES in prompt
+    assert mod._REVIEW_FORMAT in prompt
+    assert "## Settled decisions" in prompt
+    assert "{collect settled decisions.output}" in prompt
+    assert "only prefers an alternative to one of these is non-blocking" in prompt
+    assert "### B<k> — <title>" in prompt
+    assert "- <minor|nit|major-50|critical-50>: <finding> (<file>:<line>)" in prompt
+
+
+def test_finding_bar_defines_the_anchors_and_the_blocking_rule() -> None:
+    mod = _import_v2(GOOD_DIR)
+    bar = mod._FINDING_BAR
+    for anchor in ("- 0:", "- 25:", "- 50:", "- 75:", "- 100:"):
+        assert anchor in bar
+    assert "at least 75" in bar
+    assert "verbatim offending line" in bar
+    assert "at most 50" in bar
+
+
+def test_false_positives_list_is_complete() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = mod._FALSE_POSITIVES
+    for phrase in (
+        "pre-existing", "lint-level nits", "intentional", "handled elsewhere",
+        "restate the code", "no failure mode", "lint-ignore", "no written rule",
+        "speculative",
+    ):
+        assert phrase in text
+
+
+@pytest.mark.parametrize("name", ["review 1", "review 1 lite", "review 2", "review 3"])
+def test_review_prompt_braces_are_only_placeholders(name: str) -> None:
+    import re
+    prompt = _stage(_import_v2(GOOD_DIR), name).impl.prompt
+    found = re.findall(r"[{}]", prompt)
+    placeholders = re.findall(r"\{[^{}]+\.output\}", prompt)
+    assert len(found) == 2 * len(placeholders), prompt
+
+
+async def _check_review_with(tmp_path, monkeypatch, body: str):
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+    from norn.models import PipelineContext
+
+    Path(mod.REVIEW_MD).write_text(body)
+    marker = mod._review_paths[1]["needs_fixes"]
+    Path(marker).unlink(missing_ok=True)
+    result = await _stage(mod, "check review 1").impl.run(PipelineContext())
+    return result, os.path.exists(marker)
+
+
+_BLOCKING_B1 = (
+    "VERDICT: NEEDS_FIXES\n\n## Blocking findings\n\n### B1 — Swallowed error\n"
+    "Severity: major\nConfidence: 75\n\n## Non-blocking\n\n- nit: x (a.py:1)\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_check_review_needs_fixes_with_b_heading_passes(tmp_path, monkeypatch) -> None:
+    result, marker = await _check_review_with(tmp_path, monkeypatch, _BLOCKING_B1)
+    assert result.success, result.output
+    assert marker, "NEEDS_FIXES with a B heading must route the fix round"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        "VERDICT: NEEDS_FIXES\n\n## Blocking findings\n\n- major: no heading\n",
+        "VERDICT: NEEDS_FIXES\n\n## Findings\n\n- major: wrong section\n",
+        "VERDICT: NEEDS_FIXES\n",
+        # A B heading outside the blocking section does not count.
+        "VERDICT: NEEDS_FIXES\n\n## Blocking findings\n\nnone\n\n## For the human\n\n### B1 — misplaced\n",
+        # A heading that is not B<digits> does not count.
+        "VERDICT: NEEDS_FIXES\n\n## Blocking findings\n\n### Bad idea\n",
+    ],
+)
+async def test_check_review_needs_fixes_without_b_heading_is_malformed(tmp_path, monkeypatch, body) -> None:
+    result, marker = await _check_review_with(tmp_path, monkeypatch, body)
+    assert not result.success
+    assert "malformed" in _combined_output(result).lower()
+    assert "### B<k>" in _combined_output(result)
+    assert not marker, "a malformed artifact must not route a fix round"
+
+
+@pytest.mark.asyncio
+async def test_check_review_pass_needs_no_b_heading(tmp_path, monkeypatch) -> None:
+    result, marker = await _check_review_with(
+        tmp_path, monkeypatch, "VERDICT: PASS\n\n## Blocking findings\n\nnone\n"
+    )
+    assert result.success, result.output
+    assert not marker
+
+
+_CLOSEOUT_A = (
+    "EVIDENCE: test_a failed first\n"
+    "SETTLED: use a dict, not a class\n"
+    "keep the flat layout\n"
+    "DEVIATIONS: none\n"
+    "NOT_BUILT: none\n"
+    "NEXT_CONSTRAINTS: none\n"
+    "RISKS: none\n"
+)
+
+
+def test_extract_settled_takes_the_block_up_to_the_next_field() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.extract_settled(_CLOSEOUT_A) == "use a dict, not a class keep the flat layout"
+    assert mod.extract_settled("SETTLED:\nEVIDENCE: x\n") == "none"
+    assert mod.extract_settled("EVIDENCE: x\nRISKS: none\n") is None
+    assert mod.extract_settled("EVIDENCE: x\nSETTLED: last field\n") == "last field"
+
+
+def test_settled_decisions_covers_closeouts_skipped_and_missing_steps() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = mod.settled_decisions(
+        ["step-a", "step-b", "step-c", "step-d"],
+        {"step-b"},
+        {"step-a": _CLOSEOUT_A, "step-c": None, "step-d": "RISKS: none"},
+    )
+    assert text.splitlines() == [
+        "- step-a: use a dict, not a class keep the flat layout",
+        "- step-b: committed in an earlier run; see its commit",
+        "- step-c: no closeout was recorded",
+        "- step-d: no SETTLED block in its closeout",
+    ]
+    assert mod.settled_decisions([], set(), {}) == "none recorded"
+
+
+@pytest.mark.asyncio
+async def test_collect_settled_decisions_reads_closeout_results() -> None:
+    from norn.models import PipelineContext, StageResult
+    mod = _import_v2(GOOD_DIR)
+    ctx = PipelineContext()
+    stems = list(_GOOD_STEMS)
+    ctx.results[f"closeout {stems[0]}"] = StageResult(name="", success=True, output=_CLOSEOUT_A)
+    result = await _stage(mod, "collect settled decisions").impl.run(ctx)
+    assert result.success
+    lines = result.output.splitlines()
+    assert lines[0] == f"- {stems[0]}: use a dict, not a class keep the flat layout"
+    assert all("no closeout was recorded" in ln for ln in lines[1:])
+    assert len(lines) == len(stems)
