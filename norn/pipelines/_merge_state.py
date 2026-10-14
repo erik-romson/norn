@@ -1230,6 +1230,32 @@ def _ci_fix_section(paths: MergePaths, round_n: int) -> list[str]:
     ]
 
 
+def _learning_pointer_lines(paths: MergePaths, max_rounds: int) -> list[str]:
+    """Return one ``Learning proposal: <journal>/learning.md`` line per CI-fix child run that wrote one.
+
+    Reads ``ci-fix-<n>.json`` for every round; the ``journal`` field names the
+    child's run directory, and a proposal exists only when ``learning.md`` is
+    in it. A missing or unreadable file, or a journal without a proposal,
+    contributes nothing.
+    """
+    lines: list[str] = []
+    for round_n in range(1, max_rounds + 1):
+        text = _read_text(paths.ci_fix(round_n))
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        journal = data.get("journal") if isinstance(data, dict) else None
+        if not journal:
+            continue
+        proposal = Path(journal) / "learning.md"
+        if proposal.is_file():
+            lines.append(f"Learning proposal: {proposal}")
+    return lines
+
+
 def _copilot_review_section(paths: MergePaths, round_n: int) -> list[str]:
     """Render the ``## Copilot review`` block for ``render_summary``.
 
@@ -1483,8 +1509,13 @@ def render_summary(
     project_dir: str,
     test_cmd: str = "",
     local_fix_attempts: int | None = None,
+    learning_pointers: bool = False,
 ) -> str:
     """Render the ``<slug>-merge-state.md`` body.
+
+    ``learning_pointers`` (off by default, so ``merge_branch_v1``'s output is
+    unchanged) adds a ``Learning proposal: <journal>/learning.md`` line for
+    every CI-fix child run that wrote a proposal.
 
     Section order matches the plan's "Summary output" block; later steps only
     ever insert new sections here, never reorder these. ``Status`` is
@@ -1502,6 +1533,7 @@ def render_summary(
     round_n = _current_round(paths, max_rounds)
     status = _status(paths)
     warning_count = len(_warnings_lines(paths))
+    pointer_lines = _learning_pointer_lines(paths, max_rounds) if learning_pointers else []
 
     lines = [
         f"# merge_branch: {repo}, branch {branch}",
@@ -1531,6 +1563,11 @@ def render_summary(
         *_builds_section(paths, round_n),
         "",
         *_ci_fix_section(paths, round_n),
+        *(
+            [*pointer_lines, ""]
+            if pointer_lines
+            else []
+        ),
         *_copilot_review_section(paths, round_n),
         "",
         *_review_findings_section(paths, round_n),
@@ -1580,8 +1617,10 @@ class WriteMergeState(BaseStage):
         project_dir: str,
         test_cmd: str = "",
         local_fix_attempts: int | None = None,
+        learning_pointers: bool = False,
     ) -> None:
         self._paths = paths
+        self._learning_pointers = learning_pointers
         self._rerun_cmd = rerun_cmd
         self._max_rounds = max_rounds
         self._project_dir = project_dir
@@ -1597,6 +1636,7 @@ class WriteMergeState(BaseStage):
             project_dir=self._project_dir,
             test_cmd=self._test_cmd,
             local_fix_attempts=self._local_fix_attempts,
+            learning_pointers=self._learning_pointers,
         )
         summary_path = self._paths.summary(slug)
         Path(summary_path).parent.mkdir(parents=True, exist_ok=True)

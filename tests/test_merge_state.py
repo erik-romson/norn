@@ -238,6 +238,25 @@ def test_render_summary_missing_optional_files_render_as_none(tmp_path):
     assert "(none)" in body
 
 
+def test_render_summary_default_has_no_learning_pointer(tmp_path):
+    journal = tmp_path / "runs" / "1"
+    journal.mkdir(parents=True)
+    (journal / "learning.md").write_text("x\n")
+    paths = _merge_state.MergePaths(str(tmp_path / "work"))
+    Path(paths.root).mkdir(parents=True)
+    Path(paths.merged).write_text("deadbeef\n")
+    Path(paths.ci_fix(1)).write_text(json.dumps({"outcome": "ok", "journal": str(journal)}))
+    kwargs = dict(rerun_cmd="r", max_rounds=2, project_dir=str(tmp_path))
+
+    default = _merge_state.render_summary(paths, **kwargs)
+    explicit_off = _merge_state.render_summary(paths, learning_pointers=False, **kwargs)
+
+    assert "Learning proposal:" not in default
+    strip = lambda text: "\n".join(line for line in text.splitlines() if not line.startswith("Finished:"))
+    assert strip(default) == strip(explicit_off)
+    assert "Learning proposal:" in _merge_state.render_summary(paths, learning_pointers=True, **kwargs)
+
+
 def test_render_summary_local_tests_section_reports_commit_sha(tmp_path):
     repo = make_repo_with_remote(tmp_path / "checkout")
     repo.repo.git.checkout("-b", "feature-x")

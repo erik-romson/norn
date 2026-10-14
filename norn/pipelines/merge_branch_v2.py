@@ -37,6 +37,16 @@ Optional ``--arg`` knobs (not available under ``norn ui``, same as
   --arg budget=15             Cost ceiling in USD before the run pauses
                               (default: 15)
   --arg guidance="..."        Extra text passed verbatim to the local fixer
+  --arg followups=<path>      A ``followups.md`` written by implement_features_v3.
+                              Its "Unapplied review findings" section is put in
+                              the PR body inside one block marked
+                              ``<!-- norn:followups:start -->`` /
+                              ``<!-- norn:followups:end -->`` (replaced, never
+                              duplicated, on a second round). The run halts
+                              ``attribution_found`` when the file carries an
+                              assistant-attribution line. A missing file skips
+                              the stage. A relative path resolves against the
+                              launch directory. Kept by the rerun command.
   --arg overwrite_remote=<sha>  One-shot authorisation to force-push over
                               commits on the remote branch that have no
                               patch-equivalent on HEAD. Never repeated by the
@@ -72,6 +82,7 @@ from norn.pipelines._merge_gh import (
     check_findings_cmd,
     merge_cmd,
     post_findings_comment_cmd,
+    pr_followups_body_cmd,
     pr_not_draft_cmd,
     pr_open_or_reuse_cmd,
     push_cmd,
@@ -137,6 +148,10 @@ except (TypeError, ValueError):
 BASE_ARG = _args.get("base", "")
 OVERWRITE_REMOTE = _args.get("overwrite_remote", "")
 GUIDANCE = _args.get("guidance", "")
+# Optional followups.md to put in the PR body; a relative path resolves
+# against the launch directory. Empty means the stage is not added at all.
+_followups_arg = _args.get("followups", "")
+FOLLOWUPS = os.path.abspath(os.path.join(PROJECT_DIR, _followups_arg)) if _followups_arg else ""
 
 # check_and_fix_ci.py:160-164's precedence: explicit --arg, then env, then
 # auto-detect. Never raise here on an undetectable command (falls back to
@@ -743,6 +758,17 @@ def _add_round(n: int, gate) -> None:
         when=gate,
     )
 
+    if FOLLOWUPS:
+        config.stage(
+            f"add followups to pr {n}",
+            HaltingCommand(
+                cmd=pr_followups_body_cmd(PATHS, PROJECT_DIR, FOLLOWUPS, n),
+                paths=PATHS,
+                stage=f"add followups to pr {n}",
+            ),
+            when=all_of(gate, file_exists(FOLLOWUPS)),
+        )
+
     config.stage(
         f"pr is not draft {n}",
         HaltingCommand(
@@ -974,6 +1000,7 @@ config.stage(
         project_dir=PROJECT_DIR,
         test_cmd=TEST_CMD,
         local_fix_attempts=LOCAL_FIX_ATTEMPTS,
+        learning_pointers=True,
     ),
     on_failure=fail,
 )
@@ -1012,6 +1039,7 @@ config.stage(
         project_dir=PROJECT_DIR,
         test_cmd=TEST_CMD,
         local_fix_attempts=LOCAL_FIX_ATTEMPTS,
+        learning_pointers=True,
     ),
     on_failure=fail,
 )

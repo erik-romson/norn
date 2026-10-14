@@ -589,6 +589,61 @@ def pr_open_or_reuse_cmd(paths: MergePaths, project_dir: str) -> str:
     )
 
 
+FOLLOWUPS_START = "<!-- norn:followups:start -->"
+FOLLOWUPS_END = "<!-- norn:followups:end -->"
+FOLLOWUPS_SECTION = "## Unapplied review findings"
+
+
+def pr_followups_body_cmd(paths: MergePaths, project_dir: str, followups: str, n: int = 1) -> str:
+    """Return the POSIX sh fragment for ``add followups to pr {n}``.
+
+    The one place agent-written text enters a PR (everything else in the PR
+    comes from the human's own commits): the ``## Unapplied review findings``
+    section of a v3 ``followups.md``, written into one marked block of the PR
+    body. Halts ``attribution_found`` when the followups file matches
+    ``ATTRIBUTION_ERE``. Reads the current body into ``<work>/pr-body-<n>.md``,
+    drops any earlier block between :data:`FOLLOWUPS_START` and
+    :data:`FOLLOWUPS_END` (so a second round replaces the block, never
+    duplicates it), appends the new block and applies it with
+    ``gh pr edit --body-file``. A followups file without the section exits 1
+    (an unpredicted failure) rather than editing the PR with nothing in it.
+    Every file it writes is under the work root.
+    """
+    repo_path = shlex.quote(paths.repo)
+    pr_path = shlex.quote(paths.pr)
+    followups_path = shlex.quote(followups)
+    body_path = shlex.quote(paths._p(f"pr-body-{n}.md"))
+    section_path = shlex.quote(paths._p(f"pr-followups-{n}.md"))
+    pattern = shlex.quote(ATTRIBUTION_ERE)
+    start = shlex.quote(FOLLOWUPS_START)
+    end = shlex.quote(FOLLOWUPS_END)
+    section_re = shlex.quote("^" + FOLLOWUPS_SECTION + "[[:space:]]*$")
+    attribution_halt = halt_shell(paths, "attribution_found", f"printf '%s\\n' {followups_path}")
+    return (
+        f"cd {shlex.quote(project_dir)} || exit 1\n"
+        f"REPO=$(cat {repo_path}) || exit 1\n"
+        f"NUM=$(cat {pr_path}) || exit 1\n"
+        f"if grep -iE {pattern} {followups_path} >/dev/null; then\n"
+        f"{attribution_halt}"
+        "fi\n"
+        f"awk -v re={section_re} '$0 ~ re {{ f = 1; print; next }} /^## / {{ f = 0 }} f' "
+        f"{followups_path} > {section_path} || exit 1\n"
+        f"[ -s {section_path} ] || {{ echo \"no {FOLLOWUPS_SECTION} section in \"{followups_path}; exit 1; }}\n"
+        f'gh pr view "$NUM" -R "$REPO" --json body -q .body > {body_path} || exit 1\n'
+        f"awk -v s={start} -v e={end} "
+        "'index($0, s) { skip = 1 } !skip { print } index($0, e) { skip = 0 }' "
+        f"{body_path} > {body_path}.new || exit 1\n"
+        f"mv {body_path}.new {body_path} || exit 1\n"
+        "{\n"
+        "  printf '\\n'\n"
+        f"  printf '%s\\n' {start}\n"
+        f"  cat {section_path}\n"
+        f"  printf '%s\\n' {end}\n"
+        f"}} >> {body_path}\n"
+        f'gh pr edit "$NUM" -R "$REPO" --body-file {body_path} || exit 1\n'
+    )
+
+
 def pr_not_draft_cmd(paths: MergePaths, project_dir: str) -> str:
     """Return the POSIX sh fragment for round *n*'s ``pr is not draft {n}`` stage.
 

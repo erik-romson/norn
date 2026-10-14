@@ -545,7 +545,18 @@ upstream, no unpushed commits and a clean tree (also with `learn=off`).
 
 A copy of [`merge_branch_v1`](#merge_branch_v1) (see there for the stages, halts
 and knobs). The one difference in this step is the child: red PR checks start a
-`check_and_fix_ci_v2` run instead of `check_and_fix_ci_v1`.
+`check_and_fix_ci_v2` run instead of `check_and_fix_ci_v1`. Two additions:
+
+- `--arg followups=<path>` (optional; a relative path resolves against the launch
+  directory, and a rerun keeps it) takes a `followups.md` written by
+  `implement_features_v3`. Right after `open or reuse pr <n>`, the stage
+  `add followups to pr <n>` puts that file's `## Unapplied review findings`
+  section into the PR body, between `<!-- norn:followups:start -->` and
+  `<!-- norn:followups:end -->`. A second round replaces the block rather than
+  duplicating it. The stage is skipped when the file is missing, and the run halts
+  `attribution_found` when the file carries an assistant-attribution line.
+- The summary gets a `Learning proposal: <journal>/learning.md` line for each
+  `check_and_fix_ci_v2` child run that wrote a proposal.
 
 ## Renamed pipelines
 
