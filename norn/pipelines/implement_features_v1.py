@@ -31,9 +31,9 @@ Features:
   is skipped at pipeline build time.
 
 Usage:
-    norn run implement_features tmp/refactor
-    norn run implement_features tmp/refactor --dry-run
-    norn run implement_features tmp/refactor --skip "commit step-03-models"
+    norn run implement_features_v1 tmp/refactor
+    norn run implement_features_v1 tmp/refactor --dry-run
+    norn run implement_features_v1 tmp/refactor --skip "commit step-03-models"
 """
 
 import hashlib
@@ -343,7 +343,7 @@ if not step_files:
     # _load_pipeline handler (PipelineError needs a StageResult).
     raise ValueError(
         f"No step-*.md files found in {feature_dir}\n"
-        "Usage: norn run implement_features <directory>"
+        "Usage: norn run implement_features_v1 <directory>"
     )
 
 validation_commands: list[str] = []
@@ -393,7 +393,7 @@ for sf in step_files:
 # --- build pipeline --------------------------------------------------------
 
 pipeline = (
-    Pipeline("implement_features", default_model="standard")
+    Pipeline("implement_features_v1", default_model="standard")
     .alert(MacOSChannel())
 )
 

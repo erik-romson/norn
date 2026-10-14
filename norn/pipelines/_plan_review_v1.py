@@ -8,7 +8,7 @@ from typing import Any
 from norn.dsl import Pipeline, Stage, ask_user, fail, stage_failed
 from norn.model_labels import resolve_label
 from norn.models import PipelineContext, StageResult
-from norn.pipelines._plan_gates import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate
+from norn.pipelines._plan_gates_v1 import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate
 from norn.skills import Skill, resolve_skill_content
 from norn.stages.base import BaseStage
 from norn.stages.generate import Generate

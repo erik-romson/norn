@@ -1,5 +1,5 @@
 """Tests for norn/pipelines/_merge_gh.py (ResolveBranch, rebase_cmd) and for
-the merge_branch pipeline skeleton itself (norn/pipelines/merge_branch.py).
+the merge_branch pipeline skeleton itself (norn/pipelines/merge_branch_v1.py).
 
 All offline: a fake ``gh`` on PATH (tests.merge_fakes.install_fake_gh) and a
 gitpython working repo with a bare ``origin`` (tests.merge_fakes.make_repo_with_remote).
@@ -22,7 +22,7 @@ from git import Actor
 from norn.dsl import Loop, OnFailure, Parallel, Pipeline, Stage
 from norn.model_labels import ModelLabelError
 from norn.models import UsageRecord
-from norn.pipelines import _ci_estimate, _merge_gh, _merge_state, merge_branch
+from norn.pipelines import _ci_estimate, _merge_gh, _merge_state, merge_branch_v1 as merge_branch
 from norn.pipelines._ci_estimate import PollPlan
 from norn.stages.generate import Generate
 from tests.merge_fakes import RepoWithRemote, install_fake_gh, make_repo_with_remote, ctx_for
@@ -518,7 +518,7 @@ def _import_merge_branch(argv_tail: list[str] = (), cwd=None):
         sys.argv = [saved_argv[0], *argv_tail]
         if cwd is not None:
             os.chdir(str(cwd))
-        from norn.pipelines import merge_branch
+        from norn.pipelines import merge_branch_v1 as merge_branch
 
         return importlib.reload(merge_branch)
     finally:
@@ -729,7 +729,7 @@ def test_rerun_cmd_carries_args_except_overwrite_remote(tmp_path):
 
 def test_rerun_cmd_with_no_args_is_the_bare_command(tmp_path):
     mod = _import_merge_branch(cwd=tmp_path)
-    assert mod.RERUN_CMD == "norn run merge_branch --non-interactive"
+    assert mod.RERUN_CMD == "norn run merge_branch_v1 --non-interactive"
 
 
 # ---------------------------------------------------------------------------
@@ -2188,7 +2188,7 @@ async def test_ci_fix_child_success_writes_passed_outcome_no_halt(tmp_path):
 
 
 def _write_child_journal(tmp_path: Path, *, failed_stage: str, error: str) -> Path:
-    run_dir = tmp_path / "check_and_fix_ci.runs" / "1"
+    run_dir = tmp_path / "check_and_fix_ci_v1.runs" / "1"
     (run_dir / "stages").mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({"success": False, "failed_stage": failed_stage}))
     (run_dir / "stages" / "0001-stage_x-a1.json").write_text(

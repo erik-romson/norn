@@ -1243,7 +1243,7 @@ def ci_fix_child_cmd(project_dir: str, workflows: list[str], test_cmd: str, budg
     """
     return (
         f"cd {shlex.quote(project_dir)} && "
-        f"{shlex.quote(sys.executable)} -m norn run check_and_fix_ci --non-interactive "
+        f"{shlex.quote(sys.executable)} -m norn run check_and_fix_ci_v1 --non-interactive "
         f"--arg workflow={shlex.quote(','.join(workflows))} "
         f"--arg test_cmd={shlex.quote(test_cmd)} --budget {budget}"
     )
@@ -1308,7 +1308,7 @@ class CiFixChild(HaltOnTimeout):
         return max(round(min(limits) - spent, 2), _MIN_CHILD_BUDGET)
 
     def _runs_dir(self) -> Path:
-        return Path(self._project_dir) / "check_and_fix_ci.runs"
+        return Path(self._project_dir) / "check_and_fix_ci_v1.runs"
 
     def _write_outcome(self, outcome: str, run_dir: Path | None) -> None:
         data = {"outcome": outcome, "journal": str(run_dir) if run_dir else None}
@@ -1319,7 +1319,7 @@ class CiFixChild(HaltOnTimeout):
 
         if run_dir is None:
             return (
-                f"check_and_fix_ci left no journal under {self._runs_dir()} "
+                f"check_and_fix_ci_v1 left no journal under {self._runs_dir()} "
                 "— it failed before norn started it"
             )
         run_json_path = run_dir / "run.json"

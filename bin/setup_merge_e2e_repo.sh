@@ -352,7 +352,7 @@ Scenario 1 (branch cut from develop):
   cd $DIR
   git switch develop && git switch -c feature/one
   echo '- feature one' >> CHANGELOG.md && git commit -am "docs: note feature one"
-  uv run --project $NORN_ROOT norn run merge_branch --non-interactive
+  uv run --project $NORN_ROOT norn run merge_branch_v1 --non-interactive
 
 Scenario 2 needs develop == main: fast-forward main to develop first, e.g.
   git push origin develop:main   (after develop's checks are green)

@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from norn.models import PipelineContext
-from norn.pipelines._plan_gates import (
+from norn.pipelines._plan_gates_v1 import (
     OpenQuestionsGate,
     ReviewDispositionGate,
     StepFilesGate,
@@ -699,7 +699,7 @@ async def test_step_files_gate_accepts_every_v2_key(tmp_path):
 
 def test_gate_key_sets_match_implement_features_v2():
     """The gate's copies of v2's allowed keys must not drift from the loader's."""
-    from norn.pipelines._plan_gates import V2_INDEX_KEYS, V2_STEP_KEYS
+    from norn.pipelines._plan_gates_v1 import V2_INDEX_KEYS, V2_STEP_KEYS
     from tests.test_implement_features_v2 import GOOD_DIR, _import_v2
 
     v2 = _import_v2(GOOD_DIR)

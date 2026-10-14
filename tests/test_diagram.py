@@ -81,7 +81,7 @@ def test_vanilla_change_pipeline():
     """Smoke test against a real bundled pipeline."""
     from norn.catalog import load_bundled_pipeline
 
-    pipeline = load_bundled_pipeline("vanilla_change")
+    pipeline = load_bundled_pipeline("vanilla_change_v1")
     result = to_mermaid(pipeline)
     assert "flowchart TD" in result
     assert "implement" in result
@@ -93,10 +93,10 @@ def test_to_markdown_bundled():
     from norn.catalog import get_pipeline_info, load_bundled_pipeline
     from norn.diagram import to_markdown
 
-    info = get_pipeline_info("vanilla_change")
-    pipeline = load_bundled_pipeline("vanilla_change")
+    info = get_pipeline_info("vanilla_change_v1")
+    pipeline = load_bundled_pipeline("vanilla_change_v1")
     result = to_markdown(pipeline, str(info.path))
-    assert result.startswith("# vanilla_change")
+    assert result.startswith("# vanilla_change_v1")
     assert "```mermaid" in result
     assert "ANTHROPIC_API_KEY" in result
     assert "**args**" in result

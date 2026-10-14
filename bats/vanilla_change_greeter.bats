@@ -39,7 +39,7 @@ teardown() {
 }
 
 @test "vanilla_change pipeline generates greeter from spec" {
-    run uv run python -m norn run vanilla_change -v \
+    run uv run python -m norn run vanilla_change_v1 -v \
         --skip "test bats" \
         "Create a Python class based on this spec: @examples/spec.txt Place it in tmp/hello/src/greeter.py, then create a pytest test for it in tmp/hello/tests/test_greeter.py. The test should verify the greet() method returns the expected string."
     assert_success

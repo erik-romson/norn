@@ -566,11 +566,11 @@ def test_cli_run_dry_run_evaluate_flag(capsys):
     """run --dry-run --evaluate is accepted (evaluate ignored during dry-run)."""
     from norn.cli import main
 
-    with patch("sys.argv", ["norn", "run", "hello", "--dry-run", "--evaluate"]):
+    with patch("sys.argv", ["norn", "run", "hello_v1", "--dry-run", "--evaluate"]):
         main()
 
     captured = capsys.readouterr()
-    assert "hello" in captured.out
+    assert "hello_v1" in captured.out
 
 
 # ---------------------------------------------------------------------------

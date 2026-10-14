@@ -17,11 +17,11 @@ norn repo:
 
 Run with::
 
-    norn run check_and_fix_ci
-    norn run check_and_fix_ci --arg workflow=ci.yml
-    norn run check_and_fix_ci --arg workflow=ci.yml,release.yml
-    norn run check_and_fix_ci --arg test_cmd="uv run python -m pytest tests/test_runner.py -v"
-    norn run check_and_fix_ci --arg skip_local=true
+    norn run check_and_fix_ci_v1
+    norn run check_and_fix_ci_v1 --arg workflow=ci.yml
+    norn run check_and_fix_ci_v1 --arg workflow=ci.yml,release.yml
+    norn run check_and_fix_ci_v1 --arg test_cmd="uv run python -m pytest tests/test_runner.py -v"
+    norn run check_and_fix_ci_v1 --arg skip_local=true
 
 Set ``FIX_CI_LOOP_VERBOSE=1`` to dump full extracted CI logs to stderr.
 """
@@ -48,7 +48,7 @@ def _ensure_githubkit() -> None:
     except ImportError:
         pass
 
-    print("[check_and_fix_ci] installing githubkit into active venv...", file=sys.stderr)
+    print("[check_and_fix_ci_v1] installing githubkit into active venv...", file=sys.stderr)
     subprocess.check_call(
         ["uv", "pip", "install", "--quiet", "--python", sys.executable, "githubkit"],
     )
@@ -150,11 +150,11 @@ SKIP_LOCAL = _args.get("skip_local", "false").lower() in ("1", "true", "yes")
 LOCAL_FIX_MODEL = _args.get("local_fix_model", "standard")
 CI_FIX_MODEL = _args.get("ci_fix_model", "standard")
 
-print(f"[check_and_fix_ci] test_cmd       = {LOCAL_TEST_CMD}", file=sys.stderr)
-print(f"[check_and_fix_ci] local_fix_model = {LOCAL_FIX_MODEL}", file=sys.stderr)
-print(f"[check_and_fix_ci] ci_fix_model    = {CI_FIX_MODEL}", file=sys.stderr)
+print(f"[check_and_fix_ci_v1] test_cmd       = {LOCAL_TEST_CMD}", file=sys.stderr)
+print(f"[check_and_fix_ci_v1] local_fix_model = {LOCAL_FIX_MODEL}", file=sys.stderr)
+print(f"[check_and_fix_ci_v1] ci_fix_model    = {CI_FIX_MODEL}", file=sys.stderr)
 print(
-    f"[check_and_fix_ci] app_packages    = "
+    f"[check_and_fix_ci_v1] app_packages    = "
     f"{','.join(APP_PACKAGES) if APP_PACKAGES else '(infer)'}",
     file=sys.stderr,
 )
@@ -240,7 +240,7 @@ class CheckCIWithLogs(BaseStage):
         for raw in self.workflows:
             workflow = raw.strip()
             print(
-                f"[check_and_fix_ci] checking workflow {workflow!r} "
+                f"[check_and_fix_ci_v1] checking workflow {workflow!r} "
                 f"(polling up to {self.ci_kwargs.get('timeout_minutes', '?')}m)...",
                 file=sys.stderr,
                 flush=True,
@@ -254,7 +254,7 @@ class CheckCIWithLogs(BaseStage):
             conclusion = output.get("conclusion") if isinstance(output, dict) else None
             status = "green" if result.success else "RED"
             print(
-                f"[check_and_fix_ci]   → {workflow} {status} "
+                f"[check_and_fix_ci_v1]   → {workflow} {status} "
                 f"(run_id={run_id}, conclusion={conclusion}) {url}",
                 file=sys.stderr,
                 flush=True,
@@ -265,14 +265,14 @@ class CheckCIWithLogs(BaseStage):
 
             if VERBOSE:
                 print(
-                    f"[check_and_fix_ci] ----- captured logs for {workflow} "
+                    f"[check_and_fix_ci_v1] ----- captured logs for {workflow} "
                     f"({len(logs)} chars) -----",
                     file=sys.stderr,
                     flush=True,
                 )
                 print(logs, file=sys.stderr, flush=True)
                 print(
-                    f"[check_and_fix_ci] ----- end logs for {workflow} -----",
+                    f"[check_and_fix_ci_v1] ----- end logs for {workflow} -----",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -420,7 +420,7 @@ class AssertUsefulLogs(BaseStage):
 # --- pipeline -------------------------------------------------------------
 
 pipeline = (
-    Pipeline("check_and_fix_ci", default_model="standard")
+    Pipeline("check_and_fix_ci_v1", default_model="standard")
     .alert(MacOSChannel())
 )
 

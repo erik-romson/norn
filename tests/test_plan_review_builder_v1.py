@@ -6,7 +6,7 @@ import pytest
 from norn.dsl import ClearContext, Loop, OnFailure, Pipeline, Stage
 from norn.models import PipelineContext
 from norn.pipelines._launch_tree import AssertLaunchTree
-from norn.pipelines._plan_review import WaitForApproval, add_plan_review_stages
+from norn.pipelines._plan_review_v1 import WaitForApproval, add_plan_review_stages
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ def test_review_prompt_does_not_ask_codex_to_write_the_file():
     rejected patch and emit "the workspace is mounted read-only" as its final
     message — which `-o` then wrote to the review path, failing the shape gate.
     """
-    from norn.pipelines._plan_review import review_prompt
+    from norn.pipelines._plan_review_v1 import review_prompt
 
     prompt = review_prompt(plan=_PLAN, preplan=_PREPLAN, review=_REVIEW)
     assert "Write your review to" not in prompt
@@ -155,7 +155,7 @@ def test_split_prompt_forbids_verifying_test_cmds_by_running_them():
     """Regression: the split agent ran full Maven builds in the background to
     check its `test_cmd`s, and read another repo's step files and norn's own
     source, turning a file-writing stage into a 23-minute deep-model session."""
-    from norn.pipelines._plan_review import split_prompt
+    from norn.pipelines._plan_review_v1 import split_prompt
 
     prompt = split_prompt(plan=_PLAN, steps_dir=_STEPS_DIR)
     assert "Do not run the build, the tests or any\n`test_cmd`" in prompt

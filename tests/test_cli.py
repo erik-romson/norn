@@ -69,19 +69,19 @@ def test_list_shows_bundled_pipelines(capsys):
     with patch("sys.argv", ["norn", "list"]):
         main()
     captured = capsys.readouterr()
-    assert "hello" in captured.out
-    assert "vanilla_change" in captured.out
-    assert "implement_features" in captured.out
+    assert "hello_v1" in captured.out
+    assert "vanilla_change_v1" in captured.out
+    assert "implement_features_v1" in captured.out
 
 
 # --- describe subcommand ---
 
 
 def test_describe_shows_pipeline_details(capsys):
-    with patch("sys.argv", ["norn", "describe", "hello"]):
+    with patch("sys.argv", ["norn", "describe", "hello_v1"]):
         main()
     captured = capsys.readouterr()
-    assert "hello" in captured.out
+    assert "hello_v1" in captured.out
 
 
 def test_describe_unknown_pipeline_exits():
@@ -96,7 +96,7 @@ def test_describe_unknown_pipeline_exits():
 
 def test_run_resolves_bundled_pipeline_name():
     """Verify that `norn run hello --dry-run` resolves the bundled pipeline."""
-    with patch("sys.argv", ["norn", "run", "hello", "--dry-run"]):
+    with patch("sys.argv", ["norn", "run", "hello_v1", "--dry-run"]):
         # dry-run prints structure and returns without executing
         main()
 
@@ -432,7 +432,7 @@ def test_non_interactive_passes_responder_to_run_pipeline():
     """--non-interactive wires a NonInteractiveResponder into run_pipeline."""
     mock_run = AsyncMock(return_value=None)
     with patch("norn.cli.run_pipeline", mock_run):
-        with patch("sys.argv", ["norn", "run", "hello", "--non-interactive"]):
+        with patch("sys.argv", ["norn", "run", "hello_v1", "--non-interactive"]):
             main()
 
     assert mock_run.called
@@ -450,7 +450,7 @@ def test_budget_flags_override_the_pipeline_limit():
     with patch("norn.cli.run_pipeline", mock_run):
         with patch(
             "sys.argv",
-            ["norn", "run", "hello", "--budget", "250", "--token-budget", "4000000"],
+            ["norn", "run", "hello_v1", "--budget", "250", "--token-budget", "4000000"],
         ):
             main()
 
@@ -463,14 +463,14 @@ def test_without_budget_flags_the_pipeline_keeps_its_own_limits():
     """No flags means no budget is invented for a pipeline that declares none."""
     import importlib
 
-    import norn.pipelines.hello
+    import norn.pipelines.hello_v1
 
     # A bundled pipeline object is module-level and lives as long as the
     # process; reload it so an earlier test's override cannot leak in here.
-    importlib.reload(norn.pipelines.hello)
+    importlib.reload(norn.pipelines.hello_v1)
     mock_run = AsyncMock(return_value=None)
     with patch("norn.cli.run_pipeline", mock_run):
-        with patch("sys.argv", ["norn", "run", "hello"]):
+        with patch("sys.argv", ["norn", "run", "hello_v1"]):
             main()
 
     assert mock_run.call_args.args[0].budgets == []
@@ -478,7 +478,7 @@ def test_without_budget_flags_the_pipeline_keeps_its_own_limits():
 
 def test_step_and_non_interactive_are_mutually_exclusive():
     """--step --non-interactive must exit non-zero."""
-    with patch("sys.argv", ["norn", "run", "hello", "--step", "--non-interactive"]):
+    with patch("sys.argv", ["norn", "run", "hello_v1", "--step", "--non-interactive"]):
         with pytest.raises(SystemExit) as exc_info:
             main()
     assert exc_info.value.code != 0

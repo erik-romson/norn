@@ -132,7 +132,7 @@ def test_run_fzf_dirs_only_passes_type_d(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_args_prompt_collects_values() -> None:
     """Filling inputs and submitting returns the values keyed by arg name."""
-    app = ArgsPromptApp("implement_features", {"args": "Path to directory of step files"})
+    app = ArgsPromptApp("implement_features_v1", {"args": "Path to directory of step files"})
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = app.screen

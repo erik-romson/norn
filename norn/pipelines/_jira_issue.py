@@ -80,13 +80,13 @@ def resolve_issue_args(argv: list[str]) -> tuple[str, bool]:
 
     if len(keys) == 0:
         raise ValueError(
-            "fix_jira_issue needs a Jira issue key as its positional argument, "
-            "e.g. norn run fix_jira_issue CBS-2249"
+            "fix_jira_issue_v1 needs a Jira issue key as its positional argument, "
+            "e.g. norn run fix_jira_issue_v1 CBS-2249"
         )
     if len(keys) > 1:
         found = ", ".join(keys)
         raise ValueError(
-            f"fix_jira_issue found multiple issue keys and cannot choose: {found}"
+            f"fix_jira_issue_v1 found multiple issue keys and cannot choose: {found}"
         )
 
     return keys[0], stop_flag

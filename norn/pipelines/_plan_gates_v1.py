@@ -1,4 +1,4 @@
-"""Private gate stages for plan_with_review — not a pipeline."""
+"""Private gate stages for plan_with_review_v1 — not a pipeline."""
 from __future__ import annotations
 
 import re

@@ -16,7 +16,7 @@ from norn.dsl import ClearContext, Loop, OnFailure, Pipeline, Stage
 from norn.event_sink import EventSink
 from norn.graph import build_graph
 from norn.models import PipelineContext, StageResult
-from norn.pipelines._plan_gates import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate
+from norn.pipelines._plan_gates_v1 import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate
 from norn.responder import InputResponder
 from norn.runner import PipelineError, run_pipeline
 from norn.stages.base import BaseStage
@@ -43,7 +43,7 @@ def _import_plan_with_review():
     saved = list(sys.argv)
     sys.argv = [saved[0], str(FIXTURE_PREPLAN)]
     try:
-        from norn.pipelines import plan_with_review
+        from norn.pipelines import plan_with_review_v1 as plan_with_review
 
         return importlib.reload(plan_with_review)
     finally:

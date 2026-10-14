@@ -336,8 +336,8 @@ async def test_launcher_with_real_bundled_pipelines() -> None:
         # At least the bundled pipelines + open-file row
         assert screen.get_pipeline_count() >= len(bundled) + 1
         names = screen.get_row_names()
-        # hello is a known bundled pipeline
-        assert "hello" in names
+        # hello_v1 is a known bundled pipeline
+        assert "hello_v1" in names
 
 
 # ---------------------------------------------------------------------------

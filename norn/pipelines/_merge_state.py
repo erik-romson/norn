@@ -842,8 +842,8 @@ class AssertFreshRun(BaseStage):
                 name="",
                 success=False,
                 error=(
-                    "merge_branch does not resume: every stage is idempotent — "
-                    "rerun `norn run merge_branch` without --resume"
+                    "merge_branch_v1 does not resume: every stage is idempotent — "
+                    "rerun `norn run merge_branch_v1` without --resume"
                 ),
             )
         args = ctx.params.get("args")
@@ -852,7 +852,7 @@ class AssertFreshRun(BaseStage):
                 name="",
                 success=False,
                 error=(
-                    f"merge_branch takes no positional arguments (got: {args}); "
+                    f"merge_branch_v1 takes no positional arguments (got: {args}); "
                     "pass the base as `--arg base=X`"
                 ),
             )

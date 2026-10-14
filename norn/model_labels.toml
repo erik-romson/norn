@@ -24,7 +24,7 @@ effort = "xhigh"
 since  = "2026-10-05"
 context_window = 1000000
 
-[codex.review]           # plan review in plan_with_review / fix_jira_issue
+[codex.review]           # plan review in plan_with_review_v1 / fix_jira_issue_v1
 model  = "gpt-5.6-sol"
 effort = "high"          # mirrors ~/.codex/config.toml on the dev machine today
 since  = "2026-09-07"

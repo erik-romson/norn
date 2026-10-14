@@ -32,7 +32,7 @@ def _import_implement_features():
     saved = list(sys.argv)
     sys.argv = [saved[0], str(FIXTURE_FEATURE_DIR)]
     try:
-        from norn.pipelines import implement_features
+        from norn.pipelines import implement_features_v1 as implement_features
 
         return importlib.reload(implement_features)
     finally:
@@ -46,7 +46,7 @@ def test_pipelines_package_exists() -> None:
 
 def test_hello_has_metadata() -> None:
     """hello.py exposes a metadata dict."""
-    from norn.pipelines import hello
+    from norn.pipelines import hello_v1 as hello
 
     assert isinstance(hello.metadata, dict)
     assert "args" in hello.metadata
@@ -54,7 +54,7 @@ def test_hello_has_metadata() -> None:
 
 def test_vanilla_change_has_metadata() -> None:
     """vanilla_change.py exposes a metadata dict."""
-    from norn.pipelines import vanilla_change
+    from norn.pipelines import vanilla_change_v1 as vanilla_change
 
     assert isinstance(vanilla_change.metadata, dict)
     assert "env_vars" in vanilla_change.metadata
@@ -72,7 +72,7 @@ def test_implement_features_has_metadata() -> None:
 
 def test_hello_generate_stages_have_no_pinned_cwd() -> None:
     """hello.py Generate stages must not pin a cwd so they inherit ctx.working_dir."""
-    from norn.pipelines import hello
+    from norn.pipelines import hello_v1 as hello
 
     generates = list(_collect_generates(hello.config.items))
     assert generates, "expected at least one Generate stage in hello"
@@ -85,7 +85,7 @@ def test_hello_generate_stages_have_no_pinned_cwd() -> None:
 
 def test_vanilla_change_generate_stages_have_no_pinned_cwd() -> None:
     """vanilla_change.py Generate stages must not pin a cwd so they inherit ctx.working_dir."""
-    from norn.pipelines import vanilla_change
+    from norn.pipelines import vanilla_change_v1 as vanilla_change
 
     generates = list(_collect_generates(vanilla_change.config.items))
     assert generates, "expected at least one Generate stage in vanilla_change"

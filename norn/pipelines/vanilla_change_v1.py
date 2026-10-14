@@ -1,8 +1,8 @@
 """Apply a free-text change to the repo you launched from.
 
 Usage:
-    norn run vanilla_change "Add a --dry-run flag to the CLI"
-    norn run vanilla_change -v "Rename StageResult.error to message"
+    norn run vanilla_change_v1 "Add a --dry-run flag to the CLI"
+    norn run vanilla_change_v1 -v "Rename StageResult.error to message"
 
 The pipeline:
 1. Claude implements the change (CLAUDE.md loaded automatically via setting_sources)
@@ -19,7 +19,7 @@ metadata = {
 }
 
 config = (
-    Pipeline("vanilla_change", default_model="standard")
+    Pipeline("vanilla_change_v1", default_model="standard")
 
     # Step 1: implement the change (runs once)
     .stage("implement", Generate(

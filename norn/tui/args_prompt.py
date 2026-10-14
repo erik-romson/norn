@@ -2,7 +2,7 @@
 
 After a pipeline is chosen in the launcher, pipelines that declare ``args`` in
 their ``metadata`` need values before a run can start (e.g. the bundled
-``implement_features`` pipeline needs the directory holding ``step-*.md``
+``implement_features_v1`` pipeline needs the directory holding ``step-*.md``
 files).  This module renders one input per declared arg and, for args whose
 description looks like a filesystem path, offers an ``fzf`` picker
 (``ctrl+o``) so the user can fuzzy-find a file or folder instead of typing it.

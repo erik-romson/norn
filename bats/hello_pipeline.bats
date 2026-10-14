@@ -41,7 +41,7 @@ teardown() {
 }
 
 @test "hello pipeline generates greeter and passes tests" {
-    run uv run python -m norn run hello -v
+    run uv run python -m norn run hello_v1 -v
     assert_success
     assert_output --partial "all stages passed"
     assert_file_exist "$OUTPUT_DIR/src/greeter.py"

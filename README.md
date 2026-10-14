@@ -68,7 +68,7 @@ Org configs live under `~/.norn/orgs/` by default. Set `NORN_CONFIG_DIR` to over
 
 ```bash
 # Run a bundled pipeline by name
-uv run python -m norn run hello
+uv run python -m norn run hello_v1
 
 # Run an external pipeline config file
 uv run python -m norn run examples/derived.py
@@ -81,7 +81,7 @@ Discover bundled pipelines and inspect available model labels:
 
 ```bash
 uv run python -m norn list
-uv run python -m norn describe hello
+uv run python -m norn describe hello_v1
 uv run python -m norn models
 ```
 
@@ -125,7 +125,7 @@ Set the ceiling before the run instead of negotiating with it mid-run: pass
 pipeline's own limit), or — for pipelines that declare them — use their
 `--arg budget=` knob.
 
-### plan_with_review
+### plan_with_review_v1
 
 Takes a pre-plan (a brief describing what the real plan must cover) and produces
 a finished, reviewed plan, split into step files. It pauses for you when the
@@ -134,7 +134,7 @@ applies the review, and it ends by splitting the plan with the project's
 `split-plan` skill.
 
 ```bash
-uv run python -m norn run plan_with_review tmp/my-feature-preplan.md
+uv run python -m norn run plan_with_review_v1 tmp/my-feature-preplan.md
 ```
 
 For a pre-plan at `tmp/<slug>-preplan.md`, the pipeline writes four files and
@@ -185,7 +185,7 @@ meter because `RunCommand` reports no usage.
 `implement_features_v2` implements a feature described by a directory of step
 files, committing each step's changes, running an aggregate validation pass,
 gating on a structured review, and writing a handoff document. It is a deliberate
-parallel implementation of `implement_features` that closes v1 correctness gaps;
+parallel implementation of `implement_features_v1` that closes v1 correctness gaps;
 both ship side by side until v2 has enough completed runs to replace v1, and v1
 is frozen.
 
@@ -234,14 +234,14 @@ validation failed ends that attempt at once instead of rerunning the command.
 Answering `[r]` on the exhausted loop always reruns it in full, for a flaky
 failure or one fixed outside the tree.
 
-### fix_jira_issue
+### fix_jira_issue_v1
 
-`fix_jira_issue` takes a Jira issue key and carries it end-to-end: fetches the
+`fix_jira_issue_v1` takes a Jira issue key and carries it end-to-end: fetches the
 issue, writes a structured brief, plans, reviews the plan, and implements it on
 a branch — all in one command.
 
 ```bash
-uv run python -m norn run fix_jira_issue CBS-2249
+uv run python -m norn run fix_jira_issue_v1 CBS-2249
 ```
 
 The run works on a branch named after the issue. When the branch you are
@@ -279,7 +279,7 @@ honoured.
 before implementation starts:
 
 ```bash
-uv run python -m norn run fix_jira_issue CBS-2249 stop
+uv run python -m norn run fix_jira_issue_v1 CBS-2249 stop
 ```
 
 A macOS toast fires when the plan is ready; open `<KEY>-final-plan.md`, read
@@ -301,7 +301,7 @@ gitignored before spending any tokens. Add them to `.git/info/exclude` (or
 
 ```
 tmp/jira/CBS-2249
-fix_jira_issue.checkpoint
+fix_jira_issue_v1.checkpoint
 implement_features_v2.checkpoint
 ```
 
@@ -316,18 +316,18 @@ on re-run. To rerun manually:
 uv run python -m norn run implement_features_v2 tmp/jira/CBS-2249/CBS-2249-final-plan
 ```
 
-### merge_branch
+### merge_branch_v1
 
-`merge_branch` takes the current feature branch from "committed locally" to
+`merge_branch_v1` takes the current feature branch from "committed locally" to
 "merged into its base branch": resolve the base and rebase, loop the local
 test suite with an LLM either fixing a failure or saying STOP, push, open or
 reuse the PR and request Copilot as reviewer, wait out the PR's checks
-(handing red Actions checks to a `check_and_fix_ci` child run) and Copilot's
+(handing red Actions checks to a `check_and_fix_ci_v1` child run) and Copilot's
 review, classify and post review findings, fast-forward merge, and watch the
 post-merge build.
 
 ```bash
-uv run python -m norn run merge_branch --non-interactive
+uv run python -m norn run merge_branch_v1 --non-interactive
 ```
 
 `--non-interactive` is the fire-and-forget form: the run never pauses for a
@@ -348,7 +348,7 @@ human, so if it halts it simply ends (a halted guard still exits 0, but
   `--auto` would end the run before the merge happens, with the outcome
   unknown.
 
-**CLI-only knobs** (not available under `norn ui`, same as `fix_jira_issue`):
+**CLI-only knobs** (not available under `norn ui`, same as `fix_jira_issue_v1`):
 
 | Knob | Default | Description |
 | --- | --- | --- |
@@ -371,9 +371,9 @@ The prompt offers:
 - `[r]etry` — asks again (nothing about the halt changes by retrying the
   prompt itself; fix the underlying cause and rerun the pipeline instead).
 
-**Red PR checks** start a `check_and_fix_ci` child run (at most one per
+**Red PR checks** start a `check_and_fix_ci_v1` child run (at most one per
 round) with its own journal under `<state-key>.runs/<n>/` and its own
-lifecycle notifications, separate from `merge_branch`'s. A merge that lands
+lifecycle notifications, separate from `merge_branch_v1`'s. A merge that lands
 with no push-triggered workflow on the base within 120 seconds still ends
 `MERGED`, with a warning in the summary and a notification — not a halt; a
 base branch with no CI at all is not this run's problem. CI that runs longer
@@ -428,6 +428,37 @@ A few halts are structural, not bugs to route around:
 | `base_build_red`, `base_build_timeout` | The merge landed and the base build is red. Fix the base. |
 | `unexpected_failure` | Read `## Why it stopped` in the summary. Transient (gh 5xx, network)? Rerun. Else fix the cause. `Status` in the summary says whether the merge landed. |
 
+## Renamed pipelines
+
+Every bundled pipeline now carries a version suffix. The `_v1` pipelines are the
+originals, unchanged in behaviour; newer copies get a higher number and the
+originals stay as the control.
+
+| Old name | New name |
+| --- | --- |
+| `hello` | `hello_v1` |
+| `vanilla_change` | `vanilla_change_v1` |
+| `implement_features` | `implement_features_v1` |
+| `plan_with_review` | `plan_with_review_v1` |
+| `fix_jira_issue` | `fix_jira_issue_v1` |
+| `check_and_fix_ci` | `check_and_fix_ci_v1` |
+| `merge_branch` | `merge_branch_v1` |
+
+There is no alias: an old name such as `norn run hello` fails as an unknown
+pipeline. Run state is keyed by the pipeline's file name, so the old
+`<name>.checkpoint`, `<name>.history` and `<name>.runs/` files are no longer
+found. To keep your history, move them once from the directory you launch from:
+
+```bash
+for p in hello vanilla_change implement_features plan_with_review fix_jira_issue check_and_fix_ci merge_branch; do
+  for s in checkpoint history; do [ -e "$p.$s" ] && mv "$p.$s" "${p}_v1.$s"; done
+  [ -d "$p.runs" ] && mv "$p.runs" "${p}_v1.runs"
+done
+```
+
+`--resume` works across the move too: the checkpoint is looked up by file name
+and the stage names did not change.
+
 ## Launch the UI
 
 `norn ui` opens a terminal UI (Textual) with a launcher, an arguments prompt, a
@@ -439,7 +470,7 @@ app.
 uv run python -m norn ui
 
 # Run a bundled name or a .py path directly (skips the launcher)
-uv run python -m norn ui hello
+uv run python -m norn ui hello_v1
 uv run python -m norn ui examples/derived.py
 
 # Shorthand wrapper
@@ -636,7 +667,7 @@ A pipeline reaches norn one of two ways, and it is worth keeping them straight:
 
 | | `norn/pipelines/` | any other `.py` path |
 | --- | --- | --- |
-| Referenced as | a **name** — `norn run implement_features` | a **path** — `norn run examples/derived.py` |
+| Referenced as | a **name** — `norn run implement_features_v1` | a **path** — `norn run examples/derived.py` |
 | Discovered by | `norn/catalog.py` (AST, no import) | nothing — you supply the path |
 | Shows up in | `norn list`, `norn describe`, TUI launcher | TUI launcher only via a configured pipeline dir |
 | Loaded via | `importlib` as `norn.pipelines.<name>` | `importlib` from the file path |

@@ -63,14 +63,14 @@ def resolve_preplan(argv: list[str], repo_dir: str) -> str:
 
     if len(candidates) == 0:
         raise ValueError(
-            "plan_with_review needs the pre-plan markdown path as its positional "
-            "argument, e.g. norn run plan_with_review tmp/x-preplan.md"
+            "plan_with_review_v1 needs the pre-plan markdown path as its positional "
+            "argument, e.g. norn run plan_with_review_v1 tmp/x-preplan.md"
         )
 
     # More than one candidate — name them all.
     found = ", ".join(candidates)
     raise ValueError(
-        f"plan_with_review found multiple pre-plan candidates and cannot choose: {found}"
+        f"plan_with_review_v1 found multiple pre-plan candidates and cannot choose: {found}"
     )
 
 

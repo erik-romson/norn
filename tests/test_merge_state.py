@@ -198,7 +198,7 @@ def test_render_summary_halted_work_root(tmp_path):
 
     body = _merge_state.render_summary(
         paths,
-        rerun_cmd="norn run merge_branch --non-interactive",
+        rerun_cmd="norn run merge_branch_v1 --non-interactive",
         max_rounds=1,
         project_dir=str(tmp_path),
     )
@@ -214,7 +214,7 @@ def test_render_summary_missing_optional_files_render_as_none(tmp_path):
     paths = _merge_state.MergePaths(str(tmp_path))
     Path(paths.merged).write_text("deadbeef\n")
     body = _merge_state.render_summary(
-        paths, rerun_cmd="norn run merge_branch --non-interactive", max_rounds=2, project_dir=str(tmp_path)
+        paths, rerun_cmd="norn run merge_branch_v1 --non-interactive", max_rounds=2, project_dir=str(tmp_path)
     )
     assert "Status: MERGED" in body
     assert "(none)" in body
@@ -236,7 +236,7 @@ def test_render_summary_local_tests_section_reports_commit_sha(tmp_path):
     Path(paths.merged).write_text(fix_sha)
 
     body = _merge_state.render_summary(
-        paths, rerun_cmd="norn run merge_branch --non-interactive", max_rounds=2, project_dir=repo.path
+        paths, rerun_cmd="norn run merge_branch_v1 --non-interactive", max_rounds=2, project_dir=repo.path
     )
 
     assert f"Commit: {fix_sha}" in body
@@ -252,7 +252,7 @@ def test_render_summary_local_tests_section_reports_no_commit_when_none_made(tmp
     Path(paths.merged).write_text(repo.repo.head.commit.hexsha)
 
     body = _merge_state.render_summary(
-        paths, rerun_cmd="norn run merge_branch --non-interactive", max_rounds=2, project_dir=repo.path
+        paths, rerun_cmd="norn run merge_branch_v1 --non-interactive", max_rounds=2, project_dir=repo.path
     )
 
     assert "Commit: (none)" in body
@@ -304,7 +304,7 @@ def test_render_summary_builds_section_renders_table_and_poll_plan(tmp_path):
     )
 
     body = _merge_state.render_summary(
-        paths, rerun_cmd="norn run merge_branch --non-interactive", max_rounds=1, project_dir=str(tmp_path)
+        paths, rerun_cmd="norn run merge_branch_v1 --non-interactive", max_rounds=1, project_dir=str(tmp_path)
     )
 
     assert "## Builds" in body
@@ -319,7 +319,7 @@ def test_render_summary_builds_section_missing_file_renders_as_none(tmp_path):
     Path(paths.merged).write_text("deadbeef\n")
 
     body = _merge_state.render_summary(
-        paths, rerun_cmd="norn run merge_branch --non-interactive", max_rounds=1, project_dir=str(tmp_path)
+        paths, rerun_cmd="norn run merge_branch_v1 --non-interactive", max_rounds=1, project_dir=str(tmp_path)
     )
 
     builds_index = body.index("## Builds")
@@ -339,7 +339,7 @@ def test_render_summary_ci_fix_section_missing_files_degrade_to_none(tmp_path):
     Path(paths.merged).write_text("deadbeef\n")
 
     body = _merge_state.render_summary(
-        paths, rerun_cmd="norn run merge_branch --non-interactive", max_rounds=2, project_dir=str(tmp_path)
+        paths, rerun_cmd="norn run merge_branch_v1 --non-interactive", max_rounds=2, project_dir=str(tmp_path)
     )
 
     assert "## CI fix" in body
@@ -379,7 +379,7 @@ def test_render_summary_merge_section_missing_files_degrade_to_none(tmp_path):
     _merge_state.halt(paths, "no_merge_after_rounds", "the base kept moving")
 
     body = _merge_state.render_summary(
-        paths, rerun_cmd="norn run merge_branch --non-interactive", max_rounds=2, project_dir=str(tmp_path)
+        paths, rerun_cmd="norn run merge_branch_v1 --non-interactive", max_rounds=2, project_dir=str(tmp_path)
     )
 
     assert "## Merge" in body
@@ -419,7 +419,7 @@ def test_render_summary_merge_section_renders_preconditions_and_merged_sha(tmp_p
     repo.repo.remote("origin").push(refspec=":feature-x")
 
     body = _merge_state.render_summary(
-        paths, rerun_cmd="norn run merge_branch --non-interactive", max_rounds=1, project_dir=repo.path
+        paths, rerun_cmd="norn run merge_branch_v1 --non-interactive", max_rounds=1, project_dir=repo.path
     )
 
     assert "## Merge" in body
@@ -446,7 +446,7 @@ def _status_work_root(tmp_path) -> _merge_state.MergePaths:
 def _render(paths, tmp_path) -> str:
     return _merge_state.render_summary(
         paths,
-        rerun_cmd="norn run merge_branch --non-interactive",
+        rerun_cmd="norn run merge_branch_v1 --non-interactive",
         max_rounds=2,
         project_dir=str(tmp_path),
     )
@@ -536,7 +536,7 @@ async def test_write_merge_state_writes_summary_and_pointer(tmp_path):
 
     stage = _merge_state.WriteMergeState(
         paths=paths,
-        rerun_cmd="norn run merge_branch --non-interactive",
+        rerun_cmd="norn run merge_branch_v1 --non-interactive",
         max_rounds=1,
         project_dir=str(tmp_path),
     )
@@ -558,7 +558,7 @@ async def test_write_merge_state_raises_without_merged_or_halt(tmp_path):
 
     stage = _merge_state.WriteMergeState(
         paths=paths,
-        rerun_cmd="norn run merge_branch --non-interactive",
+        rerun_cmd="norn run merge_branch_v1 --non-interactive",
         max_rounds=2,
         project_dir=str(tmp_path),
     )
@@ -584,7 +584,7 @@ async def test_finalize_merge_state_splices_what_happened_only(tmp_path, monkeyp
 
     stage = _merge_state.WriteMergeState(
         paths=paths,
-        rerun_cmd="norn run merge_branch --non-interactive",
+        rerun_cmd="norn run merge_branch_v1 --non-interactive",
         max_rounds=1,
         project_dir=str(tmp_path),
     )

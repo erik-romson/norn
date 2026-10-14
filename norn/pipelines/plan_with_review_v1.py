@@ -1,6 +1,6 @@
 """Turn a pre-plan into a reviewed plan: draft → human Q&A loop → codex review → apply → split.
 
-Usage:  norn run plan_with_review tmp/<slug>-preplan.md
+Usage:  norn run plan_with_review_v1 tmp/<slug>-preplan.md
 
 Optional CLI-only knobs (not available under `norn ui`):
   --arg model=deep               Intent label for Claude Generate stages (default: deep)
@@ -14,8 +14,8 @@ import sys
 from norn.alerts import AlertEvent, MacOSChannel
 from norn.dsl import Pipeline, ask_user
 from norn.model_labels import ModelLabelError, labels_for, resolve_label
-from norn.pipelines._plan_gates import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate  # noqa: F401
-from norn.pipelines._plan_review import (
+from norn.pipelines._plan_gates_v1 import OpenQuestionsGate, ReviewDispositionGate, StepFilesGate  # noqa: F401
+from norn.pipelines._plan_review_v1 import (
     WaitForApproval,  # noqa: F401
     add_plan_review_stages,
     apply_prompt,
@@ -66,7 +66,7 @@ _SPLIT_PROMPT = split_prompt(plan=PLAN, steps_dir=STEPS_DIR)
 # --- pipeline ---------------------------------------------------------------
 
 _pipeline = (
-    Pipeline("plan_with_review")
+    Pipeline("plan_with_review_v1")
     .alert(MacOSChannel(events={AlertEvent.ASK_USER, AlertEvent.COMPLETE, AlertEvent.FAILED}))
     .budget(max_cost_usd=float(_args.get("budget", "50")), on_exceed=ask_user)
 )

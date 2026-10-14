@@ -1,6 +1,8 @@
 """Tests for norn/catalog.py — AST-based pipeline discovery."""
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from norn.catalog import (
@@ -26,11 +28,11 @@ def test_each_entry_has_name_short_and_path() -> None:
 
 
 def test_get_pipeline_info_hello() -> None:
-    info = get_pipeline_info("hello")
+    info = get_pipeline_info("hello_v1")
     assert info is not None
-    assert info.name == "hello"
+    assert info.name == "hello_v1"
     assert info.short  # non-empty first line
-    assert info.path.name == "hello.py"
+    assert info.path.name == "hello_v1.py"
 
 
 def test_get_pipeline_info_nonexistent() -> None:
@@ -38,7 +40,7 @@ def test_get_pipeline_info_nonexistent() -> None:
 
 
 def test_load_bundled_pipeline_hello() -> None:
-    pipeline = load_bundled_pipeline("hello")
+    pipeline = load_bundled_pipeline("hello_v1")
     assert isinstance(pipeline, Pipeline)
 
 
@@ -49,7 +51,7 @@ def test_load_bundled_pipeline_invalid_raises() -> None:
 
 def test_ast_extraction_reads_metadata() -> None:
     """Metadata dict (env_vars, args) is extracted correctly via AST."""
-    info = get_pipeline_info("vanilla_change")
+    info = get_pipeline_info("vanilla_change_v1")
     assert info is not None
     assert "ANTHROPIC_API_KEY" in info.env_vars
     assert "args" in info.args
@@ -63,7 +65,7 @@ def test_list_pipelines_excludes_init() -> None:
 def test_list_pipelines_excludes_private_helpers() -> None:
     """Private modules in norn/pipelines/ are helpers, not pipelines.
 
-    ``_snapshot_diff.py`` is a script invoked by ``implement_features``; it has
+    ``_snapshot_diff.py`` is a script invoked by ``implement_features_v1``; it has
     no ``config`` so listing it hands the user a name that cannot be run.
     """
     names = [info.name for info in list_pipelines()]
@@ -86,7 +88,13 @@ def test_list_pipelines_sorted() -> None:
     assert names == sorted(names)
 
 
-def test_fix_jira_issue_is_listed() -> None:
-    """fix_jira_issue is discoverable via norn list."""
+def test_fix_jira_issue_v1_is_listed() -> None:
+    """fix_jira_issue_v1 is discoverable via norn list."""
     names = [info.name for info in list_pipelines()]
-    assert "fix_jira_issue" in names
+    assert "fix_jira_issue_v1" in names
+
+
+def test_bundled_pipeline_names_are_versioned() -> None:
+    """Every bundled pipeline name carries a ``_v<N>`` suffix."""
+    for info in list_pipelines():
+        assert re.match(r"^[a-z0-9_]+_v[0-9]+$", info.name), info.name

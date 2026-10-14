@@ -24,7 +24,7 @@ uv run python -m norn run examples/derived.py
 bin/norn examples/derived.py --dry-run
 
 # Pass arguments
-uv run python -m norn run vanilla_change "add logging to the runner"
+uv run python -m norn run vanilla_change_v1 "add logging to the runner"
 
 # Resume from checkpoint after failure
 bin/norn examples/derived.py --resume
@@ -92,7 +92,7 @@ History is stored as JSONL using the pipeline state key.
 For bundled pipelines, that means the current working directory.
 For pipeline files inside your repo, it stays beside the config file.
 For external shared pipeline files run from another repo, it is written in the
-current working directory using the pipeline filename, e.g. `implement_features.history`.
+current working directory using the pipeline filename, e.g. `implement_features_v1.history`.
 Each run now includes a detailed stage log with per-step status, cost, tokens,
 timing, model, and running totals.
 History is appended incrementally during execution, so interrupted runs still

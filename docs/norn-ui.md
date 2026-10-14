@@ -322,7 +322,7 @@ The runner is the **single source of truth**; the UI is a pure projection.
 - Collected values flow into the run two ways: as `params` to `run_pipeline`
   (so `{param.args}` / `{param.KEY}` resolve), and via `sys.argv` reconstructed
   around the load so pipelines that read argv at **import time** (e.g.
-  `implement_features`) see them. `load_pipeline_with_args` also reloads an
+  `implement_features_v1`) see them. `load_pipeline_with_args` also reloads an
   already-imported bundled module so a repeat run with different args isn't
   served a stale structure.
 - **`load_pipeline_with_args` is the TUI's only pipeline-import site, so it is
@@ -495,7 +495,7 @@ and then `git branch -D <work_branch>`.
   `IssueContext.local_path`, not `ctx.working_dir`. The `Clone` stage already
   owns its own checkout dir. Running issue-processing pipelines under the
   worktree toggle is therefore unsupported.
-- **`implement_features` and `check_and_fix_ci` are not isolated.** Both pin
+- **`implement_features_v1` and `check_and_fix_ci_v1` are not isolated.** Both pin
   `PROJECT_DIR = os.getcwd()` and `cd` into it from their RunCommand stages, so
   they always run against the launch repo even with the toggle on.
 

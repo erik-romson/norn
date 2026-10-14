@@ -73,7 +73,7 @@ def resolve_ref(info: Any) -> tuple[str, bool]:
 def load_pipeline_with_args(pipeline_ref: str, *, is_bundled: bool, params: dict[str, str]):
     """Load the pipeline object, exposing positional args via ``sys.argv``.
 
-    Some bundled pipelines (e.g. ``implement_features``) read ``sys.argv`` at
+    Some bundled pipelines (e.g. ``implement_features_v1``) read ``sys.argv`` at
     import time to build their structure. Reconstruct ``argv`` from the
     positional ``args`` param around the import (and reload an already-imported
     module so a repeat selection with different args isn't served stale).

@@ -1,7 +1,7 @@
 """Take the current feature branch from "committed locally" to "merged".
 
 Usage:
-    norn run merge_branch --non-interactive
+    norn run merge_branch_v1 --non-interactive
 
 Prerequisites:
     - ``gh auth login`` has been run with a push-capable token (the
@@ -191,7 +191,7 @@ MAX_ROUNDS = 2
 # The exact rerun line this run's own summary points a human at.
 # `overwrite_remote` is a one-shot authorisation, never repeated here — an
 # unattended rerun must not silently force away commits again.
-RERUN_CMD = "norn run merge_branch --non-interactive" + "".join(
+RERUN_CMD = "norn run merge_branch_v1 --non-interactive" + "".join(
     f" --arg {shlex.quote(f'{key}={value}')}"
     for key, value in _args.items()
     if key != "overwrite_remote"
@@ -543,7 +543,7 @@ def merge_reached_cmd(paths: MergePaths, project_dir: str) -> str:
 # ---------------------------------------------------------------------------
 
 config = (
-    Pipeline("merge_branch", default_model="standard")
+    Pipeline("merge_branch_v1", default_model="standard")
     .alert(MacOSChannel(events={AlertEvent.ASK_USER, AlertEvent.COMPLETE, AlertEvent.FAILED}))
     .budget(max_cost_usd=BUDGET, on_exceed=ask_user)
     .env("GH_PROMPT_DISABLED", "1")

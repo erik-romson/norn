@@ -27,7 +27,7 @@ def test_resolve_preplan_cli_shape_absolute(tmp_path):
     preplan.write_text("# pre-plan")
 
     result = resolve_preplan(
-        ["run", "plan_with_review", str(preplan), "--arg", "model=sonnet"],
+        ["run", "plan_with_review_v1", str(preplan), "--arg", "model=sonnet"],
         repo_dir=str(tmp_path),
     )
     assert result == str(preplan.resolve())
@@ -40,7 +40,7 @@ def test_resolve_preplan_cli_shape_relative(tmp_path):
     preplan.write_text("# pre-plan")
 
     result = resolve_preplan(
-        ["run", "plan_with_review", "x-preplan.md", "--arg", "model=sonnet"],
+        ["run", "plan_with_review_v1", "x-preplan.md", "--arg", "model=sonnet"],
         repo_dir=str(tmp_path),
     )
     assert result == str(preplan.resolve())
@@ -73,7 +73,7 @@ def test_resolve_preplan_arg_equals_form_dropped(tmp_path):
     preplan.write_text("# pre-plan")
 
     result = resolve_preplan(
-        ["run", "plan_with_review", "--arg=model=sonnet", str(preplan)],
+        ["run", "plan_with_review_v1", "--arg=model=sonnet", str(preplan)],
         repo_dir=str(tmp_path),
     )
     assert result == str(preplan.resolve())
@@ -82,7 +82,7 @@ def test_resolve_preplan_arg_equals_form_dropped(tmp_path):
 def test_resolve_preplan_zero_candidates_raises(tmp_path):
     """No .md file on argv raises ValueError with a message about positional arg."""
     with pytest.raises(ValueError, match="positional"):
-        resolve_preplan(["run", "plan_with_review"], repo_dir=str(tmp_path))
+        resolve_preplan(["run", "plan_with_review_v1"], repo_dir=str(tmp_path))
 
 
 def test_resolve_preplan_non_md_file_ignored(tmp_path):
@@ -121,7 +121,7 @@ def test_resolve_preplan_result_is_absolute(tmp_path):
     preplan.write_text("# pre-plan")
 
     result = resolve_preplan(
-        ["run", "plan_with_review", "x-preplan.md"],
+        ["run", "plan_with_review_v1", "x-preplan.md"],
         repo_dir=str(tmp_path),
     )
     assert result.startswith("/")

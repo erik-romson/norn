@@ -17,7 +17,7 @@ from norn.pipelines._jira_issue import (
 
 class TestResolveIssueArgs:
     def test_full_norn_run_shape(self):
-        key, stop = resolve_issue_args(["run", "fix_jira_issue", "CBS-2249"])
+        key, stop = resolve_issue_args(["run", "fix_jira_issue_v1", "CBS-2249"])
         assert key == "CBS-2249"
         assert stop is False
 
@@ -43,7 +43,7 @@ class TestResolveIssueArgs:
 
     def test_flags_and_values_skipped(self):
         key, stop = resolve_issue_args(
-            ["run", "fix_jira_issue", "CBS-2249", "--arg", "model=opus"]
+            ["run", "fix_jira_issue_v1", "CBS-2249", "--arg", "model=opus"]
         )
         assert key == "CBS-2249"
         assert stop is False
@@ -55,7 +55,7 @@ class TestResolveIssueArgs:
 
     def test_zero_keys_raises(self):
         with pytest.raises(ValueError, match="needs a Jira issue key"):
-            resolve_issue_args(["run", "fix_jira_issue"])
+            resolve_issue_args(["run", "fix_jira_issue_v1"])
 
     def test_two_keys_raises(self):
         with pytest.raises(ValueError, match="multiple issue keys"):
@@ -68,7 +68,7 @@ class TestResolveIssueArgs:
 
     def test_subcommand_and_pipeline_name_ignored(self):
         # "run" and "fix_jira_issue" must not be mistaken for keys
-        key, _ = resolve_issue_args(["run", "fix_jira_issue", "CBS-2249"])
+        key, _ = resolve_issue_args(["run", "fix_jira_issue_v1", "CBS-2249"])
         assert key == "CBS-2249"
 
     def test_url_with_stop(self):

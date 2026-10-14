@@ -1,7 +1,7 @@
 """Fix a Jira issue end-to-end: fetch → brief → plan → review → implement.
 
-Usage:  norn run fix_jira_issue CBS-2249
-        norn run fix_jira_issue CBS-2249 stop
+Usage:  norn run fix_jira_issue_v1 CBS-2249
+        norn run fix_jira_issue_v1 CBS-2249 stop
 
 The ``stop`` positional pauses after the plan review so you can inspect and
 edit the plan before implementation begins.
@@ -31,7 +31,7 @@ from norn.pipelines._jira_issue import (
     resolve_issue_args,
 )
 from norn.pipelines._launch_tree import AssertLaunchTree
-from norn.pipelines._plan_review import (
+from norn.pipelines._plan_review_v1 import (
     add_plan_review_stages,
     resolve_split_skill,
 )
@@ -120,9 +120,9 @@ _preflight_cmd = (
     f'git check-ignore -q {shlex.quote(ART.dir.rstrip("/"))} || '
     f'{{ echo "ERROR: {ART.dir.rstrip("/")} is not gitignored. '
     f"Add to .git/info/exclude: {ART.dir.rstrip('/')}\"; exit 1; }} && "
-    f'git check-ignore -q fix_jira_issue.checkpoint || '
-    f'{{ echo "ERROR: fix_jira_issue.checkpoint is not gitignored. '
-    f"Add to .git/info/exclude: fix_jira_issue.checkpoint\"; exit 1; }} && "
+    f'git check-ignore -q fix_jira_issue_v1.checkpoint || '
+    f'{{ echo "ERROR: fix_jira_issue_v1.checkpoint is not gitignored. '
+    f"Add to .git/info/exclude: fix_jira_issue_v1.checkpoint\"; exit 1; }} && "
     f'git check-ignore -q implement_features_v2.checkpoint || '
     f'{{ echo "ERROR: implement_features_v2.checkpoint is not gitignored. '
     f"Add to .git/info/exclude: implement_features_v2.checkpoint\"; exit 1; }}"
@@ -296,7 +296,7 @@ class RunChildPipeline(RunCommand):
 # ---------------------------------------------------------------------------
 
 _pipeline = (
-    Pipeline("fix_jira_issue")
+    Pipeline("fix_jira_issue_v1")
     .alert(MacOSChannel(events={AlertEvent.ASK_USER, AlertEvent.COMPLETE, AlertEvent.FAILED}))
     .budget(max_cost_usd=BUDGET, on_exceed=ask_user)
 )

@@ -443,7 +443,7 @@ def test_cli_require_quota_threshold_blocks_run(capsys):
                 "norn.quota.subprocess.run",
                 return_value=_guard_result(1, "claude weekly: 4% remaining — LOW"),
             ):
-                with patch("sys.argv", ["norn", "run", "hello", "--require-quota", "20:weekly"]):
+                with patch("sys.argv", ["norn", "run", "hello_v1", "--require-quota", "20:weekly"]):
                     with pytest.raises(SystemExit) as exc_info:
                         main()
 
@@ -464,7 +464,7 @@ def test_cli_quota_fail_open_starts_run_on_unavailable_quota():
             with patch("norn.quota.subprocess.run", return_value=_guard_result(69)):
                 with patch(
                     "sys.argv",
-                    ["norn", "run", "hello", "--require-quota", "20", "--quota-fail-open"],
+                    ["norn", "run", "hello_v1", "--require-quota", "20", "--quota-fail-open"],
                 ):
                     main()
 
@@ -479,7 +479,7 @@ def test_cli_quota_fail_open_overrides_require_quota_for_probe_failures():
 
     mock_run = AsyncMock(return_value=None)
     with patch("norn.cli.run_pipeline", mock_run):
-        with patch("sys.argv", ["norn", "run", "hello", "--require-quota", "--quota-fail-open"]):
+        with patch("sys.argv", ["norn", "run", "hello_v1", "--require-quota", "--quota-fail-open"]):
             main()
 
     assert mock_run.call_args.kwargs["require_quota"] is False
@@ -493,7 +493,7 @@ def test_cli_bare_require_quota_still_aborts_on_probe_failure():
 
     mock_run = AsyncMock(return_value=None)
     with patch("norn.cli.run_pipeline", mock_run):
-        with patch("sys.argv", ["norn", "run", "hello", "--require-quota"]):
+        with patch("sys.argv", ["norn", "run", "hello_v1", "--require-quota"]):
             main()
 
     assert mock_run.call_args.kwargs["require_quota"] is True
@@ -506,7 +506,7 @@ def test_cli_no_quota_flags_leaves_require_quota_false():
 
     mock_run = AsyncMock(return_value=None)
     with patch("norn.cli.run_pipeline", mock_run):
-        with patch("sys.argv", ["norn", "run", "hello"]):
+        with patch("sys.argv", ["norn", "run", "hello_v1"]):
             main()
 
     assert mock_run.call_args.kwargs["require_quota"] is False

@@ -68,8 +68,8 @@ class TestUiSubparser:
 
     def test_ui_with_bundled_name(self):
         parser = _build_parser()
-        ns, _ = parser.parse_known_args(["ui", "hello"])
-        assert ns.pipeline == "hello"
+        ns, _ = parser.parse_known_args(["ui", "hello_v1"])
+        assert ns.pipeline == "hello_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +127,8 @@ class TestExistingSubcommandsUnchanged:
         (["orgs"], "orgs"),
         (["list-stages"], "list-stages"),
         (["list"], "list"),
-        (["describe", "hello"], "describe"),
-        (["diagram", "hello"], "diagram"),
+        (["describe", "hello_v1"], "describe"),
+        (["diagram", "hello_v1"], "diagram"),
     ])
     def test_subcommand_parses(self, argv, expected_cmd):
         parser = _build_parser()

@@ -58,7 +58,7 @@ def patch_load(monkeypatch):
 
 def test_pipeline_args_meta_reads_bundled_args() -> None:
     """A bundled pipeline's declared args are surfaced for the prompt."""
-    assert "args" in pipeline_args_meta("implement_features")
+    assert "args" in pipeline_args_meta("implement_features_v1")
 
 
 def test_pipeline_args_meta_empty_for_unknown() -> None:
@@ -66,10 +66,10 @@ def test_pipeline_args_meta_empty_for_unknown() -> None:
 
 
 def test_resolve_ref_bundled() -> None:
-    info = get_pipeline_info("hello")
+    info = get_pipeline_info("hello_v1")
     ref, is_bundled = resolve_ref(info)
     assert is_bundled is True
-    assert ref == "hello"
+    assert ref == "hello_v1"
 
 
 # ---------------------------------------------------------------------------

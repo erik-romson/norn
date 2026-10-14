@@ -50,7 +50,7 @@ def _import_check_and_fix_ci(argv_tail: list[str] = (), cwd=None):
         sys.argv = [saved_argv[0], *argv_tail]
         if cwd is not None:
             os.chdir(str(cwd))
-        from norn.pipelines import check_and_fix_ci
+        from norn.pipelines import check_and_fix_ci_v1 as check_and_fix_ci
 
         return importlib.reload(check_and_fix_ci)
     finally:

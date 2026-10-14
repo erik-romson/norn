@@ -116,7 +116,7 @@ Rules for `allow_noop`:
   when a step changes nothing, which is what catches an agent that silently
   did no work; `allow_noop: true` waives that check for one step.
 - A verification-only step without it aborts any run started with
-  `--non-interactive` (a child run under `fix_jira_issue`), because there is
+  `--non-interactive` (a child run under `fix_jira_issue_v1`), because there is
   no operator to accept the no-op.
 
 Rules for `test_cmd`:

@@ -40,7 +40,7 @@ def _import_fix_jira(argv_tail: list[str], cwd: str | Path | None = None):
         sys.argv = [saved_argv[0], *argv_tail]
         if cwd is not None:
             os.chdir(str(cwd))
-        from norn.pipelines import fix_jira_issue
+        from norn.pipelines import fix_jira_issue_v1 as fix_jira_issue
 
         return importlib.reload(fix_jira_issue)
     finally:
@@ -453,7 +453,7 @@ def test_preflight_names_all_ignore_paths(tmp_path):
     stage = _find_stage(mod.config.items, "preflight environment")
     cmd = stage.impl.cmd
     assert "tmp/jira/CBS-2249" in cmd
-    assert "fix_jira_issue.checkpoint" in cmd
+    assert "fix_jira_issue_v1.checkpoint" in cmd
     assert "implement_features_v2.checkpoint" in cmd
 
 
