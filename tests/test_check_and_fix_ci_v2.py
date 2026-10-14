@@ -172,3 +172,485 @@ def test_commit_push_ci_fix_blocks_attribution_line(tmp_path) -> None:
 
     after_remote = repo.repo.git.rev_parse("origin/feature-x")
     assert after_remote == before_remote
+
+
+# ---------------------------------------------------------------------------
+# Learning proposal (step 16)
+# ---------------------------------------------------------------------------
+
+import shutil
+from pathlib import Path
+
+import pytest
+
+from norn.dsl import OnFailure, Pipeline
+from norn.models import PipelineContext, StageResult
+from norn.pipelines._learnings import LearnPaths
+from norn.runner import run_pipeline
+from norn.stages.base import BaseStage
+from norn.stages.run_command import RunCommand
+
+LEARN_STAGES = [
+    "collect learning evidence",
+    "learn",
+    "learn postcondition",
+    "decide learning",
+    "publish learning proposal",
+    "learning summary",
+]
+
+
+def _top_level_names(mod) -> list[str]:
+    return [item.name for item in mod.pipeline.items if isinstance(item, Stage)]
+
+
+def _isolated(mod, tmp_path):
+    """Point the module's work root at *tmp_path* so a test never touches the shared temp dir."""
+    work = Path(tmp_path) / "work-root"
+    work.mkdir()
+    mod.WORK_ROOT = work
+    mod.START_SHA = work / "start.sha"
+    mod.ATTEMPTS_MD = work / "attempts.md"
+    mod.LEARN_EVIDENCE = work / "learn-evidence.md"
+    mod.LEARN_PATHS = LearnPaths(work)
+    return work
+
+
+def test_learn_stage_list_order_and_gating(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    names = _top_level_names(mod)
+
+    i = names.index("push all")
+    assert names[i:] == ["push all", *LEARN_STAGES, "assert nothing unpushed"]
+    assert names.index("prepare learning scratch") == names.index("check clean worktree") + 1
+
+    paths = mod.LEARN_PATHS
+    ctx = PipelineContext()
+    assert _find_stage(mod.pipeline.items, "collect learning evidence").when is None
+    assert _find_stage(mod.pipeline.items, "learning summary").when is None
+    assert _find_stage(mod.pipeline.items, "assert nothing unpushed").when is None
+    baseline = ("learn", "learn postcondition", "decide learning")
+    publish = _find_stage(mod.pipeline.items, "publish learning proposal")
+    # The work root is keyed by the (unique) launch directory, so touching it is safe.
+    paths.root.mkdir(parents=True, exist_ok=True)
+    try:
+        for name in baseline:
+            assert _find_stage(mod.pipeline.items, name).when(ctx) is False, name
+        assert publish.when(ctx) is False
+        paths.pre_head.write_text("sha\n")
+        for name in baseline:
+            assert _find_stage(mod.pipeline.items, name).when(ctx) is True, name
+        assert publish.when(ctx) is False
+        paths.marker_ready.write_text("target\n")
+        assert publish.when(ctx) is True
+    finally:
+        shutil.rmtree(paths.root, ignore_errors=True)
+
+    post = _find_stage(mod.pipeline.items, "learn postcondition")
+    assert post.on_failure == OnFailure.FAIL
+    assert _find_stage(mod.pipeline.items, "assert nothing unpushed").on_failure == OnFailure.FAIL
+    learn = _find_stage(mod.pipeline.items, "learn")
+    assert learn.timeout is None
+    assert learn.impl.timeout == 300
+    assert learn.impl.allowed_tools == ["Write"]
+    assert learn.impl.permission_mode == "acceptEdits"
+    assert learn.impl.max_turns == 4
+
+
+def test_recorders_sit_inside_the_loops(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    local = next(i for i in mod.pipeline.items if isinstance(i, Loop) and i.name == "local tests")
+    ci = next(i for i in mod.pipeline.items if isinstance(i, Loop) and i.name == "wait ci")
+    lnames = [s.name for s in local.stages]
+    cnames = [s.name for s in ci.stages]
+    assert lnames.index("record local attempt") == lnames.index("compress local tests") + 1
+    assert cnames.index("record ci attempt") == cnames.index("isolate failing step") + 1
+
+
+def test_learn_off_keeps_only_the_unpushed_assertion(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(["--arg", "learn=off"], cwd=tmp_path)
+    try:
+        names = _top_level_names(mod)
+        assert names[names.index("push all"):] == ["push all", "assert nothing unpushed"]
+        all_names = [s.name for s in _walk_stages(mod.pipeline.items)]
+        for gone in (*LEARN_STAGES, "prepare learning scratch", "record local attempt", "record ci attempt"):
+            assert gone not in all_names
+    finally:
+        _import_check_and_fix_ci(cwd=tmp_path)
+
+
+@pytest.mark.parametrize("arg", ["learn=maybe", "learn_model=gpt-9", "learn_model=claude-sonnet-4"])
+def test_bogus_learn_knobs_fail_at_import(tmp_path, arg) -> None:
+    try:
+        with pytest.raises(ValueError):
+            _import_check_and_fix_ci(["--arg", arg], cwd=tmp_path)
+    finally:
+        _import_check_and_fix_ci(cwd=tmp_path)
+
+
+def test_learn_model_label_is_applied(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(["--arg", "learn_model=standard"], cwd=tmp_path)
+    try:
+        assert _find_stage(mod.pipeline.items, "learn").impl.model == "standard"
+    finally:
+        _import_check_and_fix_ci(cwd=tmp_path)
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    assert _find_stage(mod.pipeline.items, "learn").impl.model == "light"
+
+
+def test_no_stage_after_wait_ci_commits_stages_or_pushes(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    names = _top_level_names(mod)
+    for name in names[names.index("push all") + 1:]:
+        impl = _find_stage(mod.pipeline.items, name).impl
+        cmd = getattr(impl, "cmd", "")
+        for verb in ("git add", "git commit", "git push"):
+            assert verb not in cmd, (name, verb)
+
+
+# -- the recorders through a real loop ---------------------------------------
+
+
+class _FailTimes(BaseStage):
+    needs_agent = False
+
+    def __init__(self, fails: int, output: str) -> None:
+        self.fails = fails
+        self.output = output
+        self.calls = 0
+
+    async def run(self, ctx, **kwargs):
+        self.calls += 1
+        if self.calls <= self.fails:
+            return StageResult(name="", success=False, error="red", output=self.output)
+        return StageResult(name="", success=True, output="green")
+
+
+class _Echo(BaseStage):
+    needs_agent = False
+
+    def __init__(self, fmt: str) -> None:
+        self.fmt = fmt
+        self.n = 0
+
+    async def run(self, ctx, **kwargs):
+        self.n += 1
+        return StageResult(name="", success=True, output=self.fmt.format(n=self.n))
+
+
+@pytest.mark.asyncio
+async def test_record_local_attempt_through_a_real_loop(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    ledger = tmp_path / "attempts.md"
+    pipeline = Pipeline("t").loop(
+        "local tests",
+        max_retries=3,
+        stages=[
+            Stage("compress local tests", _Echo("compressed-{n}"), when=stage_failed_("run local tests")),
+            Stage(
+                "record local attempt",
+                mod.RecordAttempt(kind="local", source_stage="compress local tests", ledger=ledger),
+                when=stage_failed_("run local tests"),
+            ),
+            Stage("run local tests", _FailTimes(2, "raw")),
+        ],
+    )
+    await run_pipeline(pipeline)
+    text = ledger.read_text()
+    assert "local attempt 1" in text and "local attempt 2" in text
+    assert text.index("local attempt 1") < text.index("local attempt 2")
+    assert "local attempt 3" not in text
+    assert text.index("compressed-1") < text.index("compressed-2")
+
+
+@pytest.mark.asyncio
+async def test_record_ci_attempt_through_a_real_loop(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    ledger = tmp_path / "attempts.md"
+    pipeline = Pipeline("t").loop(
+        "wait ci",
+        max_retries=3,
+        stages=[
+            Stage("isolate failing step", _Echo("isolated-{n}"), when=stage_failed_("check ci")),
+            Stage(
+                "record ci attempt",
+                mod.RecordAttempt(
+                    kind="ci",
+                    source_stage="isolate failing step",
+                    ledger=ledger,
+                    workflow_stage="check ci",
+                ),
+                when=stage_failed_("check ci"),
+            ),
+            Stage("check ci", _FailTimes(2, "Failing workflow: build.yml\nRun URL: u\n\nlogs")),
+        ],
+    )
+    await run_pipeline(pipeline)
+    text = ledger.read_text()
+    assert text.index("ci attempt 1") < text.index("ci attempt 2")
+    assert "ci attempt 3" not in text
+    assert "Workflow: build.yml" in text
+    assert "isolated-1" in text and "isolated-2" in text
+
+
+def stage_failed_(name):
+    from norn.dsl import stage_failed
+
+    return stage_failed(name)
+
+
+@pytest.mark.asyncio
+async def test_record_attempt_requires_the_attempt_kwarg(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    rec = mod.RecordAttempt(kind="local", source_stage="x", ledger=tmp_path / "a.md")
+    assert rec.emits_events is True
+    with pytest.raises(TypeError):
+        await rec.run(PipelineContext())
+
+
+@pytest.mark.asyncio
+async def test_record_attempt_caps_the_excerpt(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    ledger = tmp_path / "a.md"
+    ctx = PipelineContext()
+    ctx.results["src"] = StageResult(
+        name="src", success=True, output="\n".join(f"line{i}" for i in range(200))
+    )
+    rec = mod.RecordAttempt(kind="local", source_stage="src", ledger=ledger)
+    await rec.run(ctx, node_id="n", attempt=2)
+    text = ledger.read_text()
+    assert "line79" in text and "line80" not in text
+    assert "local attempt 1" in text
+
+
+# -- collect / decide / publish on temp repos --------------------------------
+
+
+def _ready_repo(tmp_path):
+    repo = make_repo_with_remote(tmp_path)
+    repo.repo.git.checkout("-b", "feature-x")
+    repo.repo.git.push("origin", "feature-x", "--set-upstream")
+    return repo
+
+
+def _fake_journal(tmp_path):
+    class _J:
+        dir = Path(tmp_path) / "run-dir"
+
+    _J.dir.mkdir()
+    return _J
+
+
+async def _run_stage(mod, name, ctx):
+    stage = _find_stage(mod.pipeline.items, name)
+    return await stage.impl.run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_collect_skips_without_fix_commits(tmp_path) -> None:
+    repo = _ready_repo(tmp_path)
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    work = _isolated(mod, tmp_path)
+    head = repo.repo.head.commit.hexsha
+    (work / "start.sha").write_text(head + "\n")
+    # A human commit after start is not a fix commit.
+    (Path(repo.path) / "human.txt").write_text("x\n")
+    repo.repo.index.add(["human.txt"])
+    repo.repo.index.commit("human work")
+
+    ctx = PipelineContext()
+    ctx.journal = _fake_journal(tmp_path)
+    paths = mod.LEARN_PATHS
+    result = await mod.CollectLearningEvidence(paths=paths, name="collect learning evidence").run(ctx)
+
+    assert result.success
+    assert "CI was green without a fix in this run" in result.output
+    assert paths.marker_skipped.exists()
+    assert not paths.pre_head.exists()
+    assert mod.file_exists(str(paths.pre_head))(ctx) is False
+    summary = await mod.LearningSummary(paths=paths, name="learning summary").run(ctx)
+    assert summary.output == "skipped: CI was green without a fix in this run"
+
+
+@pytest.mark.asyncio
+async def test_collect_skips_without_a_journal(tmp_path) -> None:
+    repo = _ready_repo(tmp_path)
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    work = _isolated(mod, tmp_path)
+    (work / "start.sha").write_text(repo.repo.head.commit.hexsha + "\n")
+    (Path(repo.path) / "f.txt").write_text("x\n")
+    repo.repo.index.add(["f.txt"])
+    repo.repo.index.commit("fix(ci): auto-fix from check_and_fix_ci")
+
+    result = await mod.CollectLearningEvidence(paths=mod.LEARN_PATHS, name="c").run(PipelineContext())
+    assert result.output == "skipped: no journal to hold the proposal"
+    assert not mod.LEARN_PATHS.pre_head.exists()
+
+
+@pytest.mark.asyncio
+async def test_collect_builds_evidence_and_baseline(tmp_path) -> None:
+    repo = _ready_repo(tmp_path)
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    work = _isolated(mod, tmp_path)
+    start = repo.repo.head.commit.hexsha
+    (work / "start.sha").write_text(start + "\n")
+    (work / "attempts.md").write_text("## ci attempt 1\n")
+    (Path(repo.path) / "widget_parser.py").write_text("x = 1\n")
+    repo.repo.index.add(["widget_parser.py"])
+    repo.repo.index.commit("fix(ci): auto-fix from check_and_fix_ci")
+    (Path(repo.path) / "other.txt").write_text("y\n")
+    repo.repo.index.add(["other.txt"])
+    repo.repo.index.commit("unrelated")
+
+    ctx = PipelineContext()
+    ctx.journal = _fake_journal(tmp_path)
+    result = await mod.CollectLearningEvidence(paths=mod.LEARN_PATHS, name="c").run(ctx)
+
+    assert result.success
+    assert "## ci attempt 1" in result.output
+    assert "widget_parser.py" in result.output
+    assert "other.txt" not in result.output
+    assert "store does not exist" in result.output
+    assert mod.LEARN_PATHS.pre_head.read_text().strip() == repo.repo.head.commit.hexsha
+    assert (work / "learn-evidence.md").read_text() == result.output
+
+
+@pytest.mark.asyncio
+async def test_collect_records_an_unusable_store_as_failed(tmp_path) -> None:
+    repo = _ready_repo(tmp_path)
+    cfg = Path(repo.path) / ".compound-engineering"
+    cfg.mkdir()
+    (cfg / "config.yaml").write_text("docs_root: ../outside\n")
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    work = _isolated(mod, tmp_path)
+    (work / "start.sha").write_text(repo.repo.head.commit.hexsha + "\n")
+    (Path(repo.path) / "f.txt").write_text("x\n")
+    repo.repo.index.add(["f.txt"])
+    repo.repo.index.commit("fix: auto-fix from check_and_fix_ci local loop")
+    ctx = PipelineContext()
+    ctx.journal = _fake_journal(tmp_path)
+
+    result = await mod.CollectLearningEvidence(paths=mod.LEARN_PATHS, name="c").run(ctx)
+    assert result.success
+    assert result.output.startswith("failed: the learning store is unusable")
+    assert mod.LEARN_PATHS.marker_failed.exists()
+    assert not mod.LEARN_PATHS.pre_head.exists()
+
+
+@pytest.mark.asyncio
+async def test_collect_failure_becomes_a_marker_not_an_error(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    _isolated(mod, tmp_path)  # no start.sha
+    result = await mod.CollectLearningEvidence(paths=mod.LEARN_PATHS, name="collect learning evidence").run(
+        PipelineContext()
+    )
+    assert result.success
+    assert result.output.startswith("failed: collect learning evidence:")
+    assert mod.LEARN_PATHS.marker_failed.exists()
+
+
+@pytest.mark.asyncio
+async def test_publish_writes_under_the_journal_dir(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    _isolated(mod, tmp_path)
+    paths = mod.LEARN_PATHS
+    paths.scratch.mkdir(parents=True)
+    paths.learning.write_text("---\ntitle: t\n---\n")
+    paths.target.write_text("docs/solutions/best-practices/t.md\n")
+    ctx = PipelineContext()
+    ctx.journal = _fake_journal(tmp_path)
+
+    result = await mod.PublishLearningProposal(paths=paths, name="publish learning proposal").run(ctx)
+
+    assert result.output == f"proposed at {ctx.journal.dir / 'learning.md'}"
+    assert (ctx.journal.dir / "learning.md").read_text() == "---\ntitle: t\n---\n"
+    assert (ctx.journal.dir / "learning-target").read_text().strip() == "docs/solutions/best-practices/t.md"
+    summary = await mod.LearningSummary(paths=paths, name="learning summary").run(ctx)
+    assert summary.output.startswith(f"proposed at {ctx.journal.dir / 'learning.md'}")
+    assert paths.outcome.exists()
+
+
+@pytest.mark.asyncio
+async def test_prepare_learning_scratch_empties_the_work_root(tmp_path) -> None:
+    repo = _ready_repo(tmp_path)
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    work = _isolated(mod, tmp_path)
+    (work / "stale.md").write_text("old\n")
+
+    stage = _find_stage(mod.pipeline.items, "prepare learning scratch")
+    stage.impl.work_root = work
+    await stage.impl.run(PipelineContext())
+
+    assert not (work / "stale.md").exists()
+    assert (work / "start.sha").read_text().strip() == repo.repo.head.commit.hexsha
+
+
+def test_work_root_is_outside_the_repo(tmp_path) -> None:
+    import tempfile
+
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    assert Path(tempfile.gettempdir()) in Path(mod.WORK_ROOT).parents
+    assert Path(mod.WORK_ROOT).parent.parent.name == "norn-learn"
+
+
+# -- learn postcondition and assert nothing unpushed -------------------------
+
+
+def _sh(cmd: str, cwd: str):
+    return subprocess.run(["sh", "-c", cmd], cwd=cwd, capture_output=True, text=True)
+
+
+def test_learn_postcondition_shell(tmp_path) -> None:
+    repo = _ready_repo(tmp_path)
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    paths = mod.LEARN_PATHS
+    paths.root.mkdir(parents=True, exist_ok=True)
+    try:
+        paths.pre_head.write_text(repo.repo.head.commit.hexsha + "\n")
+        cmd = _find_stage(mod.pipeline.items, "learn postcondition").impl.cmd
+
+        assert _sh(cmd, repo.path).returncode == 0
+
+        (Path(repo.path) / "dirty.txt").write_text("x\n")
+        dirty = _sh(cmd, repo.path)
+        assert dirty.returncode == 1 and "changed the working tree" in dirty.stderr
+        (Path(repo.path) / "dirty.txt").unlink()
+
+        (Path(repo.path) / "new.txt").write_text("x\n")
+        repo.repo.index.add(["new.txt"])
+        repo.repo.index.commit("moved")
+        moved = _sh(cmd, repo.path)
+        assert moved.returncode == 1 and "HEAD moved" in moved.stderr
+    finally:
+        shutil.rmtree(paths.root, ignore_errors=True)
+
+
+def test_assert_nothing_unpushed_shell(tmp_path) -> None:
+    repo = _ready_repo(tmp_path)
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    cmd = _find_stage(mod.pipeline.items, "assert nothing unpushed").impl.cmd
+
+    assert _sh(cmd, repo.path).returncode == 0
+
+    (Path(repo.path) / "a.txt").write_text("x\n")
+    dirty = _sh(cmd, repo.path)
+    assert dirty.returncode == 1 and "not clean" in dirty.stderr
+
+    repo.repo.index.add(["a.txt"])
+    repo.repo.index.commit("local only")
+    unpushed = _sh(cmd, repo.path)
+    assert unpushed.returncode == 1 and "1 unpushed commit" in unpushed.stderr
+
+    repo.repo.git.push()
+    assert _sh(cmd, repo.path).returncode == 0
+
+
+def test_assert_nothing_unpushed_without_upstream(tmp_path) -> None:
+    repo = make_repo_with_remote(tmp_path)
+    repo.repo.git.checkout("-b", "no-upstream")
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    cmd = _find_stage(mod.pipeline.items, "assert nothing unpushed").impl.cmd
+
+    result = _sh(cmd, repo.path)
+    assert result.returncode == 1
+    assert "no upstream" in result.stderr

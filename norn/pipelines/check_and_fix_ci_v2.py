@@ -24,14 +24,47 @@ Run with::
     norn run check_and_fix_ci_v2 --arg skip_local=true
 
 Set ``FIX_CI_LOOP_VERBOSE=1`` to dump full extracted CI logs to stderr.
+
+Optional ``--arg`` knobs (not in ``metadata["args"]``, so ``norn describe`` and
+the TUI launcher do not prompt for them):
+
+- ``--arg learn=on|off``       — propose a learning once CI is green (default
+  ``on``; anything else is rejected at import).  ``off`` drops every learn
+  stage and the recorders, but ``assert nothing unpushed`` stays.
+- ``--arg learn_model=<label>`` — intent label for the learn agent (default
+  ``light``; checked against ``norn/model_labels.toml`` at import).
+
+Learning proposal
+-----------------
+After ``wait ci`` the pipeline looks at the fix commits it made
+(``fix(ci): auto-fix from check_and_fix_ci`` and ``fix: auto-fix from
+check_and_fix_ci local loop``).  With none, or with no run journal, it records
+a skip and no agent runs.  Otherwise ``collect learning evidence`` assembles
+the failed attempts (recorded in the loops by ``record local attempt`` and
+``record ci attempt``), the fix commits' diffs and the related learnings;
+``learn`` writes at most one learning in the Compound Engineering schema; and
+``decide learning`` validates it.  The proposal lands in
+``<run dir>/learning.md`` plus ``learning-target``; **nothing is committed,
+staged or pushed** — a human copies it into the repository.  The learn stages
+never fail the run (they record ``failed: <reason>``), except
+``learn postcondition``, which fails when the repository itself changed during
+them.  Scratch lives in a temp work root, never in the repository.
+``assert nothing unpushed`` closes the run: it fails when the branch has no
+upstream, unpushed commits or a dirty tree, so a caller such as
+``merge_branch_v2`` can rely on the pushed head being the one CI checked.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import date
+from pathlib import Path
 from typing import Any
 
 
@@ -58,7 +91,7 @@ def _ensure_githubkit() -> None:
 _ensure_githubkit()
 
 from norn.alerts import MacOSChannel
-from norn.dsl import Pipeline, Stage, fail, stage_failed
+from norn.dsl import Pipeline, Stage, fail, file_exists, stage_failed
 from norn.models import PipelineContext, StageResult
 from norn.runner import PipelineError
 from norn.stages.base import BaseStage
@@ -68,7 +101,26 @@ from norn.stages.extract_failing_step import ExtractFailingStep
 from norn.stages.generate import Generate
 from norn.stages.run_command import RunCommand
 from norn.pipelines._comment_style import COMMENT_RULE, attribution_guard_sh
+from norn.pipelines._find_related import find_related
+from norn.pipelines._learnings import (
+    LearnGenerate,
+    LearnOutcomeStage,
+    LearnPaths,
+    StoreConfigError,
+    decide_learning,
+    existing_categories,
+    keywords_from,
+    learn_prompt,
+    marker_reason,
+    outcome_text,
+    publish_proposal,
+    resolve_store,
+    store_hint,
+    store_relpath,
+    write_marker,
+)
 from norn.pipelines._test_cmd import detect_test_cmd
+from norn.profiles import build_write_allowlist_hooks
 
 
 # Pinned to the launch directory at import time. This pipeline operates on the
@@ -149,6 +201,42 @@ SKIP_LOCAL = _args.get("skip_local", "false").lower() in ("1", "true", "yes")
 # with --arg local_fix_model=deep when stuck on a hard bug.
 LOCAL_FIX_MODEL = _args.get("local_fix_model", "standard")
 CI_FIX_MODEL = _args.get("ci_fix_model", "standard")
+
+
+def _require_knob_model(name: str, default: str) -> str:
+    from norn.model_labels import labels_for as _labels_for
+    _eligible = set(_labels_for("claude-code")) | set(_labels_for("opencode"))
+    raw = _args.get(name, default)
+    if raw not in _eligible:
+        raise ValueError(
+            f"--arg {name}: must be a Generate-eligible label "
+            f"({', '.join(sorted(_eligible))}), got {raw!r}"
+        )
+    return raw
+
+
+LEARN = _args.get("learn", "on")
+if LEARN not in ("on", "off"):
+    raise ValueError(f"--arg learn: must be 'on' or 'off', got {LEARN!r}")
+LEARN_ON = LEARN == "on"
+LEARN_MODEL = _require_knob_model("learn_model", "light")
+
+
+def _effective_agent_provider(argv: list[str]) -> str:
+    """The provider the run will use, resolved the way the CLI resolves it.
+
+    SDK hooks are a Claude Code feature, so the learn write-guard is only
+    attached when it can run.
+    """
+    for i, token in enumerate(argv):
+        if token == "--agent-provider" and i + 1 < len(argv):
+            return argv[i + 1]
+        if token.startswith("--agent-provider="):
+            return token.split("=", 1)[1]
+    return os.environ.get("NORN_AGENT_PROVIDER") or "claude-code"
+
+
+AGENT_PROVIDER = _effective_agent_provider(sys.argv[1:])
 
 print(f"[check_and_fix_ci_v2] test_cmd       = {LOCAL_TEST_CMD}", file=sys.stderr)
 print(f"[check_and_fix_ci_v2] local_fix_model = {LOCAL_FIX_MODEL}", file=sys.stderr)
@@ -417,6 +505,370 @@ class AssertUsefulLogs(BaseStage):
         return StageResult(name="", success=True)
 
 
+# --- learning proposal: work root, recorders and learn stages --------------
+
+# Scratch for the learn stages and the attempt ledger.  Outside the repository
+# on purpose (nothing this pipeline records may enter the target repo); the
+# directory is keyed by the launch directory so two checkouts never share it.
+WORK_ROOT = Path(tempfile.gettempdir()) / "norn-learn" / "check_and_fix_ci_v2" / (
+    hashlib.sha1(PROJECT_DIR.encode("utf-8")).hexdigest()[:12]
+)
+START_SHA = WORK_ROOT / "start.sha"
+ATTEMPTS_MD = WORK_ROOT / "attempts.md"
+LEARN_EVIDENCE = WORK_ROOT / "learn-evidence.md"
+LEARN_PATHS = LearnPaths(WORK_ROOT)
+
+# The two commit subjects this pipeline gives its fixes.
+LOCAL_FIX_SUBJECT = "fix: auto-fix from check_and_fix_ci local loop"
+CI_FIX_SUBJECT = "fix(ci): auto-fix from check_and_fix_ci"
+FIX_SUBJECTS = (CI_FIX_SUBJECT, LOCAL_FIX_SUBJECT)
+
+PREPARE_SCRATCH_STAGE = "prepare learning scratch"
+RECORD_LOCAL_STAGE = "record local attempt"
+RECORD_CI_STAGE = "record ci attempt"
+LEARN_COLLECT_STAGE = "collect learning evidence"
+LEARN_AGENT_STAGE = "learn"
+LEARN_POSTCONDITION_STAGE = "learn postcondition"
+LEARN_DECIDE_STAGE = "decide learning"
+LEARN_PUBLISH_STAGE = "publish learning proposal"
+LEARN_SUMMARY_STAGE = "learning summary"
+ASSERT_PUSHED_STAGE = "assert nothing unpushed"
+
+TIMEOUT_LEARN = 300   # applied inside LearnGenerate, never by the runner
+MAX_TURNS_LEARN = 4
+LEARN_NO_JOURNAL = "no journal to hold the proposal"
+LEARN_NO_FIX = "CI was green without a fix in this run"
+
+# Evidence caps.
+ATTEMPT_EXCERPT_LINES = 80
+COMMIT_PATCH_LINES = 150
+LEARN_RELATED_FULL = 3
+LEARN_RELATED_FULL_LINES = 300
+LEARN_RELATED_HEADS = 7
+LEARN_RELATED_HEAD_LINES = 30
+
+_EVIDENCE_FENCE = "~~~~~~"
+
+
+def _fenced(text: str) -> list[str]:
+    body = text.rstrip("\n")
+    return [_EVIDENCE_FENCE, body if body else "(empty)", _EVIDENCE_FENCE, ""]
+
+
+def _cap_lines(text: str, limit: int, *, keep: str = "head") -> str:
+    """Keep the first (``head``) or last (``tail``) *limit* lines of *text*."""
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return text
+    cut = len(lines) - limit
+    if keep == "tail":
+        return f"… ({cut} earlier lines cut)\n" + "\n".join(lines[-limit:])
+    return "\n".join(lines[:limit]) + f"\n… ({cut} more lines cut)"
+
+
+def _repo_git(*args: str) -> str:
+    """Run git in the launch directory; a failure raises."""
+    proc = subprocess.run(
+        ["git", "-C", PROJECT_DIR, *args], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed (exit {proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc.stdout
+
+
+def _toplevel() -> str:
+    return _repo_git("rev-parse", "--show-toplevel").strip()
+
+
+class PrepareLearningScratch(BaseStage):
+    """``prepare learning scratch``: empty the work root and record HEAD.
+
+    ``start.sha`` is what ``collect learning evidence`` later reads to find the
+    fixes this run made.  A failure here fails the run: it happens before any
+    work has started.
+    """
+
+    needs_agent = False
+
+    def __init__(self, *, work_root: Path) -> None:
+        self.work_root = work_root
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        head = _repo_git("rev-parse", "HEAD").strip()
+        if self.work_root.exists():
+            shutil.rmtree(self.work_root)
+        self.work_root.mkdir(parents=True)
+        (self.work_root / "start.sha").write_text(head + "\n", encoding="utf-8")
+        return StageResult(name="", success=True, output=f"start {head}")
+
+
+class RecordAttempt(BaseStage):
+    """Append the failed attempt's excerpt to ``attempts.md`` in the work root.
+
+    Runs at the top of the attempt after a failure, so the attempt it records
+    is ``attempt - 1``.  ``emits_events`` is set only so the runner passes the
+    ``attempt`` kwarg to a non-agent stage; it emits no events.  ``attempt`` has
+    no default on purpose: a runner that stopped passing it must raise instead
+    of recording attempt 1 every time.
+    """
+
+    needs_agent = False
+    emits_events = True
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        source_stage: str,
+        ledger: Path,
+        workflow_stage: str | None = None,
+    ) -> None:
+        self.kind = kind
+        self.source_stage = source_stage
+        self.ledger = ledger
+        self.workflow_stage = workflow_stage
+
+    def _workflow(self, ctx: PipelineContext) -> str:
+        if self.workflow_stage is None:
+            return "local tests"
+        prev = ctx.results.get(self.workflow_stage)
+        for line in str(prev.output if prev is not None else "").splitlines():
+            if line.startswith("Failing workflow:"):
+                return line.partition(":")[2].strip()
+        return "unknown"
+
+    async def run(self, ctx: PipelineContext, *, node_id, attempt, **_: Any) -> StageResult:
+        failed = attempt - 1
+        source = ctx.results.get(self.source_stage)
+        excerpt = str(source.output) if source is not None and source.output else ""
+        entry = [
+            f"## {self.kind} attempt {failed}",
+            "",
+            f"Workflow: {self._workflow(ctx)}",
+            "",
+            *_fenced(_cap_lines(excerpt, ATTEMPT_EXCERPT_LINES)),
+        ]
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        with self.ledger.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(entry) + "\n")
+        return StageResult(name="", success=True, output=f"recorded {self.kind} attempt {failed}")
+
+
+def _fix_commits(start: str) -> list[str]:
+    """Shas in ``start..HEAD`` whose subject is one of the two fix subjects."""
+    out = _repo_git("log", "--reverse", "--format=%H%x09%s", f"{start}..HEAD")
+    shas: list[str] = []
+    for line in out.splitlines():
+        sha, _, subject = line.partition("\t")
+        if subject in FIX_SUBJECTS:
+            shas.append(sha)
+    return shas
+
+
+def _related_section(store: Path, toplevel: str, keywords: list[str]) -> list[str]:
+    categories = existing_categories(store)
+    out = [
+        "## Related learnings",
+        "",
+        f"Store: `{store_relpath(toplevel, store)}`",
+        "Keywords: " + (", ".join(keywords) or "none"),
+        "Existing category directories: " + (", ".join(f"`{c}`" for c in categories) or "none"),
+        "",
+    ]
+    if not store.is_dir():
+        return out + ["store does not exist", ""]
+    candidates = find_related(store, keywords)[: LEARN_RELATED_FULL + LEARN_RELATED_HEADS]
+    if not candidates:
+        return out + ["none found", ""]
+    for i, cand in enumerate(candidates):
+        rel = os.path.relpath(cand.path, toplevel)
+        matched = ", ".join(cand.matched)
+        if i < LEARN_RELATED_FULL:
+            lines = Path(cand.path).read_text(encoding="utf-8", errors="replace").splitlines()
+            if len(lines) <= LEARN_RELATED_FULL_LINES:
+                out += [f"### `{rel}` — full text (matched: {matched})", ""]
+                out += _fenced("\n".join(lines))
+            else:
+                out += [
+                    f"### `{rel}` — first {LEARN_RELATED_FULL_LINES} lines only, not the "
+                    f"full text (matched: {matched})",
+                    "",
+                ]
+                out += _fenced("\n".join(lines[:LEARN_RELATED_FULL_LINES]))
+        else:
+            out += [
+                f"### `{rel}` — first {LEARN_RELATED_HEAD_LINES} lines only (matched: {matched})",
+                "",
+            ]
+            out += _fenced("\n".join(cand.head[:LEARN_RELATED_HEAD_LINES]))
+    return out
+
+
+def _learning_evidence(store: Path, toplevel: str, start: str, fixes: list[str]) -> str:
+    """Assemble the learn agent's evidence (blocking: run it in a thread)."""
+    parts = ["# Learning evidence", "", f"Start: {start}", ""]
+    parts += ["## Failed attempts", ""]
+    if ATTEMPTS_MD.is_file():
+        parts += [ATTEMPTS_MD.read_text(encoding="utf-8", errors="replace").rstrip("\n"), ""]
+    else:
+        parts += ["no failed attempt was recorded", ""]
+    parts += ["## Fix commits", ""]
+    changed: list[str] = []
+    for sha in fixes:
+        shown = _repo_git("show", "--stat", "--patch", "--format=%h %s", sha)
+        parts += [f"### {sha[:12]}", ""] + _fenced(_cap_lines(shown, COMMIT_PATCH_LINES))
+        for path in _repo_git("show", "--name-only", "--format=", sha).splitlines():
+            if path and path not in changed:
+                changed.append(path)
+    keywords = keywords_from(list(WORKFLOWS), changed)
+    parts += _related_section(store, toplevel, keywords)
+    return "\n".join(parts).rstrip("\n") + "\n"
+
+
+class CollectLearningEvidence(LearnOutcomeStage):
+    """``collect learning evidence``: reset, find the fixes, build the evidence.
+
+    No fix commit, or no journal, writes ``learn.skipped``; an unusable
+    ``docs_root`` writes ``learn.failed``.  Either way collection stops without
+    ``learn.pre-head``, so the agent, the postcondition and the decision skip.
+    Otherwise ``learn.pre-head`` is its last write, so "the baseline exists"
+    means "collection finished and the agent may run".
+    """
+
+    async def _run(self, ctx: PipelineContext) -> str:
+        paths = self.paths
+        paths.reset()
+        start = START_SHA.read_text(encoding="utf-8").strip()
+        fixes = await asyncio.to_thread(_fix_commits, start)
+        if not fixes:
+            write_marker(paths.marker_skipped, LEARN_NO_FIX)
+            return f"skipped: {LEARN_NO_FIX}"
+        if ctx.journal is None:
+            write_marker(paths.marker_skipped, LEARN_NO_JOURNAL)
+            return f"skipped: {LEARN_NO_JOURNAL}"
+        toplevel = await asyncio.to_thread(_toplevel)
+        try:
+            store = resolve_store(toplevel)
+        except StoreConfigError as exc:
+            reason = f"the learning store is unusable: {exc}"
+            write_marker(paths.marker_failed, reason)
+            return f"failed: {reason}"
+        evidence = await asyncio.to_thread(_learning_evidence, store, toplevel, start, fixes)
+        LEARN_EVIDENCE.write_text(evidence, encoding="utf-8")
+        paths.scratch.mkdir(parents=True, exist_ok=True)
+        head = await asyncio.to_thread(_repo_git, "rev-parse", "HEAD")
+        paths.pre_head.write_text(head.strip() + "\n", encoding="utf-8")
+        return evidence
+
+
+def _learn_prompt_now() -> str:
+    """The learn prompt for the store as it is when the agent runs."""
+    toplevel = _toplevel()
+    store = resolve_store(toplevel)
+    return learn_prompt(
+        evidence_stage=LEARN_COLLECT_STAGE,
+        paths=LEARN_PATHS,
+        store_rel=store_relpath(toplevel, store),
+        categories=existing_categories(store),
+        today=date.today().isoformat(),
+    )
+
+
+class LearnAgent(LearnGenerate):
+    """``learn``: the prompt is built when the stage runs, not at import.
+
+    An unusable ``docs_root`` must not stop the module from importing:
+    collection reports it as the outcome.  ``prompt`` holds a preview.
+    """
+
+    def _resolve_prompt(self, ctx: PipelineContext) -> str:
+        return self._resolve(_learn_prompt_now(), ctx)
+
+
+_LEARN_PROMPT_PREVIEW = learn_prompt(
+    evidence_stage=LEARN_COLLECT_STAGE,
+    paths=LEARN_PATHS,
+    store_rel="<store>",
+    categories=["<the store's category directories when the stage runs>"],
+    today="<today>",
+)
+
+# The learn agent may write only its three scratch files.  Claude Code only;
+# under another provider `learn postcondition` is what catches a write into
+# the repository.
+_LEARN_WRITE_GUARD = (
+    build_write_allowlist_hooks([str(p) for p in LEARN_PATHS.writable])
+    if AGENT_PROVIDER == "claude-code"
+    else None
+)
+
+_learn_postcondition_cmd = (
+    f"cd {shlex.quote(PROJECT_DIR)} && "
+    'if [ -n "$(git status --porcelain)" ]; then '
+    'echo "ERROR: the learn stages changed the working tree:" 1>&2 && '
+    'git status --short 1>&2 && exit 1; fi && '
+    f'pre=$(cat {shlex.quote(str(LEARN_PATHS.pre_head))}) && '
+    'head=$(git rev-parse HEAD) && '
+    'if [ "$head" != "$pre" ]; then '
+    'echo "ERROR: HEAD moved during the learn stages: $pre -> $head" 1>&2 && exit 1; fi'
+)
+
+_assert_nothing_unpushed_cmd = (
+    f"cd {shlex.quote(PROJECT_DIR)} && "
+    'if ! git rev-parse "@{u}" >/dev/null 2>&1; then '
+    'echo "ERROR: the current branch has no upstream; the fixes are not pushed." 1>&2 && exit 1; fi && '
+    'n=$(git rev-list --count "@{u}..HEAD") && '
+    'if [ "$n" != "0" ]; then '
+    'echo "ERROR: $n unpushed commit(s) on the current branch." 1>&2 && exit 1; fi && '
+    'if [ -n "$(git status --porcelain)" ]; then '
+    'echo "ERROR: the working tree is not clean:" 1>&2 && git status --short 1>&2 && exit 1; fi && '
+    'echo "nothing unpushed"'
+)
+
+
+class DecideLearning(LearnOutcomeStage):
+    """``decide learning``: validate the agent's result; note the instruction file."""
+
+    async def _run(self, ctx: PipelineContext) -> str:
+        toplevel = await asyncio.to_thread(_toplevel)
+        store_rel = store_relpath(toplevel, resolve_store(toplevel))
+        outcome = await asyncio.to_thread(
+            decide_learning,
+            self.paths,
+            repo=toplevel,
+            store_rel=store_rel,
+            base_sha=START_SHA.read_text(encoding="utf-8").strip(),
+        )
+        if outcome == "ready":
+            hint = store_hint(toplevel, store_rel)
+            if hint is not None:
+                self.paths.store_hint.write_text(hint + "\n", encoding="utf-8")
+        marker = {
+            "ready": self.paths.marker_ready,
+            "skipped": self.paths.marker_skipped,
+            "failed": self.paths.marker_failed,
+        }[outcome]
+        return f"{outcome}: {marker_reason(marker)}"
+
+
+class PublishLearningProposal(LearnOutcomeStage):
+    """``publish learning proposal``: copy it into the run directory."""
+
+    async def _run(self, ctx: PipelineContext) -> str:
+        return f"proposed at {publish_proposal(self.paths, ctx.journal.dir)}"
+
+
+class LearningSummary(LearnOutcomeStage):
+    """``learning summary``: ``outcome.md``, whichever marker exists."""
+
+    async def _run(self, ctx: PipelineContext) -> str:
+        text = outcome_text(self.paths)
+        self.paths.outcome.write_text(text + "\n", encoding="utf-8")
+        return text
+
+
 # --- pipeline -------------------------------------------------------------
 
 pipeline = (
@@ -436,6 +888,9 @@ pipeline.stage(
     )),
 )
 
+if LEARN_ON:
+    pipeline.stage(PREPARE_SCRATCH_STAGE, PrepareLearningScratch(work_root=WORK_ROOT))
+
 # Local test fix-loop. Cheaper to fail here than to push and burn CI minutes.
 if not SKIP_LOCAL:
     pipeline.loop(
@@ -454,6 +909,21 @@ if not SKIP_LOCAL:
                 # Only compress on a real failure — no point compressing a
                 # green log just to throw it away in the next iteration.
                 when=stage_failed("run local tests"),
+            ),
+            *(
+                [
+                    Stage(
+                        RECORD_LOCAL_STAGE,
+                        RecordAttempt(
+                            kind="local",
+                            source_stage="compress local tests",
+                            ledger=ATTEMPTS_MD,
+                        ),
+                        when=stage_failed("run local tests"),
+                    )
+                ]
+                if LEARN_ON
+                else []
             ),
             Stage(
                 "fix local",
@@ -542,6 +1012,22 @@ pipeline.loop(
             "isolate failing step",
             ExtractFailingStep(source_stage="check ci"),
             when=stage_failed("check ci"),
+        ),
+        *(
+            [
+                Stage(
+                    RECORD_CI_STAGE,
+                    RecordAttempt(
+                        kind="ci",
+                        source_stage="isolate failing step",
+                        ledger=ATTEMPTS_MD,
+                        workflow_stage="check ci",
+                    ),
+                    when=stage_failed("check ci"),
+                )
+            ]
+            if LEARN_ON
+            else []
         ),
         Stage(
             "assert ci logs",
@@ -654,6 +1140,70 @@ pipeline.loop(
             ),
         ),
     ],
+)
+
+if LEARN_ON:
+    pipeline.clear_context()
+
+    pipeline.stage(
+        LEARN_COLLECT_STAGE,
+        CollectLearningEvidence(paths=LEARN_PATHS, name=LEARN_COLLECT_STAGE),
+        on_failure=fail,   # never fails: LearnOutcomeStage
+    )
+
+    # No runner timeout: LearnGenerate applies TIMEOUT_LEARN itself and turns
+    # a timeout into an outcome, which a runner timeout could not do.
+    pipeline.stage(
+        LEARN_AGENT_STAGE,
+        LearnAgent(
+            paths=LEARN_PATHS,
+            timeout=TIMEOUT_LEARN,
+            prompt=_LEARN_PROMPT_PREVIEW,
+            allowed_tools=["Write"],
+            permission_mode="acceptEdits",
+            add_dirs=[str(LEARN_PATHS.scratch)],
+            max_turns=MAX_TURNS_LEARN,
+            model=LEARN_MODEL,
+            hooks=_LEARN_WRITE_GUARD,
+        ),
+        when=file_exists(str(LEARN_PATHS.pre_head)),
+        on_failure=fail,   # never fails: LearnGenerate
+    )
+
+    pipeline.stage(
+        LEARN_POSTCONDITION_STAGE,
+        RunCommand(cmd=_learn_postcondition_cmd),
+        when=file_exists(str(LEARN_PATHS.pre_head)),
+        on_failure=fail,   # the one integrity exception to decision 5
+    )
+
+    pipeline.stage(
+        LEARN_DECIDE_STAGE,
+        DecideLearning(paths=LEARN_PATHS, name=LEARN_DECIDE_STAGE),
+        when=file_exists(str(LEARN_PATHS.pre_head)),
+        on_failure=fail,   # never fails: LearnOutcomeStage
+    )
+
+    pipeline.stage(
+        LEARN_PUBLISH_STAGE,
+        PublishLearningProposal(paths=LEARN_PATHS, name=LEARN_PUBLISH_STAGE),
+        when=file_exists(str(LEARN_PATHS.marker_ready)),
+        on_failure=fail,   # never fails: LearnOutcomeStage
+    )
+
+    pipeline.stage(
+        LEARN_SUMMARY_STAGE,
+        LearningSummary(paths=LEARN_PATHS, name=LEARN_SUMMARY_STAGE),
+        on_failure=fail,   # never fails: LearnOutcomeStage
+    )
+
+# A contract of the CI pipeline, not a learn stage, so it stays fatal with
+# learn=off too: merge_branch_v2's ci_fix_unpushed guard relies on it.  No
+# learn stage commits, stages or pushes anything.
+pipeline.stage(
+    ASSERT_PUSHED_STAGE,
+    RunCommand(cmd=_assert_nothing_unpushed_cmd),
+    on_failure=fail,
 )
 
 

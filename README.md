@@ -522,6 +522,25 @@ norn run check_and_fix_ci_v2 --arg workflow=ci.yml,release.yml
 one that is not green is the one that gets fixed. It is a copy of
 `check_and_fix_ci_v1`.
 
+**Learning proposal.** Once CI is green and the run made at least one fix commit,
+the pipeline proposes at most one learning about the fix, in the Compound
+Engineering schema (the store is `docs/solutions/`, or `<docs_root>/solutions/`
+from `.compound-engineering/config.yaml`). The proposal is written to
+`<run dir>/learning.md` with the store path it belongs at in
+`<run dir>/learning-target`, and the final `learning summary` stage prints the
+path and a copy command. **Nothing is committed, staged or pushed**: a human
+copies the file into the repository and commits it, which puts it through
+review. A run with no fix commit, or without a run journal, records a skip and
+runs no agent. The learn stages never fail the run, except `learn postcondition`,
+which fails if the repository itself changed while they ran.
+
+- `--arg learn=on|off` (default `on`): `off` drops the learn stages and the
+  attempt recorders.
+- `--arg learn_model=<label>` (default `light`): the label for the learn agent.
+
+The run always ends with `assert nothing unpushed`: the branch must have an
+upstream, no unpushed commits and a clean tree (also with `learn=off`).
+
 ### merge_branch_v2
 
 A copy of [`merge_branch_v1`](#merge_branch_v1) (see there for the stages, halts
