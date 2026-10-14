@@ -251,6 +251,40 @@ def main() -> None:
         help="Show the detailed step log for one run",
     )
 
+    compare_parser = sub.add_parser(
+        "compare",
+        help="Compare the last N journaled runs of two pipelines, or check pass bars",
+    )
+    compare_parser.add_argument(
+        "pipelines",
+        nargs="+",
+        metavar="PIPELINE",
+        help="Two pipelines (state keys) to compare, or one with --bar",
+    )
+    compare_parser.add_argument(
+        "--last",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Journaled runs per pipeline to compare (default: 5)",
+    )
+    compare_parser.add_argument(
+        "--group",
+        action="append",
+        default=[],
+        metavar="NAME=REGEX",
+        help=(
+            "Report cost share and executed count of stages whose bare name matches "
+            "REGEX (repeatable)"
+        ),
+    )
+    compare_parser.add_argument(
+        "--bar",
+        default=None,
+        metavar="DIGEST",
+        help="Check the '## Pass bar' lines of a feedback digest against one pipeline",
+    )
+
     sub.add_parser("orgs", help="List available org configs")
 
     sub.add_parser("list-stages", help="List all registered stage plugins")
@@ -363,6 +397,48 @@ def main() -> None:
             _ui.print_history_comparison(records, run_a, run_b, state_key=_history_state_key)
         else:
             _ui.print_history_table(records, state_key=_history_state_key)
+        return
+
+    if args.command == "compare":
+        from norn import compare as _compare
+
+        if remaining:
+            parser.error(f"compare: unrecognized arguments: {' '.join(remaining)}")
+        if args.last < 1:
+            parser.error("compare: --last must be at least 1")
+        if args.bar is not None:
+            if len(args.pipelines) != 1:
+                parser.error("compare: --bar takes exactly one pipeline")
+            if args.group:
+                parser.error("compare: --group cannot be used with --bar (groups come from the digest)")
+            bar_path = Path(args.bar)
+            if not bar_path.is_file():
+                parser.error(f"compare: digest file not found: {args.bar}")
+            try:
+                bar_file = _compare.parse_bar_file(bar_path)
+                results = _compare.check_bars(args.pipelines[0], bar_file)
+            except _compare.CompareError as exc:
+                print(f"compare: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(_compare.format_bar_results(args.pipelines[0], results))
+            return
+        if len(args.pipelines) != 2:
+            parser.error("compare: expected two pipelines (or one pipeline with --bar)")
+        groups: dict = {}
+        for spec in args.group:
+            try:
+                gname, gregex = _compare.parse_group(spec)
+            except ValueError as exc:
+                parser.error(f"compare: {exc}")
+            groups[gname] = gregex
+        try:
+            comparison = _compare.compare_pipelines(
+                args.pipelines[0], args.pipelines[1], last=args.last, groups=groups
+            )
+        except _compare.CompareError as exc:
+            print(f"compare: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(_compare.format_comparison(comparison))
         return
 
     if args.command == "orgs":

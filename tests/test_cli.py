@@ -605,3 +605,94 @@ def test_models_subcommand_shows_effort_values(capsys):
         effort = resolve_label("claude-code", label).effort
         assert effort is not None, f"claude-code label {label!r} has no effort"
         assert effort in captured.out, f"Expected effort {effort!r} in norn models output"
+
+
+# --- compare subcommand ---
+
+
+def _compare_runs(root, key, costs):
+    import json
+    from dataclasses import asdict
+    from norn.metrics import RunMetrics
+
+    for i, c in enumerate(costs, start=1):
+        d = root / f"{key}.runs" / str(i)
+        d.mkdir(parents=True)
+        (d / "run.json").write_text(json.dumps({"history_run_id": i}))
+        m = RunMetrics(
+            run_id=str(i), pipeline=key, provider="claude-code", cost_mode="tracked",
+            success=True, failed_stage=None, cost_usd=c, billed_input_tokens=1,
+            output_tokens=1, cache_read_tokens=0, cache_hit_ratio=0.0, turns=1,
+            wall_ms=1, api_ms=1, tool_time_ms=1, agent_stage_count=1,
+            command_stage_count=0, failed_attempts=0, failed_attempt_cost_usd=0.0,
+            timed_out_attempts=0, retries=0, budget_max_cost_usd=None,
+            budget_used_pct=None, waiting_input={}, top_cost_stages=[], quota=None,
+            codex_cost_usd_estimate=None, stages=[],
+        )
+        (d / "metrics.json").write_text(json.dumps(asdict(m)))
+
+
+def test_compare_prints_both_sides(capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _compare_runs(tmp_path, "pa", [10, 11, 12])
+    _compare_runs(tmp_path, "pb", [1, 2, 3])
+    with patch("sys.argv", ["norn", "compare", "pa", "pb", "--group", "g=^x"]):
+        main()
+    out = capsys.readouterr().out
+    assert "A pa: 3 runs" in out and "B pb: 3 runs" in out
+    assert "B lower" in out
+    assert "group_share:g" in out
+
+
+def test_compare_unknown_pipeline_exits_1(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _compare_runs(tmp_path, "pa", [1, 2, 3])
+    with patch("sys.argv", ["norn", "compare", "pa", "missing"]):
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code == 1
+    assert "missing" in capsys.readouterr().err
+
+
+def test_compare_no_runs_with_metrics_exits_1(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _compare_runs(tmp_path, "pa", [1, 2, 3])
+    (tmp_path / "pb.runs" / "1").mkdir(parents=True)
+    with patch("sys.argv", ["norn", "compare", "pa", "pb"]):
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["compare", "only-one"],
+        ["compare", "a", "b", "c"],
+        ["compare", "a", "b", "--group", "noequals"],
+        ["compare", "a", "b", "--group", "g=("],
+        ["compare", "a", "b", "--bar", "digest.md"],
+        ["compare", "a", "--bar", "missing-digest.md"],
+        ["compare", "a", "b", "--last", "0"],
+        ["compare", "a", "b", "--bogus"],
+    ],
+)
+def test_compare_argument_errors_are_usage_errors(argv, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "digest.md").write_text("## Pass bar\n")
+    with patch("sys.argv", ["norn", *argv]):
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code == 2
+
+
+def test_compare_bar_reads_digest(capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _compare_runs(tmp_path, "pa", [10, 11, 12, 1, 1, 1])
+    digest = tmp_path / "digest.md"
+    digest.write_text(
+        "## Pass bar\nmetric=cost_usd direction=lower threshold=50% baseline=1,2,3\n"
+    )
+    with patch("sys.argv", ["norn", "compare", "pa", "--bar", str(digest)]):
+        main()
+    assert "met" in capsys.readouterr().out

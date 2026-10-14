@@ -735,7 +735,15 @@ uv run python -m norn history pipeline.py --run 3
 
 # Compare two runs side by side
 uv run python -m norn history pipeline.py --compare 2 3
+
+# Compare the last 5 journaled runs of two pipelines (default --last 5)
+uv run python -m norn compare implement_features_v2 implement_features_v3 --group review='^(review|validate findings)'
+
+# Check the pass bars of a feedback digest against one pipeline
+uv run python -m norn compare implement_features_v3 --bar implement_features_v3.runs/feedback-digest-1.md
 ```
+
+`norn compare` reads `metrics.json` (and `findings.json`) of each pipeline's journaled runs from the current directory. It prints the run count, success count and the median with min–max of `cost_usd`, `output_tokens`, `retries`, `failed_attempts` and `wall_ms`, then a verdict per metric: `too few runs (need 3)`, `within noise` (either median lies inside the other side's range) or `B lower`/`B higher`. Each `--group NAME=REGEX` adds the group's cost share and executed (not skipped) count. A group regex matches the bare stage name (`review 1`, `fix step-01`), not the journal node id (`stage:review 1`, `loop:…/stage:…`), so anchor it on the stage name. With `--bar <digest>` it checks each `## Pass bar` line as `met`, `unproven` (inside the baseline range, or fewer than 3 post runs) or `not met`. It exits 1 for an unknown pipeline or no journaled runs, and 2 for argument errors.
 
 Default labels: **light** for the stage judge, **standard** for the narrative feedback pass. Use `--model deep` to upgrade both. `--max-cost` defaults to `5.0` USD; the command exits with an error if the running evaluation spend would exceed it.
 
