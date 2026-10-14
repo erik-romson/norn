@@ -6540,3 +6540,300 @@ async def test_review_fix_baseline_clears_a_stale_marker_and_triage(tmp_path, mo
     assert r.success, r.output
     assert not nochange.exists()
     assert not triage.exists()
+
+
+# ---------------------------------------------------------------------------
+# Review validator (step 14)
+# ---------------------------------------------------------------------------
+
+_VALIDATOR_ON = ("--arg", "review_validator=on")
+_VALIDATOR_STAGES = ("validate findings 1", "record validated findings 1", "read validated 1")
+
+
+def _stage_names(mod) -> list[str]:
+    return [getattr(i, "name", None) for i in mod.config.items]
+
+
+def test_review_validator_knob_defaults_to_off() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.REVIEW_VALIDATOR == "off"
+    assert mod.REVIEW_VALIDATOR_ON is False
+
+
+def test_review_validator_knob_accepts_on_and_off() -> None:
+    assert _import_v2(GOOD_DIR, *_VALIDATOR_ON).REVIEW_VALIDATOR_ON is True
+    assert _import_v2(GOOD_DIR, "--arg", "review_validator=off").REVIEW_VALIDATOR_ON is False
+
+
+def test_review_validator_knob_rejects_a_bogus_value() -> None:
+    with pytest.raises(ValueError, match="review_validator"):
+        _import_v2(GOOD_DIR, "--arg", "review_validator=maybe")
+
+
+def test_no_validator_stages_when_off() -> None:
+    names = _stage_names(_import_v2(GOOD_DIR))
+    for name in _VALIDATOR_STAGES:
+        assert name not in names
+
+
+def test_validator_stages_when_on_are_gated_and_ordered() -> None:
+    from norn.dsl import OnFailure
+    from norn.models import PipelineContext
+    mod = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
+    names = _stage_names(mod)
+    assert names.index("check review 1") < names.index("validate findings 1")
+    assert names.index("validate findings 1") < names.index("record validated findings 1")
+    assert names.index("record validated findings 1") < names.index("review fix baseline 1")
+
+    gen = _stage(mod, "validate findings 1")
+    impl = gen.impl
+    assert impl.permission_mode == "plan"
+    assert impl.allowed_tools == ["Read", "Glob", "Grep"]
+    assert impl.max_turns == 40
+    assert impl.model == "standard"
+    assert gen.on_failure == OnFailure.ASK_USER
+    assert _stage(mod, "record validated findings 1").on_failure == OnFailure.FAIL
+
+    marker = mod._review_paths[1]["needs_fixes"]
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    if os.path.exists(marker):
+        os.unlink(marker)
+    for name in ("validate findings 1", "record validated findings 1"):
+        assert _stage(mod, name).when(PipelineContext()) is False
+    Path(marker).touch()
+    try:
+        for name in ("validate findings 1", "record validated findings 1"):
+            assert _stage(mod, name).when(PipelineContext()) is True
+    finally:
+        os.unlink(marker)
+
+
+def test_round_two_reads_the_validated_file_when_on() -> None:
+    mod = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
+    stage = _stage(mod, "read validated 1")
+    assert stage.impl.path == mod._review_paths[1]["validated"]
+    assert mod._review_paths[1]["validated"].endswith("review-1.validated.md")
+    prompt = _stage(mod, "review 2").impl.prompt
+    assert "{read validated 1.output}" in prompt
+    assert "validator" in prompt
+    off = _stage(_import_v2(GOOD_DIR), "review 2").impl.prompt
+    assert "validated 1" not in off
+    assert "validated 1" not in _stage(mod, "review 3").impl.prompt
+
+
+def test_validator_prompt_carries_the_policy() -> None:
+    mod = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
+    prompt = _stage(mod, "validate findings 1").impl.prompt
+    assert prompt == mod._validator_prompt()
+    for needle in ("at most 8", "every critical", "confirmed", "rejected", "unresolved",
+                   "Lack of disproof is never confirmation", "Inspected but unsupported is `rejected`",
+                   "Inaccessible is `unresolved`", "B<k>: <confirmed|rejected|unresolved>"):
+        assert needle in prompt, needle
+    for model_word in ('"haiku"', '"sonnet"', '"opus"'):
+        assert model_word not in prompt
+    assert "{read review manifest 1.output}" in prompt
+
+
+def test_validator_prompt_has_only_the_placeholder_braces() -> None:
+    mod = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
+    prompt = mod._validator_prompt().replace("{read review manifest 1.output}", "")
+    assert "{" not in prompt and "}" not in prompt
+
+
+def test_blocking_ids_reads_only_the_blocking_section() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod.blocking_ids(_REVIEW_WITH_THREE_BLOCKERS) == ["B1", "B2"]
+    assert mod.blocking_ids("VERDICT: PASS\n") == []
+
+
+def test_parse_validator_verdicts_reads_each_line() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = (
+        "B1: confirmed — a.py:3 really drops the error\n"
+        "- B2: Rejected - the guard at b.py:9 covers it\n"
+        "**B3**: unresolved — the file is not in the checkout\n"
+    )
+    got = mod.parse_validator_verdicts(text, ["B1", "B2", "B3"])
+    assert got == {
+        "B1": ("confirmed", "a.py:3 really drops the error"),
+        "B2": ("rejected", "the guard at b.py:9 covers it"),
+        "B3": ("unresolved", "the file is not in the checkout"),
+    }
+
+
+def test_parse_validator_verdicts_missing_and_malformed_are_unresolved() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = (
+        "Here is my analysis.\n"
+        "B1 confirmed — no colon\n"
+        "B2: maybe — not a verdict\n"
+        "B3: confirmedly fine\n"
+        "B9: confirmed — not a finding of this review\n"
+    )
+    got = mod.parse_validator_verdicts(text, ["B1", "B2", "B3"])
+    assert set(got) == {"B1", "B2", "B3"}
+    for fid in got:
+        assert got[fid] == ("unresolved", mod.VALIDATOR_NO_VERDICT)
+
+
+def test_parse_validator_verdicts_handles_repeats_and_empty_reasons() -> None:
+    mod = _import_v2(GOOD_DIR)
+    got = mod.parse_validator_verdicts(
+        "B1: confirmed — first\nB1: confirmed — again\nB2: confirmed — yes\nB2: rejected — no\nB3: rejected\n",
+        ["B1", "B2", "B3"],
+    )
+    assert got["B1"] == ("confirmed", "first")
+    assert got["B2"][0] == "unresolved"
+    assert got["B3"] == ("rejected", "no reason given")
+    assert mod.parse_validator_verdicts("", ["B1"]) == {"B1": ("unresolved", mod.VALIDATOR_NO_VERDICT)}
+
+
+def test_format_validated_has_one_line_per_id() -> None:
+    mod = _import_v2(GOOD_DIR)
+    text = mod.format_validated(["B1", "B2"], {"B1": ("confirmed", "x"), "B2": ("rejected", "y")})
+    assert text == "B1: confirmed — x\nB2: rejected — y\n"
+
+
+@pytest.mark.asyncio
+async def test_record_validated_findings_writes_the_deterministic_file(tmp_path) -> None:
+    from norn.models import PipelineContext, StageResult
+    mod = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
+    Path(mod.REVIEW_MD).parent.mkdir(parents=True, exist_ok=True)
+    saved = Path(mod.REVIEW_MD).read_text() if os.path.exists(mod.REVIEW_MD) else None
+    Path(mod.REVIEW_MD).write_text(_REVIEW_WITH_THREE_BLOCKERS, encoding="utf-8")
+    try:
+        ctx = PipelineContext()
+        ctx.results["validate findings 1"] = StageResult(
+            name="", success=True, output="B1: confirmed — real\nnoise\n",
+        )
+        result = await _stage(mod, "record validated findings 1").impl.run(ctx)
+        assert result.success, result.error
+        written = Path(mod._review_paths[1]["validated"]).read_text(encoding="utf-8")
+        assert written == f"B1: confirmed — real\nB2: unresolved — {mod.VALIDATOR_NO_VERDICT}\n"
+        assert result.output == written
+    finally:
+        if saved is None:
+            os.unlink(mod.REVIEW_MD)
+        else:
+            Path(mod.REVIEW_MD).write_text(saved)
+        Path(mod._review_paths[1]["validated"]).unlink(missing_ok=True)
+
+
+def test_round_one_fix_prompt_switches_with_the_validator() -> None:
+    on = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
+    prompt = _stage(on, "review fix 1").impl.prompt
+    validated = on._review_paths[1]["validated"]
+    assert f"`{validated}`" in prompt
+    assert "**confirmed**" in prompt
+    assert "- none confirmed" in prompt
+    assert "- B<k>: accepted" in prompt
+    assert "{" not in prompt and "}" not in prompt
+    assert "validated" not in _stage(on, "review fix 2").impl.prompt
+    off = _stage(_import_v2(GOOD_DIR), "review fix 1").impl.prompt
+    assert "none confirmed" not in off and "validator" not in off
+
+
+def test_check_triage_1_uses_the_validated_rule_only_when_on() -> None:
+    off = _import_v2(GOOD_DIR)
+    assert _stage(off, "check triage 1").impl.cmd == off._triage_check_cmd(
+        off.REVIEW_MD, off._review_paths[1]["triage"]
+    )
+    on = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
+    paths = on._review_paths[1]
+    assert _stage(on, "check triage 1").impl.cmd == on._triage_validated_check_cmd(
+        on.REVIEW_MD, paths["validated"], paths["triage"]
+    )
+    assert _stage(on, "check triage 2").impl.cmd == on._triage_check_cmd(
+        on.REVIEW_MD, on._review_paths[2]["triage"]
+    )
+
+
+_REVIEW_THREE = (
+    "VERDICT: NEEDS_FIXES\n\n## Blocking findings\n\n"
+    "### B1 — first\n\n### B2 — second\n\n### B3 — third\n\n## Non-blocking\n"
+)
+_MIXED = "B1: confirmed — real\nB2: rejected — guarded\nB3: unresolved — no access\n"
+
+
+def _run_validated_check(tmp_path: Path, triage: str | None, validated: str | None,
+                         review: str = _REVIEW_THREE):
+    mod = _import_v2(GOOD_DIR, *_VALIDATOR_ON)
+    review_md = tmp_path / "review.md"
+    review_md.write_text(review, encoding="utf-8")
+    validated_md = tmp_path / "review-1.validated.md"
+    if validated is not None:
+        validated_md.write_text(validated, encoding="utf-8")
+    triage_md = tmp_path / "review-1.triage.md"
+    if triage is not None:
+        triage_md.write_text(triage, encoding="utf-8")
+    cmd = mod._triage_validated_check_cmd(str(review_md), str(validated_md), str(triage_md))
+    return subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("triage", [
+    "- B1: accepted\n",
+    "- B1: rejected — `a.py:3` already guards this\n",
+])
+def test_validated_check_mixed_results_pass_with_only_the_confirmed_line(tmp_path, triage) -> None:
+    proc = _run_validated_check(tmp_path, triage, _MIXED)
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("triage, culprit", [
+    ("- B1: accepted\n- B2: accepted\n", "B2"),
+    ("- B1: accepted\n- B3: rejected — evidence\n", "B3"),
+    ("- B2: accepted\n", "B1"),
+    ("- B1: accepted\n- B1: accepted\n", "B1"),
+    ("- B1: rejected\n", "B1"),
+    ("- B1: accepted\n- none confirmed\n", "none confirmed"),
+    (None, "no triage file"),
+])
+def test_validated_check_mixed_results_fail(tmp_path, triage, culprit) -> None:
+    proc = _run_validated_check(tmp_path, triage, _MIXED)
+    assert proc.returncode != 0
+    assert culprit in proc.stderr
+
+
+@pytest.mark.parametrize("validated", [
+    "B1: rejected — a\nB2: rejected — b\nB3: unresolved — c\n",
+    "B1: unresolved — a\nB2: unresolved — b\nB3: unresolved — c\n",
+])
+def test_validated_check_none_confirmed(tmp_path, validated) -> None:
+    assert _run_validated_check(tmp_path, "- none confirmed\n", validated).returncode == 0
+    for bad in ("", "\n", "- B1: accepted\n", "- none confirmed\n- B1: accepted\n"):
+        proc = _run_validated_check(tmp_path, bad, validated)
+        assert proc.returncode != 0, bad
+
+
+def test_validated_check_fails_when_a_finding_has_no_verdict_line(tmp_path) -> None:
+    proc = _run_validated_check(tmp_path, "- B1: accepted\n", "B1: confirmed — real\nB2: rejected — x\n")
+    assert proc.returncode != 0
+    assert "B3" in proc.stderr
+
+
+def test_validated_check_fails_on_a_duplicate_verdict_line(tmp_path) -> None:
+    validated = "B1: confirmed — real\nB1: rejected — x\nB2: rejected — b\nB3: rejected — c\n"
+    proc = _run_validated_check(tmp_path, "- B1: accepted\n", validated)
+    assert proc.returncode != 0
+    assert "B1" in proc.stderr
+
+
+def test_validated_check_fails_without_the_validated_file(tmp_path) -> None:
+    proc = _run_validated_check(tmp_path, "- B1: accepted\n", None)
+    assert proc.returncode != 0
+    assert "verdicts are missing" in proc.stderr
+
+
+def test_validated_check_fails_on_an_unknown_verdict(tmp_path) -> None:
+    validated = "B1: maybe — x\nB2: rejected — b\nB3: rejected — c\n"
+    proc = _run_validated_check(tmp_path, "- none confirmed\n", validated)
+    assert proc.returncode != 0
+    assert "B1" in proc.stderr
+
+
+def test_validated_check_does_not_confuse_b1_with_b10(tmp_path) -> None:
+    review = "VERDICT: NEEDS_FIXES\n\n## Blocking findings\n\n### B10 — ten\n"
+    proc = _run_validated_check(tmp_path, "- B1: accepted\n", "B10: confirmed — real\n", review=review)
+    assert proc.returncode != 0
+    assert "B10" in proc.stderr
+    assert _run_validated_check(tmp_path, "- B10: accepted\n", "B10: confirmed — real\n", review=review).returncode == 0

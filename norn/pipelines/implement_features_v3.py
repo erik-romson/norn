@@ -44,6 +44,9 @@ in pipeline invocations):
   (default on; ``off`` adds none of the learn stages and the handoff says
   ``Learning: off``)
 - ``--arg learn_model=<label>``    — intent label for the learn agent (default light)
+- ``--arg review_validator=on|off`` — experiment, off by default: a read-only
+  validator agent judges round 1's blocking findings before anyone fixes them
+  (see "Review validator" below)
 
 Aggregate validation
 --------------------
@@ -93,6 +96,27 @@ Rounds are unrolled (not a ``Loop``) because a ``Loop``'s stages share one
 agent session and ``ClearContext`` cannot sit inside it.  Round 2 runs only
 when round 1's ``check review`` wrote a ``review-1.needs-fixes`` marker;
 round 3 only when round 2 wrote ``review-2.needs-fixes``.
+
+Review validator
+----------------
+``--arg review_validator=on`` (default ``off``; any other value fails at
+import) adds two stages after ``check review 1`` when round 1 wrote
+``review-1.needs-fixes``: ``validate findings 1`` (``standard``, fresh session,
+``plan`` mode, Read/Glob/Grep only, 40 turns) judges at most 8 blocking
+findings, every critical one included, as ``confirmed``, ``rejected`` or
+``unresolved`` — lack of disproof is never confirmation — and ``record
+validated findings 1`` parses the verdict lines into ``review-1.validated.md``
+(one ``B<k>: <verdict> — <reason>`` line per finding; a finding with no verdict
+line is ``unresolved``).  The round-1 fixer then fixes and triages only the
+confirmed findings (``- none confirmed`` when there are none), ``check triage
+1`` checks the triage file against the verdict file instead of against every
+finding, and round 2's prompt quotes the validator's reasons.  Rounds 2-3 keep
+the all-findings triage rule.
+
+Keep-or-drop: keep the validator only if, across at least three runs with
+``review_validator=on`` compared to v2 with ``norn compare``, the review cost
+share does not rise and the review rounds to PASS fall.  The reference point
+is the 2026-09-17 run, where review was 43% of spend.
 
 Learning proposal
 -----------------
@@ -534,6 +558,10 @@ if LEARN not in ("on", "off"):
     raise ValueError(f"--arg learn: must be 'on' or 'off', got {LEARN!r}")
 LEARN_ON = LEARN == "on"
 LEARN_MODEL = _require_knob_model("learn_model", "light")
+REVIEW_VALIDATOR = _args.get("review_validator", "off")
+if REVIEW_VALIDATOR not in ("on", "off"):
+    raise ValueError(f"--arg review_validator: must be 'on' or 'off', got {REVIEW_VALIDATOR!r}")
+REVIEW_VALIDATOR_ON = REVIEW_VALIDATOR == "on"
 
 
 def _effective_agent_provider(argv: list[str]) -> str:
@@ -2683,6 +2711,8 @@ REVIEWED_HEAD = os.path.join(snapshot_root, "reviewed.head")
 _review_paths[1].update({
     "lite": os.path.join(snapshot_root, "review-1.lite"),
     "full": os.path.join(snapshot_root, "review-1.full"),
+    # The validator's verdicts on round 1's blocking findings (review_validator=on).
+    "validated": os.path.join(snapshot_root, "review-1.validated.md"),
 })
 REVIEW_DEPTH_MD = os.path.join(snapshot_root, "review-depth.md")
 
@@ -2987,6 +3017,208 @@ _LITE_FOCUS = (
 
 
 # ---------------------------------------------------------------------------
+# Review validator (experiment, --arg review_validator=on)
+# ---------------------------------------------------------------------------
+
+VALIDATOR_MAX_FINDINGS = 8
+VALIDATOR_VERDICTS = ("confirmed", "rejected", "unresolved")
+VALIDATOR_NO_VERDICT = "no verdict line from the validator"
+NONE_CONFIRMED = "- none confirmed"
+
+# The validator policy, reduced from CE's validator-batch-template.md.
+_VALIDATOR_POLICY = (
+    "## Policy\n\n"
+    f"- Judge each blocking finding independently, at most {VALIDATOR_MAX_FINDINGS} "
+    "of them. When there are more, always include every critical finding first.\n"
+    "- Check the finding against the code as it stands. Open the cited file and "
+    "line; run nothing and edit nothing.\n"
+    "- A verdict is exactly one of `confirmed`, `rejected` or `unresolved`.\n"
+    "- `confirmed`: you inspected the code and the problem is real.\n"
+    "- `rejected`: you inspected the code and found the finding unsupported or "
+    "disproved. Inspected but unsupported is `rejected`.\n"
+    "- `unresolved`: you could not inspect what the finding depends on. "
+    "Inaccessible is `unresolved`.\n"
+    "- Lack of disproof is never confirmation. Do not mark a finding `confirmed` "
+    "because you could not find a reason to doubt it.\n\n"
+)
+
+
+def _validator_prompt() -> str:
+    """The prompt of ``validate findings 1``.
+
+    Module-level so tests can inspect the contract without running an agent.
+    """
+    return (
+        "## Objective\n\n"
+        f"Validate the blocking findings in `{REVIEW_MD}` (read it first; the "
+        "findings are the `### B<k>` headings under `## Blocking findings`) before "
+        "anyone fixes them.\n\n"
+        f"Working directory: `{PROJECT_DIR}`\n\n"
+        "You are read-only: you can Read, Glob and Grep, and you edit nothing.\n\n"
+        + _VALIDATOR_POLICY
+        + "## Answer format\n\n"
+        "Your final message has exactly one line per finding you judged, and nothing "
+        "else:\n\n"
+        "```\n"
+        "B<k>: <confirmed|rejected|unresolved> \u2014 <reason>\n"
+        "```\n\n"
+        "A finding with no line is recorded as `unresolved`.\n\n"
+        "## Manifest\n\n"
+        "{read review manifest 1.output}\n\n"
+        + shared_context
+        + f"## Plan \u2014 step files in `{feature_dir}`\n\n"
+        "Open the ones you need; do not assume their contents.\n\n"
+        f"{all_step_names}\n"
+    )
+
+
+def blocking_ids(review_text: str) -> list[str]:
+    """The ids (``B1``, ``B2``, …) of the ``### B<k>`` headings under ``## Blocking findings``."""
+    out: list[str] = []
+    in_blocking = False
+    for line in review_text.splitlines():
+        if line.startswith("## "):
+            in_blocking = re.match(r"^## Blocking findings[ \t]*$", line) is not None
+        elif in_blocking:
+            match = re.match(r"^### (B[0-9]+)", line)
+            if match and match.group(1) not in out:
+                out.append(match.group(1))
+    return out
+
+
+_VERDICT_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?\**(B[0-9]+)\**\s*:\s*\**(confirmed|rejected|unresolved)\**"
+    r"(?![A-Za-z])\s*(?:\u2014|\u2013|-+|:)?\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_validator_verdicts(text: str, ids: list[str]) -> dict[str, tuple[str, str]]:
+    """Map every id in *ids* to ``(verdict, reason)`` from the validator's answer.
+
+    A malformed line is ignored.  An id with no verdict line, or whose lines
+    disagree, is ``unresolved`` (uninspected means unresolved, and so does a
+    contradiction).  The first line for an id wins when the repeats agree.
+    """
+    found: dict[str, list[tuple[str, str]]] = {}
+    for line in (text or "").splitlines():
+        match = _VERDICT_LINE_RE.match(line)
+        if not match or match.group(1) not in ids:
+            continue
+        reason = " ".join(match.group(3).split()) or "no reason given"
+        found.setdefault(match.group(1), []).append((match.group(2).lower(), reason))
+    out: dict[str, tuple[str, str]] = {}
+    for fid in ids:
+        entries = found.get(fid, [])
+        if not entries:
+            out[fid] = ("unresolved", VALIDATOR_NO_VERDICT)
+        elif len({verdict for verdict, _ in entries}) > 1:
+            out[fid] = ("unresolved", "the validator gave conflicting verdicts")
+        else:
+            out[fid] = entries[0]
+    return out
+
+
+def format_validated(ids: list[str], verdicts: dict[str, tuple[str, str]]) -> str:
+    """The text of ``review-1.validated.md``: one ``B<k>: <verdict> \u2014 <reason>`` line per id."""
+    return "".join(f"{fid}: {verdicts[fid][0]} \u2014 {verdicts[fid][1]}\n" for fid in ids)
+
+
+class _RecordValidatedFindings(BaseStage):
+    """Write ``review-1.validated.md`` from the validator's final message."""
+
+    needs_agent = False
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        try:
+            ids = blocking_ids(Path(REVIEW_MD).read_text(encoding="utf-8"))
+        except OSError as exc:
+            return StageResult(name="", success=False, error=f"record validated findings: {exc}")
+        if not ids:
+            return StageResult(
+                name="", success=False,
+                error=f"record validated findings: no blocking findings in {REVIEW_MD}",
+            )
+        result = ctx.results.get("validate findings 1")
+        answer = str(result.output) if result is not None and result.output else ""
+        text = format_validated(ids, parse_validator_verdicts(answer, ids))
+        target = Path(_review_paths[1]["validated"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return StageResult(name="", success=True, output=text)
+
+
+# '<id>' of every verdict line in the validated file, by verdict.
+_VERDICT_OF_SH = (
+    'sed -nE "s/^[[:space:]]*$ID:[[:space:]]*([a-z]+).*/\\1/p" "$VALIDATED"'
+)
+
+
+def _triage_validated_check_cmd(review_md: str, validated_md: str, triage_md: str) -> str:
+    """Shell that checks round 1's triage file against the validator's verdicts.
+
+    Replaces :func:`_triage_check_cmd` for round 1 when the validator is on.
+    Fails when the verdict file is missing or does not hold exactly one verdict
+    line for every blocking finding; when a confirmed finding has no triage
+    line, or more than one, or a line that is neither ``accepted`` nor
+    ``rejected`` with evidence; when the triage file has a line for a
+    ``rejected`` or ``unresolved`` finding; and when ``- none confirmed`` is
+    present with confirmed findings, or missing without any.
+    """
+    q = shlex.quote
+    return (
+        f"REVIEW={q(review_md)}; VALIDATED={q(validated_md)}; TRIAGE={q(triage_md)}; "
+        'if [ ! -s "$VALIDATED" ]; then '
+        'echo "ERROR: the validator verdicts are missing at $VALIDATED" 1>&2; exit 1; fi; '
+        'if [ ! -s "$TRIAGE" ]; then '
+        'echo "ERROR: the fixer wrote no triage file at $TRIAGE" 1>&2; exit 1; fi; '
+        f"IDS=$(awk {q(_BLOCKING_IDS_AWK)} \"$REVIEW\") || exit 1; "
+        'if [ -z "$IDS" ]; then '
+        'echo "ERROR: no blocking findings in $REVIEW" 1>&2; exit 1; fi; '
+        "BAD=0; CONFIRMED=''; OTHERS=''; "
+        "for ID in $IDS; do "
+        'VLINES=$(grep -E "^[[:space:]]*$ID:" "$VALIDATED" || true); '
+        'VCOUNT=$(printf "%s\\n" "$VLINES" | grep -c . || true); '
+        'if [ "$VCOUNT" != "1" ]; then '
+        'echo "ERROR: $VALIDATED must have exactly one verdict line for $ID, found $VCOUNT" 1>&2; '
+        "BAD=1; continue; fi; "
+        f"VERDICT=$({_VERDICT_OF_SH}); "
+        'case "$VERDICT" in '
+        "confirmed) CONFIRMED=\"$CONFIRMED $ID\" ;; "
+        "rejected|unresolved) OTHERS=\"$OTHERS $ID\" ;; "
+        '*) echo "ERROR: verdict line for $ID is not confirmed, rejected or unresolved: $VLINES" 1>&2; BAD=1 ;; '
+        "esac; "
+        "done; "
+        f"NONE=$(grep -cE {q('^[[:space:]]*-[[:space:]]*none confirmed[[:space:]]*$')} \"$TRIAGE\" || true); "
+        'TOTAL=$(grep -c . "$TRIAGE" || true); '
+        'if [ -z "$CONFIRMED" ]; then '
+        'if [ "$NONE" != "1" ] || [ "$TOTAL" != "1" ]; then '
+        'echo "ERROR: no finding is confirmed, so $TRIAGE must hold the single line \'- none confirmed\'" 1>&2; BAD=1; fi; '
+        "else "
+        'if [ "$NONE" != "0" ]; then '
+        'echo "ERROR: $TRIAGE says \'- none confirmed\' but some findings are confirmed:$CONFIRMED" 1>&2; BAD=1; fi; '
+        "fi; "
+        "for ID in $CONFIRMED; do "
+        'LINES=$(grep -E "^[[:space:]]*-[[:space:]]*$ID:" "$TRIAGE" || true); '
+        'COUNT=$(printf "%s\\n" "$LINES" | grep -c . || true); '
+        'if [ "$COUNT" != "1" ]; then '
+        'echo "ERROR: triage must have exactly one line for confirmed $ID, found $COUNT" 1>&2; BAD=1; continue; fi; '
+        'if printf "%s\\n" "$LINES" | grep -Eq ":[[:space:]]*accepted"; then continue; fi; '
+        'EVIDENCE=$(printf "%s\\n" "$LINES" | sed -E '
+        "'s/^[^:]*:[[:space:]]*rejected[[:space:]]*(\u2014|\u2013|-|:)?[[:space:]]*//'); "
+        'if printf "%s\\n" "$LINES" | grep -Eq ":[[:space:]]*rejected" && [ -n "$EVIDENCE" ]; then continue; fi; '
+        'echo "ERROR: triage line for $ID must be \'accepted\' or \'rejected \u2014 <evidence>\': $LINES" 1>&2; BAD=1; '
+        "done; "
+        "for ID in $OTHERS; do "
+        'EXTRA=$(grep -cE "^[[:space:]]*-[[:space:]]*$ID:" "$TRIAGE" || true); '
+        'if [ "$EXTRA" != "0" ]; then '
+        'echo "ERROR: $TRIAGE has a line for $ID, which the validator did not confirm" 1>&2; BAD=1; fi; '
+        "done; "
+        '[ "$BAD" = "0" ] || exit 1'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Review prompts
 # ---------------------------------------------------------------------------
 
@@ -3093,6 +3325,18 @@ def _review_prompt(n: int, lite: bool = False) -> str:
             f"{{{f'read triage {n - 1}'}.output}}\n\n"
             if n > 1 else ""
         )
+        + (
+            "## Round 1 validator verdicts\n\n"
+            "Before the fixer saw them, a read-only validator judged each round 1 "
+            "blocking finding as confirmed, rejected or unresolved, with a reason. "
+            "Only the confirmed findings were fixed. Use its answer like this:\n\n"
+            "- A **rejected** finding is closed unless its reason does not hold "
+            "against the code. Do not raise it again on the same grounds.\n"
+            "- An **unresolved** finding was not fixed and was not disproved. Look at "
+            "it yourself; keep it blocking only when you can confirm it.\n\n"
+            "{read validated 1.output}\n\n"
+            if n == 2 and REVIEW_VALIDATOR_ON else ""
+        )
         + f"{shared_context}"
         f"## Plan — step files in `{feature_dir}`\n\n"
         f"Open the ones you need; do not assume their contents.\n\n"
@@ -3103,31 +3347,69 @@ def _review_prompt(n: int, lite: bool = False) -> str:
 def _review_fix_prompt(n: int) -> str:
     """Build the review-fix prompt for round *n*.
 
-    Module-level so tests can inspect the contract without running an agent.
+    With ``review_validator=on`` round 1 fixes and triages only the findings the
+    validator confirmed.  Module-level so tests can inspect the contract
+    without running an agent.
     """
     forbidden = ", ".join(f"`{v}`" for v in _GIT_FORBIDDEN_VERBS)
     triage = _review_paths[n]["triage"]
+    if n == 1 and REVIEW_VALIDATOR_ON:
+        validated = _review_paths[1]["validated"]
+        intro = (
+            f"## Objective\n\n"
+            f"Triage, then fix, the **confirmed** findings under `## Blocking findings` "
+            f"in `{REVIEW_MD}` (read it first).\n\n"
+            f"A read-only validator already judged every blocking finding. Its verdicts "
+            f"are in `{validated}`, one line per finding: "
+            f"`B<k>: confirmed|rejected|unresolved \u2014 <reason>`. Read it second. "
+            f"Work only on the findings it marks `confirmed`. Leave `rejected` and "
+            f"`unresolved` findings alone and do not mention them in the triage file: "
+            f"unresolved ones go to the human's follow-ups.\n\n"
+            f"Its other sections are not yours to act on: `## Non-blocking` findings are "
+            f"handed to the human as they are, and `## For the human` lists work this run "
+            f"cannot do. Changing either one is an unrelated change.\n\n"
+            f"## Triage first\n\n"
+            f"Before you edit any file, write `{triage}` with exactly one line for each "
+            f"**confirmed** `### B<k>` finding, in one of these two forms:\n\n"
+            "```\n"
+            "- B<k>: accepted\n"
+            "- B<k>: rejected \u2014 <evidence: quoted file:line or command output>\n"
+            "```\n\n"
+            "Check each confirmed finding against the code before you answer. Accept it "
+            "when the problem is real. Reject it only with evidence: the quoted "
+            "`file:line` or the command output that shows the finding is wrong. A "
+            "rejection with no evidence fails the pipeline's check, and the next review "
+            "round re-checks every rejection against the evidence you give.\n\n"
+            f"When no finding is confirmed, write `{triage}` as the single line "
+            f"`{NONE_CONFIRMED}` and change nothing. A triage line for a finding that was "
+            "not confirmed fails the pipeline's check.\n\n"
+            "Then fix the accepted findings only.\n\n"
+        )
+    else:
+        intro = (
+            f"## Objective\n\n"
+            f"Triage, then fix, the findings under `## Blocking findings` in `{REVIEW_MD}` "
+            f"(read it first).\n\n"
+            f"Its other sections are not yours to act on: `## Non-blocking` findings are "
+            f"handed to the human as they are, and `## For the human` lists work this run "
+            f"cannot do. Changing either one is an unrelated change.\n\n"
+            f"## Triage first\n\n"
+            f"Before you edit any file, write `{triage}` with exactly one line for each "
+            f"`### B<k>` blocking finding, in one of these two forms:\n\n"
+            "```\n"
+            "- B<k>: accepted\n"
+            "- B<k>: rejected \u2014 <evidence: quoted file:line or command output>\n"
+            "```\n\n"
+            "Check each finding against the code before you answer. Accept it when the "
+            "problem is real. Reject it only with evidence: the quoted `file:line` or the "
+            "command output that shows the finding is wrong. A rejection with no evidence "
+            "fails the pipeline's check, and the next review round re-checks every "
+            "rejection against the evidence you give.\n\n"
+            "Then fix the accepted findings only. Leave the rejected ones alone.\n\n"
+        )
     return (
-        f"## Objective\n\n"
-        f"Triage, then fix, the findings under `## Blocking findings` in `{REVIEW_MD}` "
-        f"(read it first).\n\n"
-        f"Its other sections are not yours to act on: `## Non-blocking` findings are "
-        f"handed to the human as they are, and `## For the human` lists work this run "
-        f"cannot do. Changing either one is an unrelated change.\n\n"
-        f"## Triage first\n\n"
-        f"Before you edit any file, write `{triage}` with exactly one line for each "
-        f"`### B<k>` blocking finding, in one of these two forms:\n\n"
-        "```\n"
-        "- B<k>: accepted\n"
-        "- B<k>: rejected — <evidence: quoted file:line or command output>\n"
-        "```\n\n"
-        "Check each finding against the code before you answer. Accept it when the "
-        "problem is real. Reject it only with evidence: the quoted `file:line` or the "
-        "command output that shows the finding is wrong. A rejection with no evidence "
-        "fails the pipeline's check, and the next review round re-checks every "
-        "rejection against the evidence you give.\n\n"
-        "Then fix the accepted findings only. Leave the rejected ones alone.\n\n"
-        f"Working directory: `{PROJECT_DIR}`\n\n"
+        intro
+        + f"Working directory: `{PROJECT_DIR}`\n\n"
         f"IMPORTANT: When creating or editing files, always use absolute paths "
         f"based on `{PROJECT_DIR}`.\n\n"
         f"{shared_context}"
@@ -3323,6 +3605,12 @@ def _add_review_round(n: int, when) -> None:
             ReadFile(path=_review_paths[n - 1]["triage"]),
             when=when,
         )
+        if n == 2 and REVIEW_VALIDATOR_ON:
+            pipeline.stage(
+                "read validated 1",
+                ReadFile(path=_review_paths[1]["validated"]),
+                when=when,
+            )
 
     # --- review N ---
     # The prompt says "do not edit any file except review.md"; under
@@ -3501,7 +3789,11 @@ def _add_review_fix_round(n: int) -> None:
     # before anything is validated or committed.
     pipeline.stage(
         f"check triage {n}",
-        RunCommand(cmd=_triage_check_cmd(REVIEW_MD, paths["triage"])),
+        RunCommand(cmd=(
+            _triage_validated_check_cmd(REVIEW_MD, paths["validated"], paths["triage"])
+            if n == 1 and REVIEW_VALIDATOR_ON
+            else _triage_check_cmd(REVIEW_MD, paths["triage"])
+        )),
         on_failure=fail,
         when=marker_when,
     )
@@ -3629,6 +3921,30 @@ pipeline.stage(
 
 # --- Round 1 (always runs; one of two alternative review stages) ---
 _add_review_round(1, when=None)
+if REVIEW_VALIDATOR_ON:
+    # Experiment: a read-only validator judges round 1's blocking findings
+    # before the fixer sees them.  Fresh session, no write tools.
+    pipeline.clear_context()
+    pipeline.stage(
+        "validate findings 1",
+        Generate(
+            prompt=_validator_prompt(),
+            allowed_tools=["Read", "Glob", "Grep"],
+            permission_mode="plan",
+            setting_sources=["project"],
+            model="standard",
+            max_turns=40,
+        ),
+        on_failure=ask_user,
+        timeout=TIMEOUT_REVIEW,
+        when=file_exists(_review_paths[1]["needs_fixes"]),
+    )
+    pipeline.stage(
+        "record validated findings 1",
+        _RecordValidatedFindings(),
+        on_failure=fail,
+        when=file_exists(_review_paths[1]["needs_fixes"]),
+    )
 _add_review_fix_round(1)
 
 # --- Round 2 (only when round 1 found NEEDS_FIXES) ---
