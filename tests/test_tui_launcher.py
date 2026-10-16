@@ -439,3 +439,26 @@ def test_build_run_setup_resume_adds_only_checkpoint(tmp_path: Path) -> None:
 
     assert run_kwargs["config_path"] == config_path
     assert run_kwargs["resume_checkpoint"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Logo banner
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_launcher_shows_logo_banner_on_tall_terminal() -> None:
+    """The logo banner is visible when the terminal is tall enough."""
+    app = LauncherApp(bundled=[], discovered=[])
+    async with app.run_test(size=(100, LauncherScreen.BANNER_MIN_HEIGHT)) as pilot:
+        await pilot.pause()
+        assert _get_screen(app).query_one("#banner").display is True
+
+
+@pytest.mark.asyncio
+async def test_launcher_hides_logo_banner_on_short_terminal() -> None:
+    """A short terminal hides the banner so the pipeline table keeps its room."""
+    app = LauncherApp(bundled=[], discovered=[])
+    async with app.run_test(size=(100, LauncherScreen.BANNER_MIN_HEIGHT - 1)) as pilot:
+        await pilot.pause()
+        assert _get_screen(app).query_one("#banner").display is False

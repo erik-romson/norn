@@ -1,4 +1,4 @@
-"""Textual widgets for the Norn TUI — Header, Graph, Transcript, StageDetail, BudgetMeter.
+"""Textual widgets for the Norn TUI — Logo, Header, Graph, Transcript, StageDetail, BudgetMeter.
 
 This module imports textual and must only be imported from within ``norn/tui/``.
 It must **never** be imported at core (``norn.*``) import time.
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.widget import Widget
@@ -52,6 +53,76 @@ def _glyph(status: str) -> str:
 
 def _label(status: str) -> str:
     return STATUS_LABELS.get(status, status.upper())
+
+
+# ---------------------------------------------------------------------------
+# Logo widget
+# ---------------------------------------------------------------------------
+
+
+# A 16x16 pixel mark after docs/img/norn-logo.png: three hooded Norns, the
+# crescent moon and the thread, on a dark disc. One character per pixel; "."
+# is transparent. The full illustration does not survive downsampling.
+LOGO_PIXELS = """
+..cccccccccccc..
+.cccckkkkkkcccc.
+ccckkkkkkkkkkccc
+cckskkkkkkkmmkcc
+ckssskkkkkmkkkkc
+ckfsskkskkmkkkkc
+ckssskssskkmmkkc
+cksssksfskkkkkkc
+cktsskssskkskkkc
+ckstskssskssskkc
+ckssttssskssftkc
+ckssskttsksttskc
+cckssksstttsskcc
+ccckkkkkkkkkkccc
+.cccckkkkkkcccc.
+..cccccccccccc..
+""".split()
+
+# Exact xterm-256 colours, so 256-colour terminals show them unchanged.
+LOGO_PALETTE: dict[str, str] = {
+    "c": "#ffffd7",  # cream frame (230)
+    "k": "#121212",  # night disc (233)
+    "s": "#5f5f87",  # slate cloaks (60)
+    "f": "#d7d7af",  # faces (187)
+    "m": "#ffffd7",  # moon (230)
+    "t": "#ffffd7",  # thread (230)
+}
+
+
+def logo_text(pixels: list[str] = LOGO_PIXELS) -> Text:
+    """Render pixel rows as half-block text: two pixel rows per terminal line.
+
+    ``▀`` paints the top pixel in the foreground and the bottom one in the
+    background; a transparent half falls back to ``▄`` or a blank so the
+    terminal background shows through the rounded corners.
+    """
+    text = Text(no_wrap=True, overflow="crop")
+    for line, (top_row, bottom_row) in enumerate(zip(pixels[0::2], pixels[1::2])):
+        if line:
+            text.append("\n")
+        for top_key, bottom_key in zip(top_row, bottom_row):
+            top, bottom = LOGO_PALETTE.get(top_key), LOGO_PALETTE.get(bottom_key)
+            if top is None and bottom is None:
+                text.append(" ")
+            elif top is None:
+                text.append("▄", Style(color=bottom))
+            elif top == bottom:
+                # Solid cell: paint the background so no font glyph seams show.
+                text.append(" ", Style(bgcolor=top))
+            else:
+                text.append("▀", Style(color=top, bgcolor=bottom))
+    return text
+
+
+class NornLogo(Static):
+    """The Norn logo — the three Norns with their thread under a crescent moon."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(logo_text(), **kwargs)
 
 
 # ---------------------------------------------------------------------------

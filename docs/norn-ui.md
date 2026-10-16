@@ -41,8 +41,9 @@ Launcher ──select──▶ [Args prompt, if the pipeline declares args] ─�
    q on the launcher quits; q on the run screen quits the whole app
 ```
 
-- **Launcher** (`LauncherScreen`) — a `DataTable` of bundled + discovered
-  pipelines plus an `Open file…` row. Enter selects; **`w`** toggles
+- **Launcher** (`LauncherScreen`) — a logo banner (`NornLogo`, hidden below
+  `BANNER_MIN_HEIGHT` terminal rows so the table keeps its space) above a
+  `DataTable` of bundled + discovered pipelines plus an `Open file…` row. Enter selects; **`w`** toggles
   **worktree isolation** (status line shows `Worktree: ON`/`OFF`); **`h`**
   opens the run **history** for the highlighted pipeline; `q`/Esc quits. Enter
   is handled via `on_data_table_row_selected` (the focused `DataTable` consumes
@@ -175,7 +176,7 @@ second run can start against the same repo while the first is still live.
 | --- | --- |
 | `__init__.py` | Import-safe without Textual. |
 | `viewmodel.py` | `RunViewModel` — **textual-free** projection of the event stream into render-ready state (header, per-node status, per-stage transcript, usage, waiting-input). Holds the UI logic; unit-tested without Textual. `TERMINAL_STATUSES`, `is_running`, `display_elapsed_s` and `mark_finished()` define when a run counts as over (see §1). |
-| `widgets.py` | `NornHeader`, `NornGraph` (Textual `Tree`), `Transcript` (`RichLog`), `StageDetail`, `BudgetMeter`. Thin; read the ViewModel. `NornHeader` owns its own 1s redraw timer so the elapsed clock ticks between events (§1). `Transcript.refresh_vm()` **appends** only blocks not yet on screen (full redraw on stage switch or a shrinking spool) — the app refreshes on every event, so redrawing the whole log each time is quadratic under streamed command output. |
+| `widgets.py` | `NornLogo` (16×16 pixel mark `LOGO_PIXELS` drawn with half-blocks in exact xterm-256 colours), `NornHeader`, `NornGraph` (Textual `Tree`), `Transcript` (`RichLog`), `StageDetail`, `BudgetMeter`. Thin; read the ViewModel. `NornHeader` owns its own 1s redraw timer so the elapsed clock ticks between events (§1). `Transcript.refresh_vm()` **appends** only blocks not yet on screen (full redraw on stage switch or a shrinking spool) — the app refreshes on every event, so redrawing the whole log each time is quadratic under streamed command output. |
 | `app.py` | `RunScreen` (run UI + drives `run_pipeline` in-process), `NornApp` (thin host of one `RunScreen` for direct/object runs + tests), `NornUIApp` (the unified Launcher→Args→Run navigation app). |
 | `screens.py` | `LauncherScreen`/`LauncherApp`, `HistoryBrowserScreen`/`HistoryBrowserApp`, `LaunchRequest`, the `OPEN_FILE` sentinel. |
 | `args_prompt.py` | `ArgsPromptScreen`/`ArgsPromptApp`, `is_path_arg`/`is_dir_arg`, `run_fzf`, the budget fields (keys imported from `launch.py`). |

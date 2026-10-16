@@ -7,14 +7,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from norn.catalog import PipelineInfo
 from norn.checkpoint import checkpoint_file
 from norn.history import RunRecord
+from norn.tui.widgets import NornLogo
 
 
 class _OpenFileSentinel:
@@ -244,6 +247,17 @@ class LauncherScreen(Screen):
     ]
 
     CSS = """
+    LauncherScreen #banner {
+        height: auto;
+        padding: 1 2;
+    }
+    LauncherScreen NornLogo {
+        width: auto;
+    }
+    LauncherScreen #banner-title {
+        width: 1fr;
+        padding: 2 4;
+    }
     LauncherScreen DataTable {
         height: 1fr;
     }
@@ -262,6 +276,14 @@ class LauncherScreen(Screen):
 
     # Special sentinel key for the "open file" row
     _OPEN_FILE_KEY = "__open_file__"
+
+    # Below this terminal height the logo banner hides so the table keeps room.
+    BANNER_MIN_HEIGHT = 28
+
+    _BANNER_TITLE = (
+        "[b]N O R N[/b]\n\n"
+        "[dim]Spin, measure and cut — multi-step AI agent pipelines.[/dim]"
+    )
 
     def __init__(
         self,
@@ -285,6 +307,9 @@ class LauncherScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
+        with Horizontal(id="banner"):
+            yield NornLogo()
+            yield Static(self._BANNER_TITLE, id="banner-title")
         yield DataTable(id="pipeline-table", cursor_type="row")
         yield Static("", id="pipeline-detail")
         yield Static("Worktree: OFF", id="worktree-status")
@@ -315,6 +340,10 @@ class LauncherScreen(Screen):
         # "Open file…" sentinel row — selecting it dismisses with None so the
         # caller can fall back to the CLI `norn ui <path>` workflow.
         table.add_row("Open file…", "Specify a pipeline .py file path", "", key=self._OPEN_FILE_KEY)
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Show the logo banner only when the terminal is tall enough for it."""
+        self.query_one("#banner").display = event.size.height >= self.BANNER_MIN_HEIGHT
 
     # ------------------------------------------------------------------
     # Row highlighting → detail panel

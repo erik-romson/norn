@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/norn-logo.png" alt="norn logo: the three Norns spinning, measuring and cutting the thread" width="200">
+</p>
+
 # norn
 
 Generic pipeline framework for orchestrating multi-step AI agent workflows.
