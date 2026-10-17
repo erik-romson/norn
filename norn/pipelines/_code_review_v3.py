@@ -10,7 +10,18 @@ of fix_jira_issue_v3's stage table):
 * ``review left tree unchanged``: the reviewers changed no file and no commit;
 * triage into the gate-3 file, auto decisions, and the gate itself.
 
-Part 2 (the fix loop onwards) is added by ``add_review_fix_stages``.
+Part 2 (stages 46-51), added by ``add_review_fix_stages``:
+
+* the ``fix code review`` loop: snapshot, fix agent (no ``Bash``), snapshot
+  and ownership diff, then the pipeline runs the tests;
+* ``review fixes green``: the proven test run (it reruns the tests only when
+  no proof matches the current tree);
+* ``fixes recorded`` and ``commit review fixes``;
+* ``worktree clean``: test artefacts left behind stop the run (Q2);
+* ``write review followups``: follow-ups and nits for the PR body.
+
+Part 2 takes ``project_dir`` as the git toplevel (the pipeline's preflight
+checks it): snapshot paths are relative to it.
 
 ``ResolveTestCmd`` lives here too: the pipeline wires it before ``implement``
 so a test command that cannot resolve stops the run before any child spend.
@@ -18,25 +29,36 @@ so a test command that cannot resolve stops the run before any child spend.
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from norn.dsl import Pipeline, Stage, ask_user, fail
 from norn.model_labels import resolve_label
 from norn.models import PipelineContext, StageResult
-from norn.pipelines._comment_style import COMMENT_RULE
-from norn.pipelines._decisions_v3 import AutoDecideCodeReview, CodeReviewGate
-from norn.pipelines._fix_jira_v3 import V3Paths
+from norn.pipelines._comment_style import ATTRIBUTION_ERE, COMMENT_RULE
+from norn.pipelines._decisions_v3 import (
+    _FIXED_LINE_RE,
+    AutoDecideCodeReview,
+    CodeReviewGate,
+    FixesRecordedGate,
+    _field_in,
+    has_fix,
+    parse_code_review,
+)
+from norn.pipelines._fix_jira_v3 import V3Paths, attribution_lines
 from norn.pipelines._plan_gates_v2 import format_gate_error, front_matter
 from norn.pipelines._plan_review_v2 import _SUBAGENT_LABEL
 from norn.runner import resolve_run_path
 from norn.stages.base import BaseStage
+from norn.stages.compress_test_log import CompressTestLog
 from norn.stages.generate import Generate
 from norn.stages.run_command import RunCommand
 
@@ -48,6 +70,11 @@ REVIEW_MAX_TURNS = 80
 
 REVIEW_TOOLS = ["Read", "Grep", "Glob", "Bash", "Write"]
 TRIAGE_TOOLS = ["Read", "Grep", "Glob", "Write", "Edit"]
+# No Bash (A7): the pipeline runs the tests, so no test artefact can become owned.
+FIX_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
+
+# How much of a failing test log the stage error carries.
+TEST_LOG_TAIL_LINES = 40
 
 # What the codex stage's ``cmd`` shows before it runs; the real base is read
 # from ``review-range.txt`` at run time.
@@ -655,6 +682,466 @@ def _needs_triage(paths: V3Paths):
 
 
 # ---------------------------------------------------------------------------
+# Part 2: the proven test run
+# ---------------------------------------------------------------------------
+
+
+def review_tests_cmd(*, project_dir: str, script: str) -> str:
+    return f"cd {shlex.quote(project_dir)} && sh {shlex.quote(script)}"
+
+
+def _repo_fail(proc: subprocess.CompletedProcess[str]) -> StageResult:
+    return _fail(
+        format_gate_error(
+            "cannot read the repository state",
+            [proc.stderr.strip()],
+            "Fix the repository state, then --resume.",
+        )
+    )
+
+
+def _log_text(output: dict) -> str:
+    stdout = output.get("stdout") or ""
+    stderr = output.get("stderr") or ""
+    if not stderr:
+        return stdout
+    if stdout and not stdout.endswith("\n"):
+        stdout += "\n"
+    return f"{stdout}--- stderr ---\n{stderr}"
+
+
+class RunReviewTests(RunCommand):
+    """Run ``test-cmd.sh`` and record a proof of the tree it passed on.
+
+    The timeout and the command are read when the stage runs: ``test-timeout``
+    and ``test-cmd.sh`` are written by ``resolve test command``.  The proof key
+    hashes HEAD, ``test-cmd.sh`` and a content snapshot of the worktree taken
+    after the passing run, so artefacts the run creates are part of it.  With
+    *reuse_proof* a matching proof skips the run.
+    """
+
+    def __init__(self, *, paths: V3Paths, project_dir: str, reuse_proof: bool) -> None:
+        self.paths = paths
+        self.project_dir = project_dir
+        self.reuse_proof = reuse_proof
+        super().__init__(
+            cmd=review_tests_cmd(project_dir=project_dir, script=paths.test_cmd_sh),
+            timeout=DEFAULT_TEST_TIMEOUT,
+        )
+
+    def _action(self) -> str:
+        if self.reuse_proof:
+            return "Fix the failing tests by hand, then --resume; this stage reruns them."
+        return "The fix loop retries with this failure; once it is exhausted, [r]etry or fix it by hand."
+
+    def _proof_key(self, script: Path) -> str | StageResult:
+        head = _run(self.project_dir, "git", "rev-parse", "HEAD")
+        if head.returncode != 0:
+            return _repo_fail(head)
+        with tempfile.TemporaryDirectory() as scratch:
+            out = Path(scratch) / "snapshot.json"
+            snap = _snapshot(self.project_dir, str(out))
+            if snap.returncode != 0:
+                return _repo_fail(snap)
+            snapshot = out.read_bytes()
+        script_sha = hashlib.sha1(script.read_bytes()).hexdigest()
+        return hashlib.sha1(
+            head.stdout.strip().encode() + b"\0" + script_sha.encode() + b"\0" + snapshot
+        ).hexdigest()
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        script = resolve_run_path(ctx, self.paths.test_cmd_sh)
+        timeout_file = resolve_run_path(ctx, self.paths.test_timeout)
+        for needed in (script, timeout_file):
+            if not needed.is_file():
+                return _fail(
+                    format_gate_error(
+                        f"{needed} is missing",
+                        [],
+                        "Run without --resume so 'resolve test command' runs.",
+                    )
+                )
+        raw_timeout = timeout_file.read_text().strip()
+        try:
+            self.timeout = float(raw_timeout)
+        except ValueError:
+            return _fail(
+                format_gate_error(
+                    f"{timeout_file} holds {raw_timeout!r}, not a number of seconds",
+                    [],
+                    "Run without --resume so 'resolve test command' runs.",
+                )
+            )
+        self.cmd = review_tests_cmd(project_dir=self.project_dir, script=str(script))
+        proof = resolve_run_path(ctx, self.paths.test_proof)
+
+        if self.reuse_proof and proof.is_file():
+            key = self._proof_key(script)
+            if isinstance(key, StageResult):
+                return key
+            stored = proof.read_text().splitlines()
+            if stored and stored[0] == key:
+                return _ok(f"tests already passed on this tree ({key[:8]})")
+
+        result = await super().run(ctx, **kwargs)
+        log = resolve_run_path(ctx, self.paths.test_log)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        output = result.output if isinstance(result.output, dict) else {}
+        text = _log_text(output)
+        log.write_text(text)
+
+        if not result.success:
+            code = output.get("returncode")
+            if code is None:
+                headline = f"review tests timed out after {self.timeout:g}s — log: {log}"
+            else:
+                headline = f"review tests failed (exit {code}) — log: {log}"
+            tail = text.splitlines()[-TEST_LOG_TAIL_LINES:]
+            return StageResult(
+                name="",
+                success=False,
+                # The full output: `compress review tests` reads it.
+                output=result.output,
+                error="\n".join([headline, *tail, self._action()]),
+                details=result.details,
+            )
+
+        key = self._proof_key(script)
+        if isinstance(key, StageResult):
+            return key
+        tree = _run(self.project_dir, "git", "rev-parse", "HEAD^{tree}")
+        if tree.returncode != 0:
+            return _repo_fail(tree)
+        proof.write_text(f"{key}\n{tree.stdout.strip()}\n")
+        return StageResult(
+            name="",
+            success=True,
+            output=f"tests passed ({key[:8]}) — log: {log}",
+            details=result.details,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Part 2: the fix loop
+# ---------------------------------------------------------------------------
+
+# Resolved by Generate from the compressed log of the last failing test run.
+COMPRESSED_LOG_PLACEHOLDER = "{compress review tests.output}"
+
+
+def snapshot_before_fix_cmd(*, paths: V3Paths, project_dir: str) -> str:
+    return (
+        f"mkdir -p {shlex.quote(paths.fix_dir)} && "
+        f"python3 {shlex.quote(SNAPSHOT_HELPER)} snapshot --root {shlex.quote(project_dir)} "
+        f"{shlex.quote(paths.fix_pre)}"
+    )
+
+
+def snapshot_after_fix_cmd(*, paths: V3Paths, project_dir: str) -> str:
+    """Snapshot, then append what the fix changed to ``owned.nul``.
+
+    Runs before the tests, so a test artefact is never owned.
+    """
+    helper = shlex.quote(SNAPSHOT_HELPER)
+    root = shlex.quote(project_dir)
+    return (
+        f"python3 {helper} snapshot --root {root} {shlex.quote(paths.fix_post)} && "
+        f"python3 {helper} diff {shlex.quote(paths.fix_pre)} {shlex.quote(paths.fix_post)} "
+        f"--root {root} >> {shlex.quote(paths.owned)}"
+    )
+
+
+def fix_prompt(*, paths: V3Paths, project_dir: str) -> str:
+    return f"""\
+Fix the code-review findings of {paths.key} in the repository at {project_dir}.
+The findings are in {paths.code_review}.
+
+- Fix only the findings whose `Disposition:` is `fix`. Leave every other
+  finding, and the `## Dropped as false positives` and `## Omitted findings`
+  sections, alone.
+- Make the smallest change that fixes each finding.
+- Run no git command (no add, commit, stash, checkout, reset or restore): the
+  pipeline owns the index and commits your changes itself.
+- Do not run builds or tests. When you are done, the pipeline runs
+  {paths.test_cmd_sh} in {project_dir}.
+
+The last test failure, if there was one (empty on the first pass):
+
+{COMPRESSED_LOG_PLACEHOLDER}
+
+The full log of that run is at {paths.test_log}. Fix that failure first.
+
+Then rewrite {paths.review_fixes} with one line per `fix` finding and nothing else:
+
+- C<n>: fixed — <what you changed>
+- C<n>: not fixed — <why not>
+
+{COMMENT_RULE}
+"""
+
+
+def _has_fix(paths: V3Paths):
+    """The ``when`` of every fix-loop body stage, ``fixes recorded`` and the fix commit."""
+
+    def when(ctx: PipelineContext) -> bool:
+        return has_fix(paths.code_review)
+
+    return when
+
+
+# ---------------------------------------------------------------------------
+# Part 2: the fix commit
+# ---------------------------------------------------------------------------
+
+_ATTRIBUTION_RE = re.compile(ATTRIBUTION_ERE, re.I)
+
+
+def _git_paths(cwd: str, *argv: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    """Run git with paths that round-trip any byte (``surrogateescape``)."""
+    return subprocess.run(
+        list(argv),
+        cwd=cwd,
+        capture_output=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+        input=input_text,
+        check=False,
+    )
+
+
+def _nul_list(text: str) -> list[str]:
+    return [p for p in text.split("\0") if p]
+
+
+def _proc_lines(proc: subprocess.CompletedProcess[str]) -> list[str]:
+    return [ln for ln in (proc.stdout + proc.stderr).splitlines() if ln.strip()]
+
+
+class CommitReviewFixes(BaseStage):
+    """Commit the paths the fix loop owns as ``<KEY>: address code review findings``."""
+
+    needs_agent = False
+
+    def __init__(self, *, paths: V3Paths, project_dir: str, key: str) -> None:
+        self.paths = paths
+        self.project_dir = project_dir
+        self.key = key
+
+    @property
+    def message(self) -> str:
+        return f"{self.key}: address code review findings\n"
+
+    def _attribution_in_index(self) -> list[str] | StageResult:
+        diff = _git_paths(self.project_dir, "git", "diff", "--cached", "-U0")
+        if diff.returncode != 0:
+            return _repo_fail(diff)
+        return [
+            line[1:]
+            for line in diff.stdout.splitlines()
+            if line.startswith("+") and not line.startswith("+++") and _ATTRIBUTION_RE.search(line)
+        ]
+
+    def _add(self, paths: list[str]) -> StageResult | None:
+        add = _git_paths(self.project_dir, "git", "--literal-pathspecs", "add", "-A", "--", *paths)
+        if add.returncode != 0:
+            return _fail(
+                format_gate_error(
+                    "git add of the fixed files failed",
+                    _proc_lines(add),
+                    "Fix the repository state, then --resume.",
+                )
+            )
+        hits = self._attribution_in_index()
+        if isinstance(hits, StageResult):
+            return hits
+        if hits:
+            return _fail(
+                format_gate_error(
+                    "the staged fix adds an attribution line",
+                    hits,
+                    "Remove those lines from the files, then --resume.",
+                )
+            )
+        return None
+
+    def _commit(self) -> subprocess.CompletedProcess[str]:
+        return _git_paths(self.project_dir, "git", "commit", "-F", "-", input_text=self.message)
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        owned_path = resolve_run_path(ctx, self.paths.owned)
+        if not owned_path.is_file():
+            return _fail(
+                format_gate_error(
+                    f"no ownership record {owned_path}",
+                    [],
+                    "Run without --resume so the fix loop runs.",
+                )
+            )
+        owned = list(dict.fromkeys(
+            _nul_list(owned_path.read_bytes().decode("utf-8", errors="surrogateescape"))
+        ))
+        tracked: set[str] = set()
+        if owned:
+            ls = _git_paths(self.project_dir, "git", "--literal-pathspecs", "ls-files", "-z", "--", *owned)
+            if ls.returncode != 0:
+                return _repo_fail(ls)
+            tracked = set(_nul_list(ls.stdout))
+        keep = [
+            p for p in owned
+            if os.path.lexists(os.path.join(self.project_dir, p)) or p in tracked
+        ]
+        notes = [f"dropped (gone and never tracked): {p}" for p in owned if p not in keep]
+        if not keep:
+            return _ok("\n".join(["nothing to commit", *notes]))
+
+        failed = self._add(keep)
+        if failed is not None:
+            return failed
+        staged = _git_paths(self.project_dir, "git", "diff", "--cached", "--quiet")
+        if staged.returncode == 0:
+            return _ok("\n".join(["nothing to commit: the owned files are unchanged", *notes]))
+
+        commit = self._commit()
+        if commit.returncode != 0:
+            # Auto-fixing pre-commit hooks rewrite staged files; re-add them and retry once.
+            hook = _git_paths(
+                self.project_dir, sys.executable, SNAPSHOT_HELPER, "hook-fixes", "--root", self.project_dir
+            )
+            if hook.returncode != 0:
+                return _repo_fail(hook)
+            rewritten = _nul_list(hook.stdout)
+            if not rewritten:
+                return _fail(
+                    format_gate_error(
+                        "the fix commit was rejected",
+                        _proc_lines(commit)[-5:],
+                        "Fix what the hook reports, then --resume.",
+                    )
+                )
+            failed = self._add(rewritten)
+            if failed is not None:
+                return failed
+            commit = self._commit()
+            if commit.returncode != 0:
+                return _fail(
+                    format_gate_error(
+                        "the fix commit was rejected again after re-adding the hook's rewrites",
+                        _proc_lines(commit)[-5:],
+                        "Fix what the hook reports, then --resume.",
+                    )
+                )
+
+        body = _run(self.project_dir, "git", "log", "-1", "--format=%B")
+        if body.returncode != 0:
+            return _repo_fail(body)
+        lines = attribution_lines(body.stdout)
+        if lines:
+            return _fail(
+                format_gate_error(
+                    "the fix commit message carries attribution (a commit hook added it)",
+                    [ln.strip() for ln in lines],
+                    "Run git commit --amend to remove those lines, then --resume.",
+                )
+            )
+        sha = _run(self.project_dir, "git", "rev-parse", "--short", "HEAD")
+        if sha.returncode != 0:
+            return _repo_fail(sha)
+        return _ok("\n".join([f"committed {sha.stdout.strip()}: {len(keep)} files", *keep, *notes]))
+
+
+# ---------------------------------------------------------------------------
+# Part 2: leftovers and follow-ups
+# ---------------------------------------------------------------------------
+
+WORKTREE_CLEAN_ACTION = (
+    "Add them to .git/info/exclude or to .gitignore in a commit, or delete them; "
+    "then [r]etry. The CI-fix child refuses a dirty tree."
+)
+
+
+class WorktreeClean(BaseStage):
+    """``git status --porcelain`` is empty: nothing is left for the CI-fix child (Q2)."""
+
+    needs_agent = False
+
+    def __init__(self, *, project_dir: str) -> None:
+        self.project_dir = project_dir
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        status = _run(
+            self.project_dir, "git", "status", "--porcelain", "--untracked-files=normal"
+        )
+        if status.returncode != 0:
+            return _repo_fail(status)
+        left = [line[3:] for line in status.stdout.splitlines() if line.strip()]
+        if left:
+            return _fail(
+                format_gate_error(
+                    f"{len(left)} paths are left in the worktree after the code review",
+                    left,
+                    WORKTREE_CLEAN_ACTION,
+                ),
+                output="\n".join(left),
+            )
+        return _ok()
+
+
+_NIT_TAG_RE = re.compile(r"\s*\[nit\]\s*$", re.I)
+
+
+def _where(lines: list[str]) -> str:
+    return (_field_in(lines, "Where") or "").strip()
+
+
+class WriteReviewFollowups(BaseStage):
+    """Write ``review-followups.md`` and ``review-nits.md`` for the PR body."""
+
+    needs_agent = False
+
+    def __init__(self, *, paths: V3Paths) -> None:
+        self.paths = paths
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        review_path = resolve_run_path(ctx, self.paths.code_review)
+        if not review_path.is_file():
+            return _fail(
+                format_gate_error(
+                    f"code review file not written: {review_path}",
+                    [],
+                    "Run without --resume so gate 3 runs.",
+                )
+            )
+        review = parse_code_review(review_path.read_text())
+        fixes_path = resolve_run_path(ctx, self.paths.review_fixes)
+        recorded: dict[str, str] = {}
+        if fixes_path.is_file():
+            for m in _FIXED_LINE_RE.finditer(fixes_path.read_text()):
+                recorded.setdefault(m.group(1).upper(), m.group(2).lower())
+
+        followups = [
+            f"- [ ] {f.cid} {f.title} ({_where(f.lines)})"
+            for f in review.findings
+            if f.disposition == "follow-up"
+            or (f.disposition == "fix" and recorded.get(f.cid) == "not fixed")
+        ]
+        nits = [
+            f"- {f.cid} {f.title} ({_where(f.lines)})"
+            for f in review.findings
+            if f.severity == "nit" and f.disposition == "skip"
+        ]
+        nits += [f"- {_NIT_TAG_RE.sub('', item)}" for item in review.omitted_nits]
+
+        for target, lines in (
+            (self.paths.review_followups, followups),
+            (self.paths.review_nits, nits),
+        ):
+            path = resolve_run_path(ctx, target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("".join(f"{line}\n" for line in lines))
+        return _ok(f"{len(followups)} follow-ups, {len(nits)} nits")
+
+
+# ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
 
@@ -669,7 +1156,79 @@ def add_review_fix_stages(
     fix_retries: int,
     auto: bool,
 ) -> Pipeline:
-    """Part 2 of gate 3 (stages 46-51): added in step 07; adds nothing yet."""
+    """Add stages 46-51 (loop ``fix code review`` … ``write review followups``)."""
+    when = _has_fix(paths)
+
+    # 46. Every body stage shares one `when` computed from the gate-3 file
+    # (finding 2): a loop is restored on resume only when all its body stages
+    # are checkpointed, and a skipped stage is never checkpointed.
+    pipeline.loop(
+        "fix code review",
+        max_retries=fix_retries,
+        on_exhaust=ask_user,
+        new_session=True,
+        stages=[
+            Stage(
+                "snapshot before fix",
+                RunCommand(cmd=snapshot_before_fix_cmd(paths=paths, project_dir=project_dir)),
+                when=when,
+            ),
+            Stage(
+                "compress review tests",
+                CompressTestLog(source_stage="run review tests"),
+                when=when,
+            ),
+            Stage(
+                "fix review findings",
+                Generate(
+                    prompt=fix_prompt(paths=paths, project_dir=project_dir),
+                    model=fix_model,
+                    allowed_tools=list(FIX_TOOLS),
+                    permission_mode="acceptEdits",
+                    setting_sources=["project"],
+                    env=_subagent_env(),
+                ),
+                when=when,
+            ),
+            Stage(
+                "snapshot after fix",
+                RunCommand(cmd=snapshot_after_fix_cmd(paths=paths, project_dir=project_dir)),
+                when=when,
+            ),
+            Stage(
+                "run review tests",
+                RunReviewTests(paths=paths, project_dir=project_dir, reuse_proof=False),
+                when=when,
+            ),
+        ],
+    )
+
+    # 47. Runs even when nothing was fixed (A8).
+    pipeline.stage(
+        "review fixes green",
+        RunReviewTests(paths=paths, project_dir=project_dir, reuse_proof=True),
+        on_failure=fail,
+    )
+
+    # 48-49.
+    pipeline.stage(
+        "fixes recorded",
+        FixesRecordedGate(
+            review=paths.code_review, fixes=paths.review_fixes, owned=paths.owned, auto=auto
+        ),
+        on_failure=fail,
+        when=when,
+    )
+    pipeline.stage(
+        "commit review fixes",
+        CommitReviewFixes(paths=paths, project_dir=project_dir, key=key),
+        on_failure=fail,
+        when=when,
+    )
+
+    # 50-51.
+    pipeline.stage("worktree clean", WorktreeClean(project_dir=project_dir), on_failure=ask_user)
+    pipeline.stage("write review followups", WriteReviewFollowups(paths=paths), on_failure=fail)
     return pipeline
 
 
@@ -688,7 +1247,8 @@ def add_code_review_stages(
     fix_retries: int,
     auto: bool,
 ) -> Pipeline:
-    """Add stages 35-45 (``record review base`` … ``code review dispositions recorded``)."""
+    """Add stages 35-51: 35-45 here (``record review base`` … ``code review
+    dispositions recorded``), then 46-51 through ``add_review_fix_stages``."""
     env = _subagent_env()
 
     # 35. Opens gate 3; cached on resume, so it clears outputs on a fresh pass only.
