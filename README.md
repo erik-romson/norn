@@ -508,6 +508,83 @@ A copy of [`fix_jira_issue_v1`](#fix_jira_issue_v1) (see there for the flow and
 knobs). It shares the v2 plan-review builder with `plan_with_review_v2` and runs
 `implement_features_v3` as its child implementation run.
 
+### fix_jira_issue_v3
+
+A copy of [`fix_jira_issue_v2`](#fix_jira_issue_v2) (frozen and pinned) that takes
+a Jira issue from fetch to an open **draft** PR whose checks are green, then
+stops and alerts. A PR for the branch that is already open and that a human has
+marked ready for review is reused as it is and stays ready; the run never
+changes a PR's draft state.
+
+```bash
+norn run fix_jira_issue_v3 CBS-1234                          # four gates, you edit one file at each
+norn run fix_jira_issue_v3 CBS-1234 auto                     # decides every gate it safely can
+norn run fix_jira_issue_v3 CBS-1234 auto --non-interactive   # unattended: every stop aborts
+```
+
+**Gates.** Each gate is one file in `tmp/jira/<KEY>/` that you edit. `auto`
+decides what it safely can and stops, with a prompt and an alert, where it
+cannot; with `--non-interactive` every such stop aborts the run with a FAILED
+alert.
+
+| Gate | File | Interactive | `auto` |
+|---|---|---|---|
+| 1 open questions | `<KEY>-plan-questions.md` | answer each question (`recommended` takes the recommendation) | fills blanks from the recommendations; stops on `none` |
+| 2 plan approval | `<KEY>-plan-approval.md` | set `DECISION: approve` | writes `approve (auto)` |
+| 3 code review | `<KEY>-code-review.md` | set each `Disposition` (`fix`, `skip`, `follow-up`), then `STATUS: DECIDED`; a bounded fix loop with the tests follows | fixes every finding except nits |
+| 4 ship | `<KEY>-ship.md` | `COMMITS` (`rewrite` or `keep`), `TITLE`, then `STATUS: DECIDED`; nothing is pushed before it | writes the proposal as decided |
+
+**Knobs** (`--arg KEY=VALUE`; not available under `norn ui`):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `branch` | the issue key | git branch name |
+| `model` | `deep` | label for the planning stages |
+| `codex_label` | `review` | label for the codex reviews |
+| `review_model` | `deep` | label for the Claude code review |
+| `fix_model` | `deep` | label for the gate-3 fix agent |
+| `budget` | `75` | cost ceiling in USD; each child run gets what is left |
+| `test_cmd` | `index.md` `final_test_cmd`, else the union of the step `test_cmd`s | gate-3 test command |
+| `fix_retries` | `3` | attempts of the gate-3 fix loop |
+| `ci_rounds` | `2` | CI-fix rounds on red PR checks |
+| `ci_timeout_minutes` | `60` | per-wait CI timeout of the CI-fix child |
+| `plan_gate` | `on` | `off` approves gate 2 without a pause |
+| `base` | resolved like `merge_branch_v2` | PR base branch |
+| `overwrite_remote` | none | one-shot: allow overwriting `origin/<branch>` at exactly this sha; cannot be passed under `norn ui` |
+| `jira_browse` | env `JIRA_BROWSE_BASE`, else no link | Jira browse URL ending in `/browse/` for the PR body's link |
+
+**Artifacts of one run** (`tmp/jira/<KEY>/`): as `fix_jira_issue_v2`, plus the
+four gate files, `<KEY>-commit-plan.md`, `<KEY>-pr-body.md`, and `v3/` with the
+reviews, fixes, snapshots, the test command and proof, the rewrite range,
+`shipped-heads` and `pr/`.
+
+**Resume.** Abort at the prompt, edit the one file it names, rerun with
+`--resume`. `--resume` does not restore launch parameters, so retype `auto` when
+the run was in auto:
+
+```bash
+norn run fix_jira_issue_v3 CBS-1234 auto --resume
+```
+
+**Prerequisites.** `gh auth login` with push rights to the repository; `codex`
+on `PATH`; a gitignored `tmp/jira/`; the `split-commit-plan` skill; and test
+artefacts that are ignored (a file the gate-3 tests leave behind stops the run
+at `worktree clean`; add it to `.git/info/exclude` or `.gitignore` in a commit,
+or delete it, then `[r]etry`).
+
+**Notes.**
+- The cost ceiling is per process: a resumed process starts its tracker at $0,
+  and `summary` prints this process's spend.
+- The "PR checks finished" notices are sent under the name `merge_branch`.
+- One issue per launch directory at a time: the checkpoint is per pipeline.
+- A repo with no CI stops at `checks_none`.
+- A commit made after the ship phase is pushed only after its sha is appended
+  to `tmp/jira/<KEY>/v3/shipped-heads`.
+- A PR a human already marked ready stays ready.
+- `norn compare fix_jira_issue_v2 fix_jira_issue_v3` compares unlike totals,
+  because v3's history includes child spend. Compare with `--group` excluding
+  `implement` and `fix ci <n>`, or add v2's child history.
+
 ### check_and_fix_ci_v2
 
 Pushes the current branch, waits for CI, and feeds the failing GitHub Actions
