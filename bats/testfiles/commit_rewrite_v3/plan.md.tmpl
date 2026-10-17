@@ -1,0 +1,54 @@
+# Split plan for @START_SHORT@..@HEAD_SHORT@
+
+- **Start commit (inclusive):** `@START@`
+- **HEAD at plan time:**        `@HEAD@`
+- **Base parent:**              `@START_SHORT@^  = @BASE@`
+- **Branch:**                   `CBS-1`
+- **Commits in scope:**         `2`
+
+## Proposed commits (in order)
+
+| # | Jira  | Subject                    | Files | Hunks |
+|---|-------|----------------------------|-------|-------|
+| 1 | CBS-1 | update the greeting        | 2     | 2     |
+| 2 | CBS-1 | retire the old file        | 2     | 2     |
+
+---
+
+## Group 1 — update the greeting
+
+**Guidelines cited:** #2 (Jira key)
+
+**Commit message:**
+
+```
+CBS-1: update the greeting
+
+The greeting now names the world.
+```
+
+**Files (whole-file):**
+- `greeting.txt`
+- `new.txt`
+
+**Hunks (partial-file):**
+
+---
+
+## Group 2 — retire the old file
+
+**Guidelines cited:** #2 (Jira key)
+
+**Commit message:**
+
+```
+CBS-1: retire the old file
+```
+
+**Files (whole-file):**
+- `old.txt`
+- `dir/[id].tsx`
+
+**Hunks (partial-file):**
+
+---
