@@ -10,12 +10,16 @@ Importing this module runs nothing: no subprocess, no argv parsing.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, NamedTuple
 from urllib.parse import urlsplit
 
+from norn.pipelines import _fix_jira_v3
 from norn.pipelines._jira_issue import ArtifactPaths
 
 DEFAULT_HOST = "github.com"
@@ -290,3 +294,205 @@ def artifact_paths(project_dir: str, ref: GithubIssueRef) -> ArtifactPaths:
         attachments=str(base / "attachments"),
         preplan=str(base / f"issue-{ref.slug}-preplan.md"),
     )
+
+
+# --- Fetch notes ---------------------------------------------------------------
+
+FETCH_NOTES_FILE = "fetch-notes.json"
+
+_WRITE_ACCESS = {"OWNER", "MEMBER", "COLLABORATOR"}
+_HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
+_CLOSING_RE = re.compile(
+    r"\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b:?\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+",
+    re.IGNORECASE,
+)
+_MENTION_RE = re.compile(r"(?<![\w`])@[A-Za-z0-9][A-Za-z0-9-]*")
+_WHAT_CLOSING = "a closing keyword, which also closes that issue when the PR merges"
+_WHAT_MENTION = "a mention, which notifies that user when the draft PR opens"
+_WHAT_ATTRIBUTION = (
+    "text the attribution check rejects; pr body still complete will fail until the line is edited at gate 4"
+)
+_RETRY_NOTE = "retry the fetch stage to try those downloads again"
+_RETRYABLE_RE = re.compile(r"curl exit \d+|HTTP 5\d\d")
+_EXPIRED = "signed URL expired before download"
+
+
+class FetchNote(NamedTuple):
+    text: str  # full note: issue.md, stage output, run summary
+    pr_text: str  # PR-safe form: no third-party free text
+
+
+def _same(text: str) -> FetchNote:
+    return FetchNote(text, text)
+
+
+def _tick(value: str) -> str:
+    return f"`{value}`"
+
+
+def _read_manifest(path: Path) -> list[list[str]]:
+    lines = path.read_text(encoding="utf-8").split("\n")
+    rows = []
+    for line in lines[1:]:  # line 0 is the header
+        if line.strip("\r"):
+            rows.append(line.rstrip("\r").split("\t"))
+    for row in rows:
+        if len(row) != 6:
+            raise ValueError(f"{path}: expected 6 tab-separated columns, got {len(row)}: {row!r}")
+    return rows
+
+
+def _linked_open_prs(relations: dict) -> list[dict]:
+    nodes = [n for n in (relations.get("closedByPullRequestsReferences") or {}).get("nodes") or [] if n]
+    for item in (relations.get("timelineItems") or {}).get("nodes") or []:
+        source = (item or {}).get("source")
+        if source and source.get("__typename") == "PullRequest":
+            nodes.append(source)
+    seen: set[str] = set()
+    out = []
+    for node in nodes:
+        ref = f"{(node.get('repository') or {}).get('nameWithOwner') or '?'}#{node.get('number')}"
+        if ref in seen:
+            continue
+        seen.add(ref)
+        if node.get("state") == "OPEN":
+            out.append({"ref": ref, "title": node.get("title") or ""})
+    return out
+
+
+def fetch_notes(out_dir: str) -> list[FetchNote]:
+    """Compute the fetch notes for the finished fetch in *out_dir*."""
+    base = Path(out_dir)
+    doc = json.loads((base / "issue.json").read_text(encoding="utf-8"))
+    issue = doc["issue"]
+    comments = doc.get("comments") or []
+    relations = doc.get("relations") or {}
+    repo = doc["repo"]
+    notes: list[FetchNote] = []
+
+    if issue.get("state") == "closed":
+        notes.append(_same(f"issue is closed ({issue.get('state_reason') or 'no reason given'})"))
+
+    for pr in _linked_open_prs(relations):
+        prefix = "an open pull request already references this issue: "
+        notes.append(FetchNote(f"{prefix}{pr['ref']} {pr['title']}", f"{prefix}{_tick(pr['ref'])}"))
+
+    rows = _read_manifest(base / "attachments" / "manifest.tsv")
+    statuses = []
+    for index, _path, source_url, _ctype, _bytes, status in rows:
+        if status == "downloaded":
+            continue
+        statuses.append(status)
+        head = f"attachment {index} not downloaded ({status}): "
+        notes.append(FetchNote(head + source_url, head + _tick(source_url)))
+    if any(_RETRYABLE_RE.fullmatch(s) or s == _EXPIRED for s in statuses):
+        notes.append(_same(_RETRY_NOTE))
+
+    html_url = issue.get("html_url") or ""
+    host = (urlsplit(html_url).hostname or "").lower()
+    if host != DEFAULT_HOST:
+        notes.append(
+            _same(f"attachments are downloaded only from github.com; files pasted on {host} were not fetched")
+        )
+
+    writers = [(issue, "issue")] + [(c, f"comment {i}") for i, c in enumerate(comments, 1)]
+    outsiders = [
+        (((w.get("user") or {}).get("login") or "--"), w.get("author_association") or "--", where)
+        for w, where in writers
+        if w.get("author_association") not in _WRITE_ACCESS
+    ]
+    if outsiders:
+        head = f"written by people without write access to {repo}: "
+        notes.append(
+            FetchNote(
+                head + ", ".join(f"{login} ({assoc}, {where})" for login, assoc, where in outsiders),
+                head + ", ".join(f"{_tick(login)} ({assoc}, {where})" for login, assoc, where in outsiders),
+            )
+        )
+
+    hidden = sum(len(_HTML_COMMENT_RE.findall(w.get("body") or "")) for w, _ in writers)
+    if hidden:
+        notes.append(_same(f"{hidden} hidden HTML comment(s) removed from issue.md (kept in raw/)"))
+
+    title = issue.get("title") or ""
+    head = "the title goes on the PR body's Closes line and contains "
+    pr_head = "the issue title on the Closes line contains "
+    for regex, what in ((_CLOSING_RE, _WHAT_CLOSING), (_MENTION_RE, _WHAT_MENTION)):
+        for m in regex.finditer(title):
+            notes.append(FetchNote(f"{head}{what}: {m.group(0)}", f"{pr_head}{what}"))
+    if _fix_jira_v3.attribution_lines(title):
+        notes.append(FetchNote(f"{head}{_WHAT_ATTRIBUTION}: {title}", f"{pr_head}{_WHAT_ATTRIBUTION}"))
+    return notes
+
+
+def write_fetch_notes(out_dir: str, notes: list[FetchNote]) -> None:
+    path = Path(out_dir) / FETCH_NOTES_FILE
+    tmp = path.with_name(path.name + ".tmp")
+    payload = {"notes": [{"text": n.text, "pr_text": n.pr_text} for n in notes]}
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_fetch_notes(out_dir: str) -> list[FetchNote]:
+    path = Path(out_dir) / FETCH_NOTES_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read fetch notes {path}: {exc}") from exc
+    items = doc.get("notes") if isinstance(doc, dict) else None
+    if not isinstance(items, list):
+        raise ValueError(f"{path}: expected an object with a 'notes' list")
+    notes = []
+    for item in items:
+        if not (
+            isinstance(item, dict) and isinstance(item.get("text"), str) and isinstance(item.get("pr_text"), str)
+        ):
+            raise ValueError(f"{path}: every note needs string 'text' and 'pr_text': {item!r}")
+        notes.append(FetchNote(item["text"], item["pr_text"]))
+    return notes
+
+
+def note_texts(out_dir: str) -> list[str]:
+    return [n.text for n in read_fetch_notes(out_dir)]
+
+
+def pr_checklist_items(out_dir: str) -> list[str]:
+    return [f"- [ ] fetch note: {n.pr_text}" for n in read_fetch_notes(out_dir)]
+
+
+def add_notes_to_issue_md(out_dir: str, notes: list[FetchNote]) -> None:
+    """Put a ``## Fetch notes`` section directly before ``## Description`` in issue.md."""
+    path = Path(out_dir) / "issue.md"
+    lines = path.read_text(encoding="utf-8").split("\n")
+    if "## Fetch notes" in lines:
+        start = lines.index("## Fetch notes")
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        del lines[start:end]
+    if "## Description" not in lines:
+        raise ValueError(f"{path}: no '## Description' heading to put the fetch notes before")
+    at = lines.index("## Description")
+    bullets = [f"- {n.text}" for n in notes] or ["none"]
+    lines[at:at] = ["## Fetch notes", "", *bullets, ""]
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(lines), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2 or argv[0] != "notes":
+        print("Usage: python -I -m norn.pipelines._github_issue notes <OUT_DIR>", file=sys.stderr)
+        return 2
+    out_dir = argv[1]
+    notes = fetch_notes(out_dir)
+    write_fetch_notes(out_dir, notes)
+    add_notes_to_issue_md(out_dir, notes)
+    if notes:
+        for note in notes:
+            print(f"NOTE: {note.text}")
+    else:
+        print("notes: none")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
