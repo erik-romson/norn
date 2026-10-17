@@ -69,6 +69,11 @@ class UsageRecord:
         return self.input_tokens + self.output_tokens
 
     @property
+    def refused(self) -> bool:
+        """Whether the provider refused this call (API stop reason ``refusal``)."""
+        return self.stop_reason == "refusal"
+
+    @property
     def billed_input_tokens(self) -> int:
         """Tokens that count toward billing: input + cache creation + cache read."""
         return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
@@ -142,10 +147,14 @@ class UsageTracker:
 
     @property
     def last_session_id(self) -> str | None:
-        """Return the most recent session_id from usage records."""
+        """Return the most recent session_id from usage records.
+
+        ``None`` when that session's last call was refused: the session ends in
+        the refusal, so resuming it is refused again.
+        """
         for r in reversed(self.records):
             if r.session_id:
-                return r.session_id
+                return None if r.refused else r.session_id
         return None
 
 

@@ -619,6 +619,15 @@ def _timed_out(result: StageResult | None) -> bool:
     return result is not None and bool(result.details.get("timed_out"))
 
 
+def _refused(result: StageResult | None) -> bool:
+    """Whether the provider refused *result*'s agent call.
+
+    The refused session ends in the refusal, so the next agent call must start
+    a new session: resuming it is refused again within seconds.
+    """
+    return result is not None and result.usage is not None and result.usage.refused
+
+
 def _resume_reason(result: StageResult | None) -> str | None:
     """Why a retry of *result* should resume its session, or ``None``.
 
@@ -809,6 +818,9 @@ async def _run_loop(
                     log.debug("[%s] Forked to session %s", loop.name, session_id)
                 if _fork_pending:
                     _fork_pending = False
+            if _refused(result):
+                log.warning("[%s] %s was refused; the next agent call starts a new session", loop.name, stage.name)
+                session_id = None
 
             if not result.success:
                 if pipeline_hooks:
@@ -1471,7 +1483,7 @@ async def run_pipeline(
                 if result.usage and result.usage.session_id:
                     if _fork_pending:
                         _fork_pending = False
-                    current_session = result.usage.session_id
+                    current_session = None if _refused(result) else result.usage.session_id
                 # Failure handling with optional user-driven retry: on a
                 # "retry" decision re-run the stage and re-evaluate; on
                 # "continue" proceed past it; abort/FAIL raise inside
@@ -1502,7 +1514,7 @@ async def run_pipeline(
                     if result.usage and result.usage.session_id:
                         if _fork_pending:
                             _fork_pending = False
-                        current_session = result.usage.session_id
+                        current_session = None if _refused(result) else result.usage.session_id
 
                 if result.success:
                     # Save checkpoint after each successful stage

@@ -1,7 +1,7 @@
 import pytest
 
 from norn.dsl import Loop, OnFailure, Pipeline, Stage
-from norn.models import PipelineContext, StageResult, UsageRecord
+from norn.models import PipelineContext, StageResult, UsageRecord, UsageTracker
 from norn.runner import run_pipeline
 from norn.stages.base import BaseStage
 from typing import Any
@@ -12,8 +12,11 @@ class FakeGenerate(BaseStage):
 
     needs_agent = True
 
-    def __init__(self, *, fail_count: int = 0, session_id: str = "fake-session") -> None:
+    def __init__(
+        self, *, fail_count: int = 0, session_id: str = "fake-session", refuse_calls: tuple[int, ...] = (),
+    ) -> None:
         self._fail_count = fail_count
+        self._refuse_calls = refuse_calls
         self._calls = 0
         self._session_id = session_id
         self.received_sessions: list[str | None] = []
@@ -36,6 +39,7 @@ class FakeGenerate(BaseStage):
             duration_api_ms=800,
             num_turns=1,
             attempt=attempt,
+            stop_reason="refusal" if self._calls in self._refuse_calls else None,
         )
 
         if self._calls <= self._fail_count:
@@ -141,6 +145,33 @@ async def test_loop_mixed_stages_usage():
 
     assert len(ctx.usage_tracker.records) == 1
     assert ctx.usage_tracker.records[0].stage_name == "gen"
+
+
+@pytest.mark.asyncio
+async def test_loop_starts_new_session_after_refusal():
+    """A refused session is not resumed: the next attempt starts a new session."""
+    gen = FakeGenerate(fail_count=2, refuse_calls=(2,))
+    p = Pipeline("test").loop(
+        "retry",
+        max_retries=3,
+        stages=[Stage("gen", gen)],
+    )
+    await run_pipeline(p)
+
+    assert gen.received_sessions == [None, "fake-session", None]
+
+
+def test_last_session_id_is_none_after_refusal():
+    """The checkpoint and history must not offer a refused session for --resume."""
+    tracker = UsageTracker()
+    tracker.add(UsageRecord(stage_name="implement", session_id="s1"))
+    tracker.add(UsageRecord(stage_name="fix", session_id="s1", stop_reason="refusal"))
+
+    assert tracker.last_session_id is None
+
+    tracker.add(UsageRecord(stage_name="fix", session_id="s2"))
+
+    assert tracker.last_session_id == "s2"
 
 
 @pytest.mark.asyncio
