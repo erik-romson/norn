@@ -1246,9 +1246,14 @@ def add_code_review_stages(
     fix_model: str,
     fix_retries: int,
     auto: bool,
+    subject_prefix: str | None = None,
 ) -> Pipeline:
     """Add stages 35-51: 35-45 here (``record review base`` … ``code review
-    dispositions recorded``), then 46-51 through ``add_review_fix_stages``."""
+    dispositions recorded``), then 46-51 through ``add_review_fix_stages``.
+
+    *subject_prefix* (default: *key*) prefixes the review-fix commit's subject;
+    the triage prompt keeps the file key *key*.
+    """
     env = _subagent_env()
 
     # 35. Opens gate 3; cached on resume, so it clears outputs on a fresh pass only.
@@ -1368,7 +1373,7 @@ def add_code_review_stages(
         pipeline,
         paths=paths,
         project_dir=project_dir,
-        key=key,
+        key=(key if subject_prefix is None else subject_prefix),
         fix_model=fix_model,
         fix_retries=fix_retries,
         auto=auto,

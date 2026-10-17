@@ -490,3 +490,17 @@ async def test_ship_decision_gate(tmp_path):
     p.write_text(_ship(status="PROPOSED"))
     result = await gate.run(_ctx())
     assert not result.success and "STATUS" in result.error
+
+
+@pytest.mark.asyncio
+async def test_ship_decision_gate_checks_a_github_subject_prefix(tmp_path):
+    # fix_issue_v1 passes the commit prefix, not the file key (`issue-123`).
+    p = tmp_path / "ship.md"
+    gate = ShipDecisionGate(path=str(p), key="#123")
+    p.write_text(_ship(title="#123: add x"))
+    assert (await gate.run(_ctx())).success
+
+    p.write_text(_ship(title="issue-123: add x"))
+    result = await gate.run(_ctx())
+    assert not result.success
+    assert "TITLE: subject must start with '#123: '" in result.error

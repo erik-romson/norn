@@ -1321,3 +1321,40 @@ async def test_write_review_followups_with_no_findings_writes_empty_files(paths)
     assert (await WriteReviewFollowups(paths=paths).run(_ctx())).success
     assert Path(paths.review_followups).read_text() == ""
     assert Path(paths.review_nits).read_text() == ""
+
+
+# ---------------------------------------------------------------------------
+# Subject prefix (fix_issue_v1: the commit prefix differs from the file key)
+# ---------------------------------------------------------------------------
+
+
+def test_subject_prefix_reaches_the_fix_commit_and_not_the_triage_prompt(tmp_path):
+    paths = V3Paths(str(tmp_path / "art"), "issue-123")
+    p = add_code_review_stages(
+        Pipeline("test-code-review-v3"),
+        paths=paths,
+        project_dir="/repo",
+        steps_dir="/steps",
+        key="issue-123",
+        base_file=str(Path(paths.art_dir) / "base.sha"),
+        codex_label="review",
+        review_model="deep",
+        triage_model="standard",
+        fix_model="deep",
+        fix_retries=3,
+        auto=False,
+        subject_prefix="#123",
+    )
+    commit = _stage(p, "commit review fixes").impl
+    assert isinstance(commit, CommitReviewFixes)
+    assert commit.key == "#123"
+    assert commit.message == "#123: address code review findings\n"
+    triage = next(
+        s for s in _loop(p, "triage code review").stages if s.name == "triage findings"
+    ).impl
+    assert triage.prompt == triage_prompt(paths=paths, steps_dir="/steps", key="issue-123")
+
+
+def test_fix_commit_uses_the_key_without_a_subject_prefix(paths):
+    commit = _stage(_build(paths), "commit review fixes").impl
+    assert commit.message == f"{KEY}: address code review findings\n"

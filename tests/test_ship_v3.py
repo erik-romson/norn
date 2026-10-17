@@ -1063,3 +1063,340 @@ def test_rewrite_stages_share_the_commits_when(tmp_path):
     assert when(ctx) is False
     Path(paths.ship).write_text("STATUS: DECIDED\nCOMMITS: Rewrite\n")
     assert when(ctx) is True
+
+
+# ---------------------------------------------------------------------------
+# Another issue source (fix_issue_v1): subject prefix, issue line, label, notes
+# ---------------------------------------------------------------------------
+
+GH_PREFIX = "#123"
+GH_FILE_KEY = "issue-123"
+GH_ISSUE_MD = "# acme/app#123: Crash on save\n\n| Field | Value |\n| --- | --- |\n"
+GH_COMMITS = [
+    ("#123: add x", {"x.txt": "x\n"}),
+    ("#123: fix y", {"modified.txt": "one\ntwo\n"}),
+]
+NOTE_ITEM = "- [ ] fetch note: issue is closed (completed)"
+TODAYS_REWORD_ACTION = "Reword those commits (git rebase -i <base.sha>), then --resume."
+
+
+def _gh_issue_line(summary: str) -> str:
+    return f"Closes #123 — {summary.removeprefix('acme/app#123: ')}"
+
+
+def _gh_issue_line_ok(first: str) -> bool:
+    return re.match(r"^Closes #123(\s|$)", first) is not None
+
+
+def _make_gh_env(tmp_path: Path) -> ShipEnv:
+    """A range of `#123:` commits; cleanup is pinned so git keeps the `#` subjects."""
+    env = _make_env(tmp_path, commits=[])
+    _git(env.root, "config", "commit.cleanup", "whitespace")
+    for message, files in GH_COMMITS:
+        _commit(env.root, message, files)
+    env.issue_md.write_text(GH_ISSUE_MD)
+    return env
+
+
+def _assemble_with(env: ShipEnv, **kw) -> AssemblePrBody:
+    args = dict(
+        paths=env.paths,
+        plan=str(env.plan),
+        steps_dir=str(env.steps),
+        issue_md=str(env.issue_md),
+        key=KEY,
+        jira_browse=BROWSE,
+        project_dir=str(env.root),
+    )
+    args.update(kw)
+    return AssemblePrBody(**args)
+
+
+async def _body_with(env: ShipEnv, **kw) -> str:
+    result = await _assemble_with(env, **kw).run(_ctx())
+    assert result.success, result.error
+    return Path(env.paths.pr_body).read_text()
+
+
+def _without_human_sources(env: ShipEnv) -> None:
+    """Sources with no '## For the human' items (as in the empty-sources test)."""
+    env.plan.write_text("# Plan\n\n## Summary\n\nx\n")
+    (env.steps / "README.md").unlink()
+    (env.steps / "followups.md").write_text(
+        "# Follow-ups\n\n## Unapplied review findings\n\n- [ ] minor C2 x\n"
+    )
+
+
+def _gh_builder(paths: V3Paths, **kw) -> Pipeline:
+    args = dict(
+        paths=paths,
+        project_dir="/repo",
+        key=GH_FILE_KEY,
+        plan="/plan.md",
+        steps_dir="/steps",
+        issue_md="/issue.md",
+        base_file="/art/base.sha",
+        skill=Skill("split-commit-plan", "skill text"),
+        skill_searched=["/a"],
+        jira_browse=None,
+        auto=False,
+        subject_prefix=GH_PREFIX,
+        issue_line=_gh_issue_line,
+        issue_line_ok=_gh_issue_line_ok,
+        issue_label="GitHub",
+    )
+    args.update(kw)
+    return add_ship_stages(Pipeline("test-ship-v3"), **args)
+
+
+def test_commit_plan_prompt_for_another_issue_source():
+    paths = V3Paths("/art", GH_FILE_KEY)
+    prompt = commit_plan_prompt(
+        paths=paths,
+        key=GH_PREFIX,
+        start="a" * 40,
+        head="b" * 40,
+        issue_md="/art/issue.md",
+        issue_label="GitHub",
+    )
+    assert "Every subject is `#123: <lowercase summary>`" in prompt
+    assert (
+        "Do not use `#123 type:` forms, several issue references, or exempt prefixes "
+        "(chore, style, docs, ci, build)."
+    ) in prompt
+    assert "Pass the skill no hints and fetch nothing: the GitHub issue text is at /art/issue.md." in prompt
+    for absent in ("#KEY", "Jira", "jira-fetch", "comma-joined keys"):
+        assert absent not in prompt, absent
+    assert prompt.rstrip().endswith(COMMENT_RULE)
+    assert "{" not in prompt and "}" not in prompt
+
+
+def test_commit_plan_prompt_label_jira_is_the_default():
+    paths = V3Paths("/art", KEY)
+    kw = dict(paths=paths, key=KEY, start="a" * 40, head="b" * 40, issue_md="/art/issue.md")
+    assert commit_plan_prompt(**kw, issue_label="Jira") == commit_plan_prompt(**kw)
+
+
+def test_pr_summary_prompt_names_the_issue_source():
+    paths = V3Paths("/art", GH_FILE_KEY)
+    prompt = pr_summary_prompt(
+        paths=paths, key=GH_PREFIX, plan="/plan.md", issue_md="/issue.md", issue_label="GitHub"
+    )
+    assert "- /issue.md: the GitHub issue." in prompt
+    assert "`#123: <lowercase summary>`" in prompt
+    assert "Jira" not in prompt
+    kw = dict(paths=V3Paths("/art", KEY), key=KEY, plan="/plan.md", issue_md="/issue.md")
+    assert pr_summary_prompt(**kw, issue_label="Jira") == pr_summary_prompt(**kw)
+    assert "- /issue.md: the Jira issue." in pr_summary_prompt(**kw)
+
+
+@pytest.mark.asyncio
+async def test_commit_plan_stage_keeps_the_issue_label_when_it_runs(env, monkeypatch):
+    seen: list[str] = []
+
+    async def fake_run(self, ctx, **kwargs):
+        seen.append(self.prompt)
+        return StageResult(name="", success=True)
+
+    monkeypatch.setattr(Generate, "run", fake_run)
+    await _open(env)
+    stage = CommitPlanGenerate(
+        paths=env.paths, key=GH_PREFIX, issue_md=str(env.issue_md), skill=None, issue_label="GitHub"
+    )
+    assert "the GitHub issue text is at" in stage.prompt
+    assert (await stage.run(_ctx())).success
+    assert f"`Start commit (inclusive)` is `{env.start()}`" in seen[0]
+    assert "the GitHub issue text is at" in seen[0]
+    assert "Pass no Jira hints" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_github_issue_line_and_prefixed_commits_leave_no_reword_section(tmp_path):
+    env = _make_gh_env(tmp_path)
+    assert env.subjects() == ["#123: add x", "#123: fix y"]
+    await _open(env)
+    env.write_body_inputs()
+
+    body = await _body_with(env, key=GH_PREFIX, jira_browse=None, issue_line=_gh_issue_line)
+    lines = body.splitlines()
+    assert lines[0] == BODY_START
+    assert lines[1] == "Closes #123 — Crash on save"
+    assert "## Reword at squash/merge" not in body
+
+    # The same commits checked against the file key: both would need a reword.
+    body = await _body_with(env, key=GH_FILE_KEY, jira_browse=None, issue_line=_gh_issue_line)
+    shas = _git(env.root, "rev-list", "--reverse", f"{env.base}..HEAD").split()
+    assert _section_lines(body, "## Reword at squash/merge") == [
+        f"- {sha[:7]} {subject}" for sha, subject in zip(shas, env.subjects())
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_note_items_alone_make_a_for_the_human_section(env):
+    await _open(env)
+    env.write_body_inputs()
+    _without_human_sources(env)
+    body = await _body_with(env, extra_checklist=lambda: [NOTE_ITEM])
+    assert _section_lines(body, "## For the human") == [NOTE_ITEM]
+    assert "<details>" not in body and "Full instructions" not in body
+    assert Path(checklist_file(env.paths)).read_text() == f"{NOTE_ITEM}\n"
+    assert (await PrBodyGate(paths=env.paths, key=KEY).run(_ctx())).success
+
+
+@pytest.mark.asyncio
+async def test_fetch_note_items_come_after_the_plan_and_followup_items(env):
+    await _open(env)
+    env.write_body_inputs()
+    body = await _body_with(env, extra_checklist=lambda: [NOTE_ITEM])
+    lines = body.splitlines()
+    human = lines[lines.index("## For the human") + 1:lines.index(DETAILS_OPEN)]
+    assert [ln for ln in human if ln.strip()] == [*EXPECTED_CHECKLIST, NOTE_ITEM]
+    assert Path(checklist_file(env.paths)).read_text().splitlines() == [*EXPECTED_CHECKLIST, NOTE_ITEM]
+    assert (await PrBodyGate(paths=env.paths, key=KEY).run(_ctx())).success
+
+
+@pytest.mark.asyncio
+async def test_a_failing_extra_checklist_fails_the_stage(env):
+    await _open(env)
+    env.write_body_inputs()
+
+    def broken_notes() -> list[str]:
+        raise ValueError("/art/fetch-notes.json is not valid JSON")
+
+    result = await _assemble_with(env, extra_checklist=broken_notes).run(_ctx())
+    assert not result.success
+    headline = result.error.splitlines()[0]
+    assert "broken_notes raised ValueError" in headline
+    assert "/art/fetch-notes.json is not valid JSON" in result.error
+    assert not Path(env.paths.pr_body).exists()
+    assert not Path(checklist_file(env.paths)).exists()
+
+
+@pytest.mark.asyncio
+async def test_without_the_new_keywords_the_body_is_unchanged(env):
+    await _open(env)
+    env.write_body_inputs()
+    default = await _body(env)
+    default_checklist = Path(checklist_file(env.paths)).read_text()
+    assert await _body_with(env, issue_line=None, extra_checklist=None) == default
+    assert Path(checklist_file(env.paths)).read_text() == default_checklist
+    assert await _body_with(env, extra_checklist=lambda: []) == default
+    assert default.splitlines()[1] == f"Jira: [{KEY}]({BROWSE}{KEY}) — CBS-1: Split the slow supplier query"
+    assert default_checklist.splitlines() == EXPECTED_CHECKLIST
+
+
+def test_pr_body_problems_with_a_source_issue_line():
+    good = (
+        f"{BODY_START}\nCloses #123 — x\nsummary\n\n## Commits\n- #123: a (1 files)\n\n"
+        f"## Testing\nLocal\n{BODY_END}\n"
+    )
+    kw = dict(
+        expect_human=False,
+        issue_line=lambda s: f"Closes #123 — {s}",
+        issue_line_ok=_gh_issue_line_ok,
+    )
+    assert pr_body_problems(good, GH_PREFIX, **kw) == []
+    longer = pr_body_problems(good.replace("Closes #123 — x", "Closes #1234 — x"), GH_PREFIX, **kw)
+    assert longer == [
+        "the first line after the start marker must be 'Closes #123 — …', got 'Closes #1234 — x'"
+    ]
+    jira = pr_body_problems(good.replace("Closes #123 — x", "Jira: CBS-1 — x"), GH_PREFIX, **kw)
+    assert len(jira) == 1 and "'Closes #123 — …'" in jira[0]
+
+    # Without the callables the rule and the message are today's.
+    assert pr_body_problems(good, KEY, expect_human=False) == [
+        f"the first line after the start marker must be 'Jira: {KEY} …', got 'Closes #123 — x'"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pr_body_gate_passes_the_issue_line_check_through(env):
+    await _open(env)
+    env.write_body_inputs()
+    await _body(env)  # a Jira first line
+    gate = PrBodyGate(
+        paths=env.paths, key=GH_PREFIX, issue_line=_gh_issue_line, issue_line_ok=_gh_issue_line_ok
+    )
+    result = await gate.run(_ctx())
+    assert not result.success
+    assert "must be 'Closes #123 — …'" in result.error
+
+
+def test_builder_threads_the_subject_prefix(tmp_path):
+    paths = V3Paths(str(tmp_path / "art"), GH_FILE_KEY)
+
+    def notes() -> list[str]:
+        return [NOTE_ITEM]
+
+    p = _gh_builder(paths, extra_checklist=notes)
+    assert _stage(p, "record rewrite range").impl.key == GH_PREFIX
+    assert _stage(p, "ship decision recorded").impl.key == GH_PREFIX
+    assert _body_stage(p, "summarize pr", "check pr summary").impl.key == GH_PREFIX
+    assert _stage(p, "pr summary valid").impl.key == GH_PREFIX
+
+    assemble = _stage(p, "assemble pr body").impl
+    assert assemble.key == GH_PREFIX
+    assert assemble.issue_line is _gh_issue_line
+    assert assemble.extra_checklist is notes
+
+    gate = _stage(p, "pr body still complete").impl
+    assert gate.key == GH_PREFIX
+    assert gate.issue_line is _gh_issue_line and gate.issue_line_ok is _gh_issue_line_ok
+
+    messages = _stage(p, "check commit messages").impl
+    assert messages.key == GH_PREFIX
+    assert "core.commentChar=';'" in messages._action()
+    assert messages._action() == (
+        "Reword those commits (git -c core.commentChar=';' rebase -i <base.sha>), then --resume."
+    )
+
+    plan = _body_stage(p, "plan commits", "write commit plan").impl
+    assert plan.key == GH_PREFIX and plan.issue_label == "GitHub"
+    assert "the GitHub issue text is at /issue.md" in plan.prompt
+    summary = _body_stage(p, "summarize pr", "write pr summary").impl
+    assert "- /issue.md: the GitHub issue." in summary.prompt
+    assert "`#123: <lowercase summary>`" in summary.prompt
+
+    assert "--key '#123'" in _stage(p, "rewrite commits").impl.cmd
+
+    Path(paths.work).mkdir(parents=True)
+    Path(paths.rewrite_range).write_text(
+        f"base {'1' * 40}\nstart {'2' * 40}\nhead {'3' * 40}\ntree {'4' * 40}\n"
+    )
+    for name in ("commit plan valid", "commit plan still valid"):
+        argv = _stage(p, name).impl.argv(_ctx())
+        assert argv[argv.index("--key") + 1] == GH_PREFIX, name
+
+    for stage in _all_stages(p):
+        if isinstance(stage.impl, Generate):
+            assert "{" not in stage.impl.prompt and "}" not in stage.impl.prompt, stage.name
+
+
+def test_builder_keeps_todays_reword_hint_without_a_hash_prefix(tmp_path):
+    paths = V3Paths(str(tmp_path / "art"), "issue-other-lib-45-2b9ddc19")
+    p = _gh_builder(
+        paths,
+        key="issue-other-lib-45-2b9ddc19",
+        subject_prefix="other/lib#45",
+        issue_line=lambda s: f"Closes other/lib#45 — {s}",
+        issue_line_ok=lambda f: re.match(r"^Closes other/lib#45(\s|$)", f) is not None,
+    )
+    messages = _stage(p, "check commit messages").impl
+    assert messages.key == "other/lib#45"
+    assert messages._action() == TODAYS_REWORD_ACTION
+
+    v3 = _builder(paths=V3Paths(str(tmp_path / "v3"), KEY))
+    assert _stage(v3, "check commit messages").impl._action() == TODAYS_REWORD_ACTION
+    assemble = _stage(v3, "assemble pr body").impl
+    assert assemble.key == KEY
+    assert assemble.issue_line is None and assemble.extra_checklist is None
+    gate = _stage(v3, "pr body still complete").impl
+    assert gate.issue_line is None and gate.issue_line_ok is None
+
+
+def test_builder_refuses_half_an_issue_line(tmp_path):
+    paths = V3Paths(str(tmp_path / "art"), GH_FILE_KEY)
+    with pytest.raises(ValueError, match="issue_line and issue_line_ok"):
+        _gh_builder(paths, issue_line_ok=None)
+    with pytest.raises(ValueError, match="issue_line and issue_line_ok"):
+        _gh_builder(paths, issue_line=None)

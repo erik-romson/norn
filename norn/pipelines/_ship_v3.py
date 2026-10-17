@@ -81,6 +81,12 @@ HEAD_PREVIEW = "<head from rewrite-range.txt>"
 
 RANGE_KEYS = ("base", "start", "head", "tree")
 
+# The reword hint of `check commit messages`. An editor reword strips a
+# `#123:` subject as a comment line, so a `#` prefix gets another comment char
+# (`;`: `auto` is deprecated for Git 3.0).
+REWORD_CMD = "git rebase -i <base.sha>"
+REWORD_CMD_HASH_PREFIX = "git -c core.commentChar=';' rebase -i <base.sha>"
+
 
 def _ok(output: Any = "") -> StageResult:
     return StageResult(name="", success=True, output=output)
@@ -424,14 +430,24 @@ def check_plan_argv(
 class CheckCommitMessages(ScriptCheck):
     """``messages`` over ``base.sha..HEAD``: the house style for ``rewrite``, attribution for ``keep``.
 
-    ``COMMITS`` is read when the stage runs.
+    ``COMMITS`` is read when the stage runs.  *reword_cmd* is the command the
+    failure hint names.
     """
 
-    def __init__(self, *, paths: V3Paths, project_dir: str, base_file: str, key: str) -> None:
+    def __init__(
+        self,
+        *,
+        paths: V3Paths,
+        project_dir: str,
+        base_file: str,
+        key: str,
+        reword_cmd: str = REWORD_CMD,
+    ) -> None:
         self.paths = paths
         self.project_dir = project_dir
         self.base_file = base_file
         self.key = key
+        self.reword_cmd = reword_cmd
         self._checked: str | None = None  # the COMMITS value the last run checked
         super().__init__(argv=self._messages_argv)
 
@@ -467,7 +483,7 @@ class CheckCommitMessages(ScriptCheck):
         return argv
 
     def _action(self) -> str:
-        return "Reword those commits (git rebase -i <base.sha>), then --resume."
+        return f"Reword those commits ({self.reword_cmd}), then --resume."
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         result = await super().run(ctx, **kwargs)
@@ -483,8 +499,40 @@ class CheckCommitMessages(ScriptCheck):
 # ---------------------------------------------------------------------------
 
 
-def commit_plan_prompt(*, paths: V3Paths, key: str, start: str, head: str, issue_md: str) -> str:
-    """The ``write commit plan`` prompt: the skill plus every override of it (external-docs 1d)."""
+def commit_plan_prompt(
+    *,
+    paths: V3Paths,
+    key: str,
+    start: str,
+    head: str,
+    issue_md: str,
+    issue_label: str = "Jira",
+) -> str:
+    """The ``write commit plan`` prompt: the skill plus every override of it (external-docs 1d).
+
+    *key* is the commit-subject prefix.  With *issue_label* ``"Jira"`` the text
+    is v3's; any other source drops the ``#KEY`` clause (a ``#123:`` subject is
+    the house style there) and the Jira-specific hint wording.
+    """
+    if issue_label == "Jira":
+        forms = (
+            " Do not use `KEY type:` forms,\n"
+            "  comma-joined keys, exempt prefixes (chore, style, docs, ci, build) or\n"
+            "  `#KEY` forms."
+        )
+        hints = (
+            "- Pass no Jira hints and do not run `jira-fetch.sh`: the issue text is at\n"
+            f"  {issue_md}."
+        )
+    else:
+        forms = (
+            f"\n  Do not use `{key} type:` forms, several issue references, "
+            "or exempt prefixes (chore, style, docs, ci, build)."
+        )
+        hints = (
+            "- Pass the skill no hints and fetch nothing: "
+            f"the {issue_label} issue text is at {issue_md}."
+        )
     return f"""\
 Plan how to regroup the commits of {key} into new commits, following the
 {COMMIT_SKILL} skill in your system prompt. Its {COMMIT_STYLE_FILE} follows
@@ -504,13 +552,10 @@ These rules override the skill wherever they disagree:
   `**Files (whole-file):**`. Write no `**Hunks (partial-file):**` bullets.
 - Every subject is `{key}: <lowercase summary>`: at most 72 characters, a
   lower-case word right after `{key}: `, and no trailing period. Do not copy
-  the `refactor:` style of the commits in scope. Do not use `KEY type:` forms,
-  comma-joined keys, exempt prefixes (chore, style, docs, ci, build) or
-  `#KEY` forms.
+  the `refactor:` style of the commits in scope.{forms}
 - The body is optional and has at most 4 lines, not 6, after one blank line.
 - No footers or trailers.
-- Pass no Jira hints and do not run `jira-fetch.sh`: the issue text is at
-  {issue_md}.
+{hints}
 - Read-only git only (`git log`, `git diff`, `git show`, `git rev-list`,
   `git merge-base`). Run no other command and change no file but the plan.
 - If {paths.commit_plan_problems} exists, the plan failed its check: fix
@@ -535,13 +580,27 @@ class CommitPlanGenerate(Generate):
     ``prompt`` holds a preview until then, with the range shown as ``<…>``.
     """
 
-    def __init__(self, *, paths: V3Paths, key: str, issue_md: str, skill: Skill | None) -> None:
+    def __init__(
+        self,
+        *,
+        paths: V3Paths,
+        key: str,
+        issue_md: str,
+        skill: Skill | None,
+        issue_label: str = "Jira",
+    ) -> None:
         self.paths = paths
         self.key = key
         self.issue_md = issue_md
+        self.issue_label = issue_label
         super().__init__(
             prompt=commit_plan_prompt(
-                paths=paths, key=key, start=START_PREVIEW, head=HEAD_PREVIEW, issue_md=issue_md
+                paths=paths,
+                key=key,
+                start=START_PREVIEW,
+                head=HEAD_PREVIEW,
+                issue_md=issue_md,
+                issue_label=issue_label,
             ),
             model=COMMIT_PLAN_MODEL,
             skills=[skill] if skill else [],
@@ -562,6 +621,7 @@ class CommitPlanGenerate(Generate):
             start=rng["start"],
             head=rng["head"],
             issue_md=self.issue_md,
+            issue_label=self.issue_label,
         )
         return await super().run(ctx, **kwargs)
 
@@ -588,12 +648,14 @@ _SUMMARY_LINE_RE = re.compile(r"^\d+\.\s+(.*)$")
 # ---------------------------------------------------------------------------
 
 
-def pr_summary_prompt(*, paths: V3Paths, key: str, plan: str, issue_md: str) -> str:
+def pr_summary_prompt(
+    *, paths: V3Paths, key: str, plan: str, issue_md: str, issue_label: str = "Jira"
+) -> str:
     return f"""\
 Write the title and the summary of the pull request for {key}.
 
 Read:
-- {issue_md}: the Jira issue.
+- {issue_md}: the {issue_label} issue.
 - {plan}: the plan the change implements, with the reasons for it.
 - {paths.commit_plan}: the commits and the files each one changes.
 
@@ -743,10 +805,20 @@ def _lines_kept(text: str) -> list[str]:
     return text.strip("\n").splitlines() if text.strip() else []
 
 
+def _callable_name(fn: Callable[..., object]) -> str:
+    """*fn*'s name; a ``functools.partial`` is named by the function it wraps."""
+    target = getattr(fn, "func", fn)
+    return getattr(target, "__name__", repr(target))
+
+
 class AssemblePrBody(BaseStage):
     """Write ``<KEY>-pr-body.md`` deterministically; the agent wrote only the summary.
 
-    ``project_dir`` is needed for ``git log`` (the Reword section).
+    ``project_dir`` is needed for ``git log`` (the Reword section).  *key* is
+    the commit-subject prefix.  *issue_line* builds the first line from
+    ``issue.md``'s first line (default: the Jira line); *extra_checklist*
+    returns more ``## For the human`` items, listed after the plan's and the
+    follow-ups'.
     """
 
     needs_agent = False
@@ -761,6 +833,8 @@ class AssemblePrBody(BaseStage):
         key: str,
         jira_browse: str | None,
         project_dir: str,
+        issue_line: Callable[[str], str] | None = None,
+        extra_checklist: Callable[[], list[str]] | None = None,
     ) -> None:
         self.paths = paths
         self.plan = plan
@@ -769,6 +843,8 @@ class AssemblePrBody(BaseStage):
         self.key = key
         self.jira_browse = jira_browse
         self.project_dir = project_dir
+        self.issue_line = issue_line
+        self.extra_checklist = extra_checklist
 
     def _step_file(self, name: str) -> str:
         return str(Path(self.steps_dir) / name)
@@ -787,7 +863,24 @@ class AssemblePrBody(BaseStage):
                     sections.append(section)
         followups_md = _read_optional(ctx, self._step_file("followups.md"))
         checklist = human_checklist(sections) + human_followup_items(followups_md)
+        if self.extra_checklist is not None:
+            checklist += self._extra_items(self.extra_checklist)
         return sections, checklist, followups_md
+
+    @staticmethod
+    def _extra_items(source: Callable[[], list[str]]) -> list[str]:
+        """*source*'s items; an exception from it becomes a ``ShipInputError`` naming it."""
+        try:
+            return list(source())
+        except Exception as exc:
+            raise ShipInputError(
+                format_gate_error(
+                    "cannot list the extra '## For the human' items: "
+                    f"{_callable_name(source)} raised {type(exc).__name__}",
+                    _lines(str(exc)),
+                    "Fix the cause, then --resume.",
+                )
+            ) from exc
 
     def _reword(self, base: str) -> list[str]:
         log = _run(
@@ -846,8 +939,12 @@ class AssemblePrBody(BaseStage):
         followups += followup_items(followups_md)
         nits = _lines(_read_required(ctx, self.paths.review_nits, "review-nits.md"))
         testing_line, labels = self._testing(ctx, rng["tree"])
+        if self.issue_line is not None:
+            issue_line = self.issue_line(summary_line)
+        else:
+            issue_line = _jira_line(key=self.key, summary=summary_line, jira_browse=self.jira_browse)
         kwargs = dict(
-            jira_line=_jira_line(key=self.key, summary=summary_line, jira_browse=self.jira_browse),
+            jira_line=issue_line,
             summary=_read_required(ctx, self.paths.pr_summary, "pr-summary.md"),
             commits=commits,
             checklist=checklist,
@@ -892,8 +989,19 @@ class AssemblePrBody(BaseStage):
 _CHECKBOX_RE = re.compile(r"^\s*[-*] \[[ xX]\]")
 
 
-def pr_body_problems(text: str, key: str, *, expect_human: bool) -> list[str]:
-    """One line per way *text* breaks the PR-body contract (step 09 edits it by its markers)."""
+def pr_body_problems(
+    text: str,
+    key: str,
+    *,
+    expect_human: bool,
+    issue_line: Callable[[str], str] | None = None,
+    issue_line_ok: Callable[[str], bool] | None = None,
+) -> list[str]:
+    """One line per way *text* breaks the PR-body contract (step 09 edits it by its markers).
+
+    With *issue_line_ok* the first line after the start marker must pass it,
+    and the problem shows ``issue_line('…')``; otherwise it is the Jira line.
+    """
     problems: list[str] = []
     has_start, has_end = BODY_START in text, BODY_END in text
     if not has_start:
@@ -907,7 +1015,12 @@ def pr_body_problems(text: str, key: str, *, expect_human: bool) -> list[str]:
     if has_start:
         after = text.split(BODY_START, 1)[1].splitlines()
         first = next((ln.strip() for ln in after if ln.strip()), "")
-        if not first.startswith("Jira:") or key not in first:
+        if issue_line_ok is not None:
+            if not issue_line_ok(first):
+                problems.append(
+                    f"the first line after the start marker must be '{issue_line('…')}', got {first!r}"
+                )
+        elif not first.startswith("Jira:") or key not in first:
             problems.append(f"the first line after the start marker must be 'Jira: {key} …', got {first!r}")
 
     heads = _headings(lines)
@@ -941,9 +1054,18 @@ class PrBodyGate(BaseStage):
 
     needs_agent = False
 
-    def __init__(self, *, paths: V3Paths, key: str) -> None:
+    def __init__(
+        self,
+        *,
+        paths: V3Paths,
+        key: str,
+        issue_line: Callable[[str], str] | None = None,
+        issue_line_ok: Callable[[str], bool] | None = None,
+    ) -> None:
         self.paths = paths
         self.key = key
+        self.issue_line = issue_line
+        self.issue_line_ok = issue_line_ok
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         body = resolve_run_path(ctx, self.paths.pr_body)
@@ -958,7 +1080,11 @@ class PrBodyGate(BaseStage):
                     )
                 )
         problems = pr_body_problems(
-            body.read_text(), self.key, expect_human=bool(_lines(side.read_text()))
+            body.read_text(),
+            self.key,
+            expect_human=bool(_lines(side.read_text())),
+            issue_line=self.issue_line,
+            issue_line_ok=self.issue_line_ok,
         )
         if problems:
             return _fail(
@@ -1163,15 +1289,34 @@ def add_ship_stages(
     skill_searched: list[str],
     jira_browse: str | None,
     auto: bool,
+    subject_prefix: str | None = None,
+    issue_line: Callable[[str], str] | None = None,
+    issue_line_ok: Callable[[str], bool] | None = None,
+    issue_label: str = "Jira",
+    extra_checklist: Callable[[], list[str]] | None = None,
 ) -> Pipeline:
-    """Add stages 52-68 (``record rewrite range`` … ``record shipped head``)."""
+    """Add stages 52-68 (``record rewrite range`` … ``record shipped head``).
+
+    *subject_prefix* (default: *key*) is the prefix of every commit subject and
+    of the PR title; every stage here checks against it.  *issue_line* and
+    *issue_line_ok* (both or neither) replace the Jira first line of the PR
+    body and its check; *issue_label* names the issue source in the prompts;
+    *extra_checklist* adds ``## For the human`` items.
+    """
+    if (issue_line is None) != (issue_line_ok is None):
+        raise ValueError(
+            "add_ship_stages: pass issue_line and issue_line_ok together, or neither"
+        )
+    prefix = key if subject_prefix is None else subject_prefix
+    # The one home of the comment-char rule: an editor reword drops a `#123:` subject.
+    reword_cmd = REWORD_CMD_HASH_PREFIX if prefix.startswith("#") else REWORD_CMD
     is_rewrite = _is_rewrite(paths)
-    check_argv = check_plan_argv(paths=paths, project_dir=project_dir, key=key)
+    check_argv = check_plan_argv(paths=paths, project_dir=project_dir, key=prefix)
 
     # 52-53. Opens gate 4; cached on resume, so it clears outputs on a fresh pass only.
     pipeline.stage(
         "record rewrite range",
-        RecordRewriteRange(paths=paths, project_dir=project_dir, base_file=base_file, key=key),
+        RecordRewriteRange(paths=paths, project_dir=project_dir, base_file=base_file, key=prefix),
         on_failure=fail,
     )
     pipeline.stage(
@@ -1189,7 +1334,13 @@ def add_ship_stages(
         stages=[
             Stage(
                 "write commit plan",
-                CommitPlanGenerate(paths=paths, key=key, issue_md=issue_md, skill=skill),
+                CommitPlanGenerate(
+                    paths=paths,
+                    key=prefix,
+                    issue_md=issue_md,
+                    skill=skill,
+                    issue_label=issue_label,
+                ),
                 when=_needs_commit_plan(paths),
             ),
             Stage(
@@ -1210,7 +1361,13 @@ def add_ship_stages(
             Stage(
                 "write pr summary",
                 Generate(
-                    prompt=pr_summary_prompt(paths=paths, key=key, plan=plan, issue_md=issue_md),
+                    prompt=pr_summary_prompt(
+                        paths=paths,
+                        key=prefix,
+                        plan=plan,
+                        issue_md=issue_md,
+                        issue_label=issue_label,
+                    ),
                     model=PR_SUMMARY_MODEL,
                     allowed_tools=list(PR_SUMMARY_TOOLS),
                     permission_mode="acceptEdits",
@@ -1221,11 +1378,11 @@ def add_ship_stages(
             ),
             Stage(
                 "check pr summary",
-                PrSummaryGate(paths=paths, key=key, problems_file=paths.pr_summary_problems),
+                PrSummaryGate(paths=paths, key=prefix, problems_file=paths.pr_summary_problems),
             ),
         ],
     )
-    pipeline.stage("pr summary valid", PrSummaryGate(paths=paths, key=key), on_failure=fail)
+    pipeline.stage("pr summary valid", PrSummaryGate(paths=paths, key=prefix), on_failure=fail)
 
     # 58. The body around the summary.
     pipeline.stage(
@@ -1235,9 +1392,11 @@ def add_ship_stages(
             plan=plan,
             steps_dir=steps_dir,
             issue_md=issue_md,
-            key=key,
+            key=prefix,
             jira_browse=jira_browse,
             project_dir=project_dir,
+            issue_line=issue_line,
+            extra_checklist=extra_checklist,
         ),
         on_failure=fail,
     )
@@ -1245,7 +1404,7 @@ def add_ship_stages(
     # 59-62. Gate 4.
     pipeline.stage(
         "write ship decision",
-        WriteShipDecision(path=paths.ship, render=_render_ship_now(key=key, paths=paths)),
+        WriteShipDecision(path=paths.ship, render=_render_ship_now(key=prefix, paths=paths)),
         on_failure=fail,
     )
     if auto:
@@ -1266,7 +1425,7 @@ def add_ship_stages(
     )
     pipeline.stage(
         "ship decision recorded",
-        ShipDecisionGate(path=paths.ship, key=key),
+        ShipDecisionGate(path=paths.ship, key=prefix),
         on_failure=fail,
         always_run=True,
     )
@@ -1278,10 +1437,14 @@ def add_ship_stages(
         on_failure=fail,
         when=is_rewrite,
     )
-    pipeline.stage("pr body still complete", PrBodyGate(paths=paths, key=key), on_failure=fail)
+    pipeline.stage(
+        "pr body still complete",
+        PrBodyGate(paths=paths, key=prefix, issue_line=issue_line, issue_line_ok=issue_line_ok),
+        on_failure=fail,
+    )
     pipeline.stage(
         "rewrite commits",
-        RunCommand(cmd=rewrite_cmd(paths=paths, project_dir=project_dir, key=key)),
+        RunCommand(cmd=rewrite_cmd(paths=paths, project_dir=project_dir, key=prefix)),
         on_failure=ask_user,
         when=is_rewrite,
     )
@@ -1295,7 +1458,13 @@ def add_ship_stages(
     # 67-68.
     pipeline.stage(
         "check commit messages",
-        CheckCommitMessages(paths=paths, project_dir=project_dir, base_file=base_file, key=key),
+        CheckCommitMessages(
+            paths=paths,
+            project_dir=project_dir,
+            base_file=base_file,
+            key=prefix,
+            reword_cmd=reword_cmd,
+        ),
         on_failure=fail,
     )
     pipeline.stage(
