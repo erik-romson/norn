@@ -13,12 +13,13 @@ from pathlib import Path
 
 import pytest
 
+from norn.alerts import MacOSChannel
 from norn.dsl import Pipeline
-from norn.models import UsageRecord
-from norn.pipelines import _merge_gh, _pr_v3
+from norn.models import StageResult, UsageRecord
+from norn.pipelines import _child_cost_v3, _fix_jira_v3, _merge_gh, _merge_state, _pr_v3
 from norn.pipelines._child_cost_v3 import CiFixChildV3
 from norn.pipelines._comment_style import ATTRIBUTION_ERE
-from norn.pipelines._fix_jira_v3 import V3Paths
+from norn.pipelines._fix_jira_v3 import PIPELINE, V3Paths
 from norn.pipelines._merge_gh import ResolveBranch, WaitForChecks
 from norn.pipelines._merge_state import HaltingCommand, MergePaths
 from norn.pipelines._pr_v3 import (
@@ -37,6 +38,7 @@ from norn.pipelines._pr_v3 import (
     draft_pr_cmd,
     pr_paths,
     refresh_sections,
+    resume_hint,
     title_file,
 )
 from norn.pipelines._ship_v3 import BODY_END, BODY_START, render_pr_body
@@ -1132,3 +1134,437 @@ async def test_green_draft_pr_flow(tmp_path, notices):
     assert f"{KEY}-plan-questions.md" in summary.output
     assert "spend this process: $12.35 (the ceiling restarts on --resume)" in summary.output
     assert not [c for c in _calls(calls_log) if c[:2] == ["pr", "ready"]]
+
+
+# ---------------------------------------------------------------------------
+# fix_issue_v1: subject prefix, pipeline name, resume argument, fetch notes
+# ---------------------------------------------------------------------------
+
+OTHER = "fix_issue_v1"
+GH_KEY = "issue-123"
+GH_PREFIX = "#123"
+NOTES_PATH = "/x/tmp/github/123/issue.md"
+HALT_HEADING = "The pull request's checks settled red"
+NOTES_ACTION = "Run without --resume so 'fetch issue' writes it again."
+
+
+@pytest.fixture
+def quiet(monkeypatch) -> list[tuple[str, str, dict]]:
+    """The shared quiet-notify rule: every notifier accepts **kwargs, and no osascript."""
+    calls: list[tuple[str, str, dict]] = []
+
+    async def fake_notify(title: str, detail: str, **kwargs) -> None:
+        calls.append((title, detail, kwargs))
+
+    async def fake_send(self, msg) -> None:
+        calls.append((msg.title, msg.body, {"channel": "macos"}))
+
+    for module in (_merge_gh, _merge_state, _pr_v3, _child_cost_v3, _fix_jira_v3):
+        monkeypatch.setattr(module, "notify", fake_notify)
+    monkeypatch.setattr(MacOSChannel, "send", fake_send)
+    return calls
+
+
+def test_resume_hint_names_another_pipeline():
+    assert resume_hint("123", True, pipeline=OTHER) == "norn run fix_issue_v1 123 auto --resume"
+    assert resume_hint("123", False, pipeline=OTHER) == "norn run fix_issue_v1 123 --resume"
+    assert resume_hint(KEY, True) == f"norn run fix_jira_issue_v3 {KEY} auto --resume"
+    assert resume_hint(KEY, False) == f"norn run fix_jira_issue_v3 {KEY} --resume"
+
+
+def _prefix_run(tmp_path: Path) -> Run:
+    """Two ``#123:`` commits on ``issue-123``, plus the files the PR body refresh reads.
+
+    The PR body lists only the first commit, so a refresh always changes it.
+    """
+    rr = make_repo_with_remote(tmp_path / "checkout")
+    repo = Path(rr.path)
+    _git(repo, "config", "commit.gpgsign", "false")
+    _git(repo, "config", "commit.cleanup", "whitespace")  # keeps a `#123:` subject
+    _git(repo, "checkout", "-q", "-b", GH_KEY, "main")
+    base = _git(repo, "rev-parse", "HEAD")
+    start = _commit(repo, "#123: add x", {"x.txt": "x\n"})
+    head = _commit(repo, "#123: fix y", {"y.txt": "y\n"})
+    assert _git(repo, "log", "--format=%s", f"{base}..HEAD").splitlines() == [
+        "#123: fix y",
+        "#123: add x",
+    ]
+    art = tmp_path / "art"
+    art.mkdir()
+    base_file = art / "base.sha"
+    base_file.write_text(base + "\n")
+    paths = V3Paths(str(art), GH_KEY)
+    Path(paths.work).mkdir(parents=True)
+    Path(paths.shipped_heads).write_text(head + "\n")
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    Path(paths.rewrite_range).write_text(f"base {base}\nstart {start}\nhead {head}\ntree {tree}\n")
+    Path(paths.ship).write_text(
+        "# Ship — issue-123\n\nSTATUS: DECIDED\nCOMMITS: rewrite\nTITLE: #123: add x and fix y\n"
+    )
+    body = render_pr_body(
+        jira_line="Closes #123 — Add x",
+        summary="X is added and y is fixed.",
+        commits=["- #123: add x (1 files)"],
+        checklist=["- [ ] Check x"],
+        instructions="",
+        plan_path="",
+        followups=[],
+        nits=[],
+        reword=[],
+        testing_line="Local, passed on tree 1234567 (gate 3):",
+        test_labels=["unit tests"],
+        details=False,
+    )
+    Path(paths.pr_body).write_text(body)
+    pr = pr_paths(paths)
+    _write_root(pr, repo=REPO_NAME, pr="42")
+    return Run(repo=repo, paths=paths, pr=pr, base_file=base_file, base=base, head=head)
+
+
+async def _refresh(tmp_path: Path, run: Run, *, publish: bool, **kwargs):
+    original = Path(run.paths.pr_body).read_text()
+    env, calls_log = _gh(
+        tmp_path, {("pr", "view"): [(0, original, "")], ("pr", "edit"): [(0, "", "")]}
+    )
+    stage = UpdatePrBody(paths=run.paths, project_dir=str(run.repo), publish=publish, **kwargs)
+    result = await stage.run(ctx_for(env=env))
+    edits = [c for c in _calls(calls_log) if c[:2] == ["pr", "edit"]]
+    lives = [Path(e[e.index("--body-file") + 1]).read_text() for e in edits]
+    return result, _calls(calls_log), lives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publish", [False, True])
+async def test_update_pr_body_with_the_subject_prefix_lists_no_reword(tmp_path, publish):
+    run = _prefix_run(tmp_path)
+    assert run.paths.key == GH_KEY
+
+    result, calls, lives = await _refresh(tmp_path, run, publish=publish, subject_prefix=GH_PREFIX)
+
+    assert result.success, result.error
+    assert result.output == {"changed": True, "published": publish, "commits": 2}
+    text = Path(run.paths.pr_body).read_text()
+    assert _section(text, "Commits") == ["- #123: add x (1 files)", "- #123: fix y (1 files)"]
+    assert "## Reword at squash/merge" not in text
+    assert Path(title_file(run.pr)).read_text() == "#123: add x and fix y\n"
+    if publish:
+        assert len(lives) == 1
+        assert "## Reword at squash/merge" not in lives[0]
+        assert "- #123: fix y (1 files)" in lives[0]
+        assert lives[0].count(BODY_START) == 1
+    else:
+        assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publish", [False, True])
+async def test_update_pr_body_without_the_prefix_rewords_every_hash_commit(tmp_path, publish):
+    run = _prefix_run(tmp_path)
+    first = _git(run.repo, "rev-parse", "HEAD~1")
+
+    result, calls, lives = await _refresh(tmp_path, run, publish=publish)
+
+    assert result.success, result.error
+    expected = [f"- {first[:7]} #123: add x", f"- {run.head[:7]} #123: fix y"]
+    text = Path(run.paths.pr_body).read_text()
+    assert _section(text, "Reword at squash/merge") == expected
+    if publish:
+        assert len(lives) == 1
+        assert _section(lives[0], "Reword at squash/merge") == expected
+    else:
+        assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_provenance_resume_hint_names_the_pipeline_and_the_resume_arg(tmp_path):
+    paths = V3Paths(str(tmp_path / "art"), "issue-o-r-5-12345678")
+    stage = CheckPrProvenance(
+        paths=paths,
+        project_dir=str(tmp_path),
+        key="https://github.com/o/r/issues/5",
+        auto=False,
+        pipeline_name=OTHER,
+    )
+
+    result = await stage.run(ctx_for())
+
+    assert not result.success
+    lines = result.error.splitlines()
+    assert lines[0] == "no shipped head recorded: the ship phase did not finish"
+    assert lines[-1] == (
+        "Finish the ship phase: norn run fix_issue_v1 https://github.com/o/r/issues/5 --resume"
+    )
+
+
+def _halted(tmp_path: Path) -> V3Paths:
+    paths = V3Paths(str(tmp_path / "art"), GH_KEY)
+    pr = pr_paths(paths)
+    Path(pr.root).mkdir(parents=True)
+    Path(pr.halt_reason).write_text(f"KIND: checks_red\n{HALT_HEADING}\nbuild (https://ci/1)\n")
+    Path(pr.halt).touch()
+    return paths
+
+
+@pytest.mark.asyncio
+async def test_stop_for_human_names_another_pipeline(tmp_path, quiet):
+    paths = _halted(tmp_path)
+
+    result = await StopForHuman(paths=paths, key="123", auto=False, pipeline_name=OTHER).run(
+        ctx_for()
+    )
+
+    assert not result.success
+    assert result.error.splitlines()[-1] == "norn run fix_issue_v1 123 --resume"
+    assert "fetch notes" not in result.error
+    assert quiet == [("Stopped", HALT_HEADING, {"pipeline": OTHER})]
+
+
+@pytest.mark.asyncio
+async def test_stop_for_human_counts_the_fetch_notes(tmp_path, quiet):
+    paths = _halted(tmp_path)
+    stage = StopForHuman(
+        paths=paths,
+        key="123",
+        auto=False,
+        pipeline_name=OTHER,
+        fetch_notes=lambda: ["a", "b"],
+        notes_path=NOTES_PATH,
+    )
+
+    result = await stage.run(ctx_for())
+
+    assert not result.success
+    lines = result.error.splitlines()
+    assert lines[0] == f"{HALT_HEADING} (checks_red)"
+    assert lines[-2:] == [f"2 fetch notes: {NOTES_PATH}", "norn run fix_issue_v1 123 --resume"]
+    assert quiet == [
+        ("Stopped", f"{HALT_HEADING} — 2 fetch notes, see issue.md", {"pipeline": OTHER})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stop_for_human_with_no_fetch_notes_keeps_todays_texts(tmp_path, quiet):
+    paths = _halted(tmp_path)
+
+    plain = await StopForHuman(paths=paths, key="123", auto=False).run(ctx_for())
+    empty = await StopForHuman(
+        paths=paths, key="123", auto=False, fetch_notes=lambda: [], notes_path=NOTES_PATH
+    ).run(ctx_for())
+
+    assert not plain.success and not empty.success
+    assert empty.error == plain.error
+    assert empty.output == plain.output == "checks_red"
+    assert plain.error.splitlines()[-1] == "norn run fix_jira_issue_v3 123 --resume"
+    assert "fetch notes" not in empty.error
+    # The default pipeline name keeps the two-argument notify call.
+    assert quiet == [("Stopped", HALT_HEADING, {}), ("Stopped", HALT_HEADING, {})]
+
+
+def _announce_paths(tmp_path: Path) -> tuple[V3Paths, dict[str, str], str]:
+    paths = V3Paths(str(tmp_path / "art"), GH_KEY)
+    pr = pr_paths(paths)
+    _write_root(pr, repo=REPO_NAME, pr="42")
+    _checks_file(pr, 1, ["pass"])
+    env, calls_log = _gh(
+        tmp_path, {("pr", "view"): [(0, json.dumps({"isDraft": True, "url": PR_URL}), "")]}
+    )
+    return paths, env, calls_log
+
+
+@pytest.mark.asyncio
+async def test_announce_names_another_pipeline(tmp_path, quiet):
+    paths, env, calls_log = _announce_paths(tmp_path)
+
+    result = await AnnouncePrReady(
+        paths=paths, project_dir=str(tmp_path), pipeline_name=OTHER
+    ).run(ctx_for(env=env))
+
+    assert result.success, result.error
+    assert result.output == "draft"
+    assert quiet == [("PR ready", f"PR #42 draft, 1 checks green — {PR_URL}", {"pipeline": OTHER})]
+    assert _calls(calls_log) == [["pr", "view", "-R", REPO_NAME, "42", "--json", "isDraft,url"]]
+
+
+@pytest.mark.asyncio
+async def test_announce_counts_the_fetch_notes_and_keeps_the_output(tmp_path, quiet):
+    paths, env, _calls_log = _announce_paths(tmp_path)
+
+    result = await AnnouncePrReady(
+        paths=paths,
+        project_dir=str(tmp_path),
+        pipeline_name=OTHER,
+        fetch_notes=lambda: ["a", "b"],
+        notes_path=NOTES_PATH,
+    ).run(ctx_for(env=env))
+
+    assert result.success, result.error
+    assert result.output == "draft"
+    assert len(quiet) == 1
+    title, detail, kwargs = quiet[0]
+    assert (title, kwargs) == ("PR ready", {"pipeline": OTHER})
+    assert detail == f"PR #42 draft, 1 checks green — {PR_URL} — 2 fetch notes, see issue.md"
+
+
+@pytest.mark.asyncio
+async def test_announce_with_no_fetch_notes_keeps_todays_detail(tmp_path, quiet):
+    paths, env, _calls_log = _announce_paths(tmp_path)
+
+    result = await AnnouncePrReady(
+        paths=paths, project_dir=str(tmp_path), fetch_notes=lambda: [], notes_path=NOTES_PATH
+    ).run(ctx_for(env=env))
+
+    assert result.success, result.error
+    assert quiet == [("PR ready", f"PR #42 draft, 1 checks green — {PR_URL}", {})]
+
+
+def _summary_run(tmp_path: Path):
+    run = _run_repo(tmp_path)
+    _write_root(run.pr, branch=KEY)
+    Path(run.pr.pr_json).write_text(_pr_json(is_draft=True, head=run.head))
+    ctx = ctx_for()
+    ctx.results[_pr_v3.ANNOUNCE_STAGE] = StageResult(
+        name=_pr_v3.ANNOUNCE_STAGE, success=True, output="draft"
+    )
+    ctx.usage_tracker.add(UsageRecord(stage_name="x", total_cost_usd=1.5))
+    return run, ctx
+
+
+async def _summary(run: Run, ctx, **kwargs) -> StageResult:
+    return await RunSummary(
+        paths=run.paths, project_dir=str(run.repo), base_file=str(run.base_file), **kwargs
+    ).run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_summary_lists_the_fetch_notes_before_the_spend_line(tmp_path):
+    run, ctx = _summary_run(tmp_path)
+
+    plain = await _summary(run, ctx)
+    noted = await _summary(run, ctx, fetch_notes=lambda: ["a", "b"], notes_path=NOTES_PATH)
+    none = await _summary(run, ctx, fetch_notes=lambda: [], notes_path=NOTES_PATH)
+
+    assert plain.success and noted.success and none.success
+    oneline = _git(run.repo, "log", "--oneline", f"{run.base}..HEAD")
+    spend = "spend this process: $1.50 (the ceiling restarts on --resume)"
+    today = [
+        f"branch: {KEY}",
+        f"commits ({run.base[:7]}..HEAD):",
+        f"  {oneline}",
+        f"PR: {PR_URL} (draft)",
+        "gate files:",
+        f"  {_pr_v3.questions_file(run.paths)}",
+        f"  {run.paths.approval}",
+        f"  {run.paths.code_review}",
+        f"  {run.paths.ship}",
+        spend,
+    ]
+    assert plain.output.splitlines() == today
+    assert noted.output.splitlines() == [
+        *today[:-1], f"fetch notes ({NOTES_PATH}):", "  - a", "  - b", spend
+    ]
+    assert none.output.splitlines() == [*today[:-1], "fetch notes: none", spend]
+
+
+def _missing_notes() -> list[str]:
+    raise FileNotFoundError(2, "No such file or directory", "/x/tmp/github/123/fetch-notes.json")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["stop for human", "announce pr ready", "summary"])
+async def test_a_raising_fetch_notes_fails_the_stage_naming_the_error(tmp_path, quiet, name):
+    paths = _halted(tmp_path)
+    env, calls_log = _gh(tmp_path, {})
+    notes = {"fetch_notes": _missing_notes, "notes_path": NOTES_PATH}
+    stage = {
+        "stop for human": lambda: StopForHuman(
+            paths=paths, key="123", auto=False, pipeline_name=OTHER, **notes
+        ),
+        "announce pr ready": lambda: AnnouncePrReady(
+            paths=paths, project_dir=str(tmp_path), pipeline_name=OTHER, **notes
+        ),
+        "summary": lambda: RunSummary(
+            paths=paths, project_dir=str(tmp_path), base_file=str(tmp_path / "base.sha"), **notes
+        ),
+    }[name]()
+
+    result = await stage.run(ctx_for(env=env))
+
+    assert not result.success
+    lines = result.error.splitlines()
+    assert lines[0] == "cannot read the fetch notes: FileNotFoundError"
+    assert "/x/tmp/github/123/fetch-notes.json" in result.error
+    assert lines[-1] == NOTES_ACTION
+    assert quiet == []
+    assert _calls(calls_log) == []
+
+
+@pytest.mark.parametrize(
+    "given", [{"fetch_notes": lambda: []}, {"notes_path": NOTES_PATH}], ids=["callable", "path"]
+)
+def test_fetch_notes_and_notes_path_come_together(tmp_path, given):
+    paths = V3Paths(str(tmp_path / "art"), GH_KEY)
+    together = "pass fetch_notes and notes_path together, or neither"
+    with pytest.raises(ValueError, match=f"StopForHuman: {together}"):
+        StopForHuman(paths=paths, key="123", auto=False, **given)
+    with pytest.raises(ValueError, match=f"AnnouncePrReady: {together}"):
+        AnnouncePrReady(paths=paths, project_dir=str(tmp_path), **given)
+    with pytest.raises(ValueError, match=f"RunSummary: {together}"):
+        RunSummary(paths=paths, project_dir=str(tmp_path), base_file="/b/base.sha", **given)
+
+
+def test_builder_passes_the_fix_issue_v1_values_to_every_stage(tmp_path):
+    def f() -> list[str]:
+        return []
+
+    paths = V3Paths(str(tmp_path / "art"), GH_KEY)
+    pipeline = add_pr_stages(
+        Pipeline("t"),
+        paths=paths,
+        project_dir=str(tmp_path / "repo"),
+        key=GH_KEY,
+        base_file=str(tmp_path / "art" / "base.sha"),
+        base_arg=None,
+        overwrite_remote=None,
+        ci_rounds=2,
+        ci_timeout_minutes=60,
+        budget_pipeline=Pipeline("budget"),
+        auto=False,
+        subject_prefix=GH_PREFIX,
+        pipeline_name=OTHER,
+        resume_arg="123",
+        fetch_notes=f,
+        notes_path=NOTES_PATH,
+    )
+    assert [s.name for s in pipeline.items] == EXPECTED_STAGES
+    impls = {s.name: s.impl for s in pipeline.items}
+
+    for name in ("update pr body", "refresh pr body"):
+        assert isinstance(impls[name], UpdatePrBody)
+        assert impls[name].subject_prefix == GH_PREFIX
+    provenance = impls["check pr provenance"]
+    assert (provenance.key, provenance.pipeline_name) == ("123", OTHER)
+    stop = impls["stop for human"]
+    assert (stop.key, stop.pipeline_name) == ("123", OTHER)
+    fixes = [s.impl for s in pipeline.items if s.name.startswith("fix ci ")]
+    assert [type(fix) for fix in fixes] == [CiFixChildV3, CiFixChildV3]
+    assert all(fix._pipeline_name == OTHER for fix in fixes)
+    assert impls["announce pr ready"].pipeline_name == OTHER
+    for name in ("stop for human", "announce pr ready", "summary"):
+        assert impls[name].fetch_notes is f, name
+        assert impls[name].notes_path == NOTES_PATH, name
+
+
+def test_builder_defaults_keep_the_v3_values(tmp_path):
+    _paths, pipeline, stages = _build(tmp_path)
+    impls = {name: stage.impl for name, stage in stages.items()}
+
+    for name in ("update pr body", "refresh pr body"):
+        assert impls[name].subject_prefix is None
+    for name in ("check pr provenance", "stop for human"):
+        assert (impls[name].key, impls[name].pipeline_name) == (KEY, PIPELINE)
+    assert impls["announce pr ready"].pipeline_name == PIPELINE
+    assert all(
+        s.impl._pipeline_name == PIPELINE for s in pipeline.items if s.name.startswith("fix ci ")
+    )
+    for name in ("stop for human", "announce pr ready", "summary"):
+        assert impls[name].fetch_notes is None and impls[name].notes_path is None, name

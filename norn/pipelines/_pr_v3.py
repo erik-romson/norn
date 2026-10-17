@@ -17,6 +17,10 @@ The merge helpers are reused by import and composition only
 (``_merge_gh.py`` and ``_merge_state.py`` are frozen for this change).
 ``WaitForChecks`` sends its own "PR checks finished" notices under the name
 ``merge_branch`` (A14): cosmetic, documented, not fixed.
+
+``fix_issue_v1`` reuses the builder through keyword parameters whose defaults
+keep fix_jira_issue_v3 unchanged: the commit-subject prefix, the pipeline name
+of notices and resume hints, the resume argument, and the fetch notes.
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from norn.dsl import Pipeline, fail, file_exists
 from norn.models import PipelineContext, StageResult
@@ -154,9 +158,48 @@ def questions_file(paths: V3Paths) -> str:
     return str(Path(paths.art_dir) / f"{paths.key}-plan-questions.md")
 
 
-def resume_hint(key: str, auto: bool) -> str:
+def resume_hint(key: str, auto: bool, *, pipeline: str = PIPELINE) -> str:
     """The resume command; ``auto`` is not restored by ``--resume`` (A16)."""
-    return f"norn run {PIPELINE} {key}{' auto' if auto else ''} --resume"
+    return f"norn run {pipeline} {key}{' auto' if auto else ''} --resume"
+
+
+async def _notify(title: str, detail: str, pipeline: str) -> None:
+    """Send *title*/*detail*; the default pipeline name keeps the two-argument call."""
+    if pipeline == PIPELINE:
+        await notify(title, detail)
+    else:
+        await notify(title, detail, pipeline=pipeline)
+
+
+FetchNotes = Callable[[], list[str]]
+
+FETCH_NOTES_ACTION = "Run without --resume so 'fetch issue' writes it again."
+
+
+def _check_notes_pair(owner: str, fetch_notes: FetchNotes | None, notes_path: str | None) -> None:
+    if (fetch_notes is None) != (notes_path is None):
+        raise ValueError(f"{owner}: pass fetch_notes and notes_path together, or neither")
+
+
+def _read_notes(fetch_notes: FetchNotes | None) -> list[str] | None:
+    """The fetch notes, or None without a source; raises ``ShipInputError`` naming the error."""
+    if fetch_notes is None:
+        return None
+    try:
+        return list(fetch_notes())
+    except Exception as exc:
+        raise ShipInputError(
+            format_gate_error(
+                f"cannot read the fetch notes: {type(exc).__name__}",
+                _lines(str(exc)),
+                FETCH_NOTES_ACTION,
+            )
+        ) from exc
+
+
+def _notes_suffix(notes: list[str] | None) -> str:
+    """`` — <n> fetch notes, see issue.md`` when there is at least one note."""
+    return f" — {len(notes)} fetch notes, see issue.md" if notes else ""
 
 
 def _read_required(ctx: PipelineContext, path: str, what: str) -> str:
@@ -183,14 +226,23 @@ class CheckPrProvenance(BaseStage):
 
     needs_agent = False
 
-    def __init__(self, *, paths: V3Paths, project_dir: str, key: str, auto: bool) -> None:
+    def __init__(
+        self,
+        *,
+        paths: V3Paths,
+        project_dir: str,
+        key: str,
+        auto: bool,
+        pipeline_name: str = PIPELINE,
+    ) -> None:
         self.paths = paths
         self.project_dir = project_dir
         self.key = key
         self.auto = auto
+        self.pipeline_name = pipeline_name
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
-        resume = resume_hint(self.key, self.auto)
+        resume = resume_hint(self.key, self.auto, pipeline=self.pipeline_name)
         shipped = resolve_run_path(ctx, self.paths.shipped_heads)
         heads = _lines(shipped.read_text()) if shipped.is_file() else []
         heads = [h.strip() for h in heads]
@@ -576,15 +628,24 @@ class UpdatePrBody(BaseStage):
     ``update pr body`` (``publish=False``) runs before ``open draft pr``;
     ``refresh pr body`` (``publish=True``) runs after the CI rounds and, when
     the body changed and the PR exists, replaces the marker block of the live
-    PR body. An unchanged body makes no ``gh`` call.
+    PR body. An unchanged body makes no ``gh`` call. *subject_prefix*
+    (default: the file key) is the prefix the Reword check expects.
     """
 
     needs_agent = False
 
-    def __init__(self, *, paths: V3Paths, project_dir: str, publish: bool) -> None:
+    def __init__(
+        self,
+        *,
+        paths: V3Paths,
+        project_dir: str,
+        publish: bool,
+        subject_prefix: str | None = None,
+    ) -> None:
         self.paths = paths
         self.project_dir = project_dir
         self.publish = publish
+        self.subject_prefix = subject_prefix
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         pr = pr_paths(self.paths)
@@ -608,7 +669,11 @@ class UpdatePrBody(BaseStage):
                     )
                 )
             text = body_path.read_text()
-            commits, reword = commit_lines(self.project_dir, base, self.paths.key)
+            commits, reword = commit_lines(
+                self.project_dir,
+                base,
+                self.paths.key if self.subject_prefix is None else self.subject_prefix,
+            )
             new = refresh_sections(text, commits=commits, reword=reword)
         except (ShipInputError, PrBodyError) as exc:
             return _fail(str(exc))
@@ -719,20 +784,38 @@ class StopForHuman(BaseStage):
     """End a halted PR phase with the halt's kind, detail and the resume command.
 
     Never prints ``HALTS[kind].next_step``: that text is written for
-    merge_branch.
+    merge_branch. With *fetch_notes* and *notes_path* (both or neither), a
+    run with fetch notes counts them in the notice and names *notes_path*.
     """
 
     needs_agent = False
 
-    def __init__(self, *, paths: V3Paths, key: str, auto: bool) -> None:
+    def __init__(
+        self,
+        *,
+        paths: V3Paths,
+        key: str,
+        auto: bool,
+        pipeline_name: str = PIPELINE,
+        fetch_notes: FetchNotes | None = None,
+        notes_path: str | None = None,
+    ) -> None:
+        _check_notes_pair("StopForHuman", fetch_notes, notes_path)
         self.paths = paths
         self.key = key
         self.auto = auto
+        self.pipeline_name = pipeline_name
+        self.fetch_notes = fetch_notes
+        self.notes_path = notes_path
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        try:
+            notes = _read_notes(self.fetch_notes)
+        except ShipInputError as exc:
+            return _fail(str(exc))
         pr = pr_paths(self.paths)
         reason = resolve_run_path(ctx, pr.halt_reason)
-        resume = resume_hint(self.key, self.auto)
+        resume = resume_hint(self.key, self.auto, pipeline=self.pipeline_name)
         if not reason.is_file():
             return _fail(
                 format_gate_error(
@@ -745,7 +828,7 @@ class StopForHuman(BaseStage):
         kind = lines[0].removeprefix("KIND:").strip() if lines else "unknown"
         heading = lines[1].strip() if len(lines) > 1 else "The PR phase halted"
         detail = _lines("\n".join(lines[2:]))[-5:]
-        await notify("Stopped", heading)
+        await _notify("Stopped", f"{heading}{_notes_suffix(notes)}", self.pipeline_name)
 
         error = [f"{heading} ({kind})", *detail]
         url = _pr_url(pr)
@@ -753,6 +836,8 @@ class StopForHuman(BaseStage):
             error.append(f"PR: {url}")
         if kind == "checks_none":
             error.append("workflows may skip draft PRs, or the PR has a merge conflict")
+        if notes:
+            error.append(f"{len(notes)} fetch notes: {self.notes_path}")
         error.append(resume)
         return _fail("\n".join(error), output=kind)
 
@@ -870,18 +955,33 @@ class AnnouncePrReady(BaseStage):
     """Notify that the PR is green, saying whether it is a draft.
 
     The PR's state is read again when the stage runs: a human can mark it
-    ready during the check wait. The output is ``draft`` or ``ready``.
+    ready during the check wait. The output is ``draft`` or ``ready``. With
+    *fetch_notes* and *notes_path* (both or neither), the notice counts the
+    fetch notes.
     """
 
     needs_agent = False
 
-    def __init__(self, *, paths: V3Paths, project_dir: str) -> None:
+    def __init__(
+        self,
+        *,
+        paths: V3Paths,
+        project_dir: str,
+        pipeline_name: str = PIPELINE,
+        fetch_notes: FetchNotes | None = None,
+        notes_path: str | None = None,
+    ) -> None:
+        _check_notes_pair("AnnouncePrReady", fetch_notes, notes_path)
         self.paths = paths
         self.project_dir = project_dir
+        self.pipeline_name = pipeline_name
+        self.fetch_notes = fetch_notes
+        self.notes_path = notes_path
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         pr = pr_paths(self.paths)
         try:
+            notes = _read_notes(self.fetch_notes)
             repo = _read_required(ctx, pr.repo, "the repository name")
             num = _read_required(ctx, pr.pr, "the PR number")
         except ShipInputError as exc:
@@ -909,7 +1009,7 @@ class AnnouncePrReady(BaseStage):
         else:
             state = "ready"
             detail = f"PR #{num} ready for review (not marked by this run), {k} checks green — {url}"
-        await notify("PR ready", detail)
+        await _notify("PR ready", f"{detail}{_notes_suffix(notes)}", self.pipeline_name)
         return _ok(state)
 
 
@@ -919,18 +1019,34 @@ class AnnouncePrReady(BaseStage):
 
 
 class RunSummary(BaseStage):
-    """Print the branch, the commits, the PR, the gate files and this process's spend."""
+    """Print the branch, the commits, the PR, the gate files and this process's spend.
+
+    With *fetch_notes* and *notes_path* (both or neither), the fetch notes are
+    listed before the spend line.
+    """
 
     needs_agent = False
 
-    def __init__(self, *, paths: V3Paths, project_dir: str, base_file: str) -> None:
+    def __init__(
+        self,
+        *,
+        paths: V3Paths,
+        project_dir: str,
+        base_file: str,
+        fetch_notes: FetchNotes | None = None,
+        notes_path: str | None = None,
+    ) -> None:
+        _check_notes_pair("RunSummary", fetch_notes, notes_path)
         self.paths = paths
         self.project_dir = project_dir
         self.base_file = base_file
+        self.fetch_notes = fetch_notes
+        self.notes_path = notes_path
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         pr = pr_paths(self.paths)
         try:
+            notes = _read_notes(self.fetch_notes)
             branch = _read_required(ctx, pr.branch, "the branch")
             base_sha = _read_required(ctx, self.base_file, "base.sha")
             _read_required(ctx, pr.pr_json, "pr.json")
@@ -960,8 +1076,14 @@ class RunSummary(BaseStage):
             f"  {self.paths.approval}",
             f"  {self.paths.code_review}",
             f"  {self.paths.ship}",
-            f"spend this process: ${spent:.2f} (the ceiling restarts on --resume)",
         ]
+        if notes is not None:
+            if notes:
+                lines.append(f"fetch notes ({self.notes_path}):")
+                lines += [f"  - {note}" for note in notes]
+            else:
+                lines.append("fetch notes: none")
+        lines.append(f"spend this process: ${spent:.2f} (the ceiling restarts on --resume)")
         text = "\n".join(lines)
         print(text)
         return _ok(text)
@@ -985,15 +1107,34 @@ def add_pr_stages(
     ci_timeout_minutes: int,
     budget_pipeline: Pipeline,
     auto: bool,
+    subject_prefix: str | None = None,
+    pipeline_name: str = PIPELINE,
+    resume_arg: str | None = None,
+    fetch_notes: FetchNotes | None = None,
+    notes_path: str | None = None,
 ) -> Pipeline:
-    """Add stages 69-82 (``check pr provenance`` … ``summary``); every one is ``always_run``."""
+    """Add stages 69-82 (``check pr provenance`` … ``summary``); every one is ``always_run``.
+
+    *key* feeds only the resume hints, and *resume_arg* (default: *key*)
+    replaces it there. *subject_prefix* (default: the file key) is what the PR
+    body refresh's Reword check expects. *pipeline_name* brands the notices,
+    the resume hints and the CI-fix children's notices. *fetch_notes* and
+    *notes_path* (both or neither) add the fetch notes to the ending stages.
+    """
     pr = pr_paths(paths)
     gate = running(pr)
+    resume = key if resume_arg is None else resume_arg
 
     # 69-72. Provenance, the wipe, the branch and the range.
     pipeline.stage(
         "check pr provenance",
-        CheckPrProvenance(paths=paths, project_dir=project_dir, key=key, auto=auto),
+        CheckPrProvenance(
+            paths=paths,
+            project_dir=project_dir,
+            key=resume,
+            auto=auto,
+            pipeline_name=pipeline_name,
+        ),
         on_failure=fail,
         always_run=True,
     )
@@ -1025,7 +1166,9 @@ def add_pr_stages(
     )
     pipeline.stage(
         "update pr body",
-        UpdatePrBody(paths=paths, project_dir=project_dir, publish=False),
+        UpdatePrBody(
+            paths=paths, project_dir=project_dir, publish=False, subject_prefix=subject_prefix
+        ),
         on_failure=fail,
         when=gate,
         always_run=True,
@@ -1070,6 +1213,7 @@ def add_pr_stages(
                 pipeline=budget_pipeline,
                 test_cmd_file=paths.test_cmd_sh,
                 ci_timeout_minutes=ci_timeout_minutes,
+                pipeline_name=pipeline_name,
             ),
             when=red,
             always_run=True,
@@ -1105,7 +1249,14 @@ def add_pr_stages(
     # 78-82. Stop, or announce.
     pipeline.stage(
         "stop for human",
-        StopForHuman(paths=paths, key=key, auto=auto),
+        StopForHuman(
+            paths=paths,
+            key=resume,
+            auto=auto,
+            pipeline_name=pipeline_name,
+            fetch_notes=fetch_notes,
+            notes_path=notes_path,
+        ),
         on_failure=fail,
         when=halted(pr),
         always_run=True,
@@ -1119,21 +1270,35 @@ def add_pr_stages(
     )
     pipeline.stage(
         "refresh pr body",
-        UpdatePrBody(paths=paths, project_dir=project_dir, publish=True),
+        UpdatePrBody(
+            paths=paths, project_dir=project_dir, publish=True, subject_prefix=subject_prefix
+        ),
         on_failure=fail,
         when=gate,
         always_run=True,
     )
     pipeline.stage(
         ANNOUNCE_STAGE,
-        AnnouncePrReady(paths=paths, project_dir=project_dir),
+        AnnouncePrReady(
+            paths=paths,
+            project_dir=project_dir,
+            pipeline_name=pipeline_name,
+            fetch_notes=fetch_notes,
+            notes_path=notes_path,
+        ),
         on_failure=fail,
         when=gate,
         always_run=True,
     )
     pipeline.stage(
         "summary",
-        RunSummary(paths=paths, project_dir=project_dir, base_file=base_file),
+        RunSummary(
+            paths=paths,
+            project_dir=project_dir,
+            base_file=base_file,
+            fetch_notes=fetch_notes,
+            notes_path=notes_path,
+        ),
         on_failure=fail,
         always_run=True,
     )
