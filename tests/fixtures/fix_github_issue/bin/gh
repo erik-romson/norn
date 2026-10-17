@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Test shim for gh, used by tests/test_github_fetch_script.py.
+#
+# Routes on argv (the fixture directory is the parent of bin/):
+#   api -H 'Accept: …full+json' repos/<o>/<r>/issues/<N>        -> <prefix>issue-<N>.json
+#   api -H 'Accept: …full+json' --paginate …/issues/<N>/comments -> <prefix>issue-<N>-comments-p*.json,
+#                                                                   concatenated as separate arrays
+#   api graphql -f query=… -f o=<o> -f r=<r> -F n=<N>            -> <prefix>issue-<N>-relations.json
+#   auth token                                                   -> test-token
+# <prefix> is empty for acme/app and "<o>-<r>-" for any other repository.
+#
+# Exits 2 when --hostname, -F o= or -F r= is used, or the Accept header or
+# --paginate is missing; exits 1 with a 404 message for a missing fixture.
+# GH_SHIM_FAIL=graphql|comments makes that call exit 1 ("API rate limit exceeded").
+# Every argv is appended as one line to $GH_SHIM_LOG when that is set.
+
+set -euo pipefail
+
+FIXTURE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ACCEPT='Accept: application/vnd.github.full+json'
+
+if [ -n "${GH_SHIM_LOG:-}" ]; then
+  line="$(printf '%s' "$*" | tr '\n' ' ')"
+  printf '%s\n' "$line" >>"$GH_SHIM_LOG"
+fi
+
+usage_error() {
+  echo "gh shim: $1" >&2
+  exit 2
+}
+
+not_found() {
+  echo "gh: Not Found (HTTP 404) [gh shim: no fixture $1]" >&2
+  exit 1
+}
+
+rate_limited() {
+  echo "gh: API rate limit exceeded" >&2
+  exit 1
+}
+
+prefix_for() {  # <owner> <repo>
+  if [ "$1/$2" = "acme/app" ]; then
+    echo ""
+  else
+    echo "$1-$2-"
+  fi
+}
+
+has_accept=0
+paginate=0
+route=""
+field_n=""
+field_o=""
+field_r=""
+prev=""
+for arg in "$@"; do
+  case "$arg" in
+    --hostname | --hostname=*) usage_error "--hostname must not be passed" ;;
+    --paginate) paginate=1 ;;
+    repos/*) route="$arg" ;;
+  esac
+  case "$prev" in
+    -H)
+      if [ "$arg" = "$ACCEPT" ]; then
+        has_accept=1
+      fi
+      ;;
+    -F | --field)
+      case "$arg" in
+        o=* | r=*) usage_error "-F $arg types the value; use -f for owner and repo" ;;
+        n=*) field_n="${arg#n=}" ;;
+      esac
+      ;;
+    -f | --raw-field)
+      case "$arg" in
+        o=*) field_o="${arg#o=}" ;;
+        r=*) field_r="${arg#r=}" ;;
+      esac
+      ;;
+  esac
+  prev="$arg"
+done
+
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  echo "test-token"
+  exit 0
+fi
+
+if [ "${1:-}" != "api" ]; then
+  usage_error "unsupported command: $*"
+fi
+
+if [ "${2:-}" = "graphql" ]; then
+  if [ "${GH_SHIM_FAIL:-}" = "graphql" ]; then
+    rate_limited
+  fi
+  if [ -z "$field_n" ]; then
+    usage_error "graphql call without -F n=<N>"
+  fi
+  if [ -z "$field_o" ] || [ -z "$field_r" ]; then
+    usage_error "graphql call without -f o= and -f r="
+  fi
+  fixture="$FIXTURE_DIR/$(prefix_for "$field_o" "$field_r")issue-$field_n-relations.json"
+  [ -f "$fixture" ] || not_found "$fixture"
+  cat "$fixture"
+  exit 0
+fi
+
+[ "$has_accept" = 1 ] || usage_error "REST call without -H '$ACCEPT'"
+
+IFS=/ read -r _repos owner repo _issues number rest <<EOF
+$route
+EOF
+prefix="$(prefix_for "$owner" "$repo")"
+
+if [ "${rest:-}" = "comments" ]; then
+  if [ "${GH_SHIM_FAIL:-}" = "comments" ]; then
+    rate_limited
+  fi
+  [ "$paginate" = 1 ] || usage_error "comments call without --paginate"
+  found=0
+  for page in "$FIXTURE_DIR/${prefix}issue-$number-comments-p"*.json; do
+    [ -f "$page" ] || continue
+    cat "$page"
+    printf '\n'
+    found=1
+  done
+  [ "$found" = 1 ] || not_found "$FIXTURE_DIR/${prefix}issue-$number-comments-p*.json"
+  exit 0
+fi
+
+if [ -z "${rest:-}" ] && [ -n "${number:-}" ]; then
+  fixture="$FIXTURE_DIR/${prefix}issue-$number.json"
+  [ -f "$fixture" ] || not_found "$fixture"
+  cat "$fixture"
+  exit 0
+fi
+
+usage_error "unsupported api route: $route"

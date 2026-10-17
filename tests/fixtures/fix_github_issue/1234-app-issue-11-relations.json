@@ -1,0 +1,22 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "issueType": null,
+        "parent": null,
+        "subIssues": {
+          "totalCount": 0,
+          "nodes": []
+        },
+        "closedByPullRequestsReferences": {
+          "totalCount": 0,
+          "nodes": []
+        },
+        "timelineItems": {
+          "totalCount": 0,
+          "nodes": []
+        }
+      }
+    }
+  }
+}

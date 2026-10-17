@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Test shim for curl, used by tests/test_github_fetch_script.py.
+#
+# Supports: -s -S -L (and combinations such as -sSL), --connect-timeout N,
+# --max-time N, -o FILE, -w FMT (with %{http_code}, %{content_type} and \n),
+# and -K - (a config on stdin; the only accepted line is
+# header = "Authorization: token test-token"). Any other flag exits 2, so a
+# stray -f, -H or --location-trusted fails loudly. stdin is read only for -K -.
+#
+# Logs to $CURL_SHIM_LOG, one printf per line so concurrent calls do not
+# interleave:
+#   ARGV <argv>                          on entry
+#   START <AUTH|NOAUTH> <max-time> <url> on entry
+#   END <url>                            on exit
+#
+# Routes are keyed by URL (see route below). A URL that still holds "&amp;"
+# exits 3, and an unknown URL exits 22.
+
+set -euo pipefail
+
+log() {
+  if [ -n "${CURL_SHIM_LOG:-}" ]; then
+    printf '%s\n' "$1" >>"$CURL_SHIM_LOG"
+  fi
+}
+
+usage_error() {
+  echo "curl shim: $1" >&2
+  exit 2
+}
+
+log "ARGV $(printf '%s' "$*" | tr '\n' ' ')"
+
+out_file=""
+write_out=""
+max_time="-"
+read_config=0
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --connect-timeout)
+      [ "$#" -ge 2 ] || usage_error "--connect-timeout needs a value"
+      shift 2
+      ;;
+    --max-time)
+      [ "$#" -ge 2 ] || usage_error "--max-time needs a value"
+      max_time="$2"
+      shift 2
+      ;;
+    -o)
+      [ "$#" -ge 2 ] || usage_error "-o needs a value"
+      out_file="$2"
+      shift 2
+      ;;
+    -w)
+      [ "$#" -ge 2 ] || usage_error "-w needs a value"
+      write_out="$2"
+      shift 2
+      ;;
+    -K)
+      [ "${2:-}" = "-" ] || usage_error "only -K - is supported"
+      read_config=1
+      shift 2
+      ;;
+    -?*)
+      flags="${1#-}"
+      case "$flags" in
+        *[!sSL]*) usage_error "unsupported flag $1" ;;
+      esac
+      shift
+      ;;
+    *)
+      [ -z "$url" ] || usage_error "more than one URL: $url $1"
+      url="$1"
+      shift
+      ;;
+  esac
+done
+[ -n "$url" ] || usage_error "no URL"
+
+auth="NOAUTH"
+if [ "$read_config" = 1 ]; then
+  config="$(cat)"
+  if [ "$config" != 'header = "Authorization: token test-token"' ]; then
+    usage_error "unexpected -K - config"
+  fi
+  auth="AUTH"
+fi
+
+log "START $auth $max_time $url"
+trap 'log "END $url"' EXIT
+
+# finish <http_code> <content_type> <body>: write the body and the -w output.
+finish() {
+  if [ -n "$out_file" ]; then
+    printf '%b' "$3" >"$out_file"
+  fi
+  if [ -n "$write_out" ]; then
+    printf '%b' "$(printf '%s' "$write_out" | sed -e "s|%{http_code}|$1|g" -e "s|%{content_type}|$2|g")"
+  fi
+}
+
+# fail <exit code> <message>: curl's own error, with -w reporting no response.
+fail() {
+  if [ -n "$write_out" ]; then
+    printf '%b' "$(printf '%s' "$write_out" | sed -e "s|%{http_code}|000|g" -e "s|%{content_type}||g")"
+  fi
+  echo "curl: ($1) $2" >&2
+  exit "$1"
+}
+
+case "$url" in
+  *'&amp;'*) fail 3 "URL using bad/illegal format (undecoded &amp;): $url" ;;
+esac
+
+PNG='\211PNG\r\n\032\nfake png bytes'
+UUID_1='11111111-1111-4111-8111-111111111111'
+UUID_3='33333333-3333-4333-8333-333333333333'
+UUID_STALL='57a11000-5555-4555-8555-555555555555'
+
+case "$url" in
+  "https://github.com/user-attachments/assets/$UUID_1" | \
+    "https://github.com/user-attachments/assets/$UUID_3" | \
+    "https://private-user-images.githubusercontent.com/"*"/"*"-$UUID_1.png?jwt=x")
+    finish 200 image/png "$PNG"
+    ;;
+  "https://private-user-images.githubusercontent.com/"*"/"*"-$UUID_STALL.png?jwt=x")
+    sleep 2
+    fail 28 "Operation timed out after 2000 milliseconds with 0 bytes received"
+    ;;
+  "https://github.com/user-attachments/files/"*"/report.pdf" | \
+    "https://github.com/user-attachments/files/"*"/report.pdf?"*)
+    finish 200 application/pdf '%PDF-1.4 fake pdf bytes\n'
+    ;;
+  */dead.png)
+    finish 404 'text/plain; charset=utf-8' 'Not Found'
+    ;;
+  */login-page)
+    finish 200 'text/html; charset=utf-8' '<html><body>Sign in</body></html>\n'
+    ;;
+  */hang)
+    fail 28 "Operation timed out after 600000 milliseconds with 0 bytes received"
+    ;;
+  *)
+    fail 22 "The requested URL returned error: 404 (unknown fixture URL: $url)"
+    ;;
+esac

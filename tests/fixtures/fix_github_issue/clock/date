@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Test shim for date, used by tests/test_github_fetch_script.py (signed-URL window test).
+#
+# Answers `date +%s` with 1000 on its first call and 1241 on every later call,
+# so 241 s seem to pass after the script records T0. The call count is kept in
+# the file named by $DATE_SHIM_STATE. Any other argument exits 2.
+
+set -euo pipefail
+
+if [ "$#" -ne 1 ] || [ "$1" != "+%s" ]; then
+  echo "date shim: only 'date +%s' is supported (got: $*)" >&2
+  exit 2
+fi
+
+state="${DATE_SHIM_STATE:?date shim: DATE_SHIM_STATE is not set}"
+if [ -s "$state" ]; then
+  echo 1241
+else
+  echo called >"$state"
+  echo 1000
+fi

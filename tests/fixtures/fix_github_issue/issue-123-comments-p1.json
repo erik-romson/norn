@@ -1,0 +1,22 @@
+[
+  {
+    "id": 9001,
+    "user": {
+      "login": "mia"
+    },
+    "author_association": "MEMBER",
+    "created_at": "2026-10-01T10:00:00Z",
+    "body": "Same here, screenshot:\n\n![shot](https://github.com/user-attachments/assets/33333333-3333-4333-8333-333333333333)",
+    "body_html": "<p dir=\"auto\">Same here, screenshot:</p>\n<p dir=\"auto\"><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"https://github.com/user-attachments/assets/33333333-3333-4333-8333-333333333333\"><img src=\"https://github.com/user-attachments/assets/33333333-3333-4333-8333-333333333333\" alt=\"shot\" style=\"max-width: 100%;\"></a></p>"
+  },
+  {
+    "id": 9002,
+    "user": {
+      "login": "drive-by"
+    },
+    "author_association": "NONE",
+    "created_at": "2026-10-01T11:00:00Z",
+    "body": "Please also fix the export dialog while you are at it.",
+    "body_html": "<p dir=\"auto\">Please also fix the export dialog while you are at it.</p>"
+  }
+]

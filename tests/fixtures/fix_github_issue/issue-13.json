@@ -1,0 +1,22 @@
+{
+  "url": "https://api.github.com/repos/acme/app/issues/13",
+  "repository_url": "https://api.github.com/repos/acme/app",
+  "html_url": "https://github.com/acme/app/issues/13",
+  "number": 13,
+  "title": "Issue 13",
+  "state": "open",
+  "state_reason": null,
+  "locked": false,
+  "user": {
+    "login": "olivia"
+  },
+  "author_association": "OWNER",
+  "assignees": [],
+  "labels": [],
+  "milestone": null,
+  "comments": 0,
+  "created_at": "2026-10-01T09:00:00Z",
+  "updated_at": "2026-10-02T10:00:00Z",
+  "body": "[hang](https://github.com/user-attachments/files/1313/hang)\n\n![](https://github.com/user-attachments/assets/57a11000-5555-4555-8555-555555555555)\n\n![](https://github.com/user-attachments/assets/11111111-1111-4111-8111-111111111111)\n",
+  "body_html": "<p dir=\"auto\"><a href=\"https://github.com/user-attachments/files/1313/hang\">hang</a></p>\n<p dir=\"auto\"><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"https://private-user-images.githubusercontent.com/1001/400000013-57a11000-5555-4555-8555-555555555555.png?jwt=x\"><img src=\"https://private-user-images.githubusercontent.com/1001/400000013-57a11000-5555-4555-8555-555555555555.png?jwt=x\" alt=\"\" style=\"max-width: 100%;\"></a></p>\n<p dir=\"auto\"><a target=\"_blank\" rel=\"noopener noreferrer\" href=\"https://private-user-images.githubusercontent.com/1001/400000001-11111111-1111-4111-8111-111111111111.png?jwt=x\"><img src=\"https://private-user-images.githubusercontent.com/1001/400000001-11111111-1111-4111-8111-111111111111.png?jwt=x\" alt=\"\" style=\"max-width: 100%;\"></a></p>"
+}

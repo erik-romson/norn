@@ -1,0 +1,83 @@
+{
+  "data": {
+    "repository": {
+      "issue": {
+        "issueType": {
+          "name": "Bug"
+        },
+        "parent": {
+          "number": 100,
+          "title": "Editor stability",
+          "state": "OPEN",
+          "repository": {
+            "nameWithOwner": "acme/app"
+          }
+        },
+        "subIssues": {
+          "totalCount": 2,
+          "nodes": [
+            {
+              "number": 124,
+              "title": "Save handler null check",
+              "state": "OPEN",
+              "repository": {
+                "nameWithOwner": "acme/app"
+              }
+            },
+            {
+              "number": 125,
+              "title": "Autosave race",
+              "state": "CLOSED",
+              "repository": {
+                "nameWithOwner": "acme/app"
+              }
+            }
+          ]
+        },
+        "closedByPullRequestsReferences": {
+          "totalCount": 1,
+          "nodes": [
+            {
+              "number": 130,
+              "title": "Fix crash on save",
+              "state": "OPEN",
+              "repository": {
+                "nameWithOwner": "acme/app"
+              }
+            }
+          ]
+        },
+        "timelineItems": {
+          "totalCount": 3,
+          "nodes": [
+            {
+              "source": null
+            },
+            {
+              "source": {
+                "__typename": "PullRequest",
+                "number": 130,
+                "title": "Fix crash on save",
+                "state": "OPEN",
+                "repository": {
+                  "nameWithOwner": "acme/app"
+                }
+              }
+            },
+            {
+              "source": {
+                "__typename": "Issue",
+                "number": 140,
+                "title": "Export dialog freezes",
+                "state": "CLOSED",
+                "repository": {
+                  "nameWithOwner": "other/lib"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

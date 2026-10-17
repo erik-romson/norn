@@ -1,0 +1,22 @@
+{
+  "url": "https://api.github.com/repos/acme/app/issues/9",
+  "repository_url": "https://api.github.com/repos/acme/app",
+  "html_url": "https://github.com/acme/app/issues/9",
+  "number": 9,
+  "title": "Issue 9",
+  "state": "open",
+  "state_reason": null,
+  "locked": false,
+  "user": {
+    "login": "olivia"
+  },
+  "author_association": "OWNER",
+  "assignees": [],
+  "labels": [],
+  "milestone": null,
+  "comments": 0,
+  "created_at": "2026-10-01T09:00:00Z",
+  "updated_at": "2026-10-02T10:00:00Z",
+  "body": "[dead.png](https://github.com/user-attachments/files/909/dead.png)\n[login-page](https://github.com/user-attachments/files/910/login-page)\n[hang](https://github.com/user-attachments/files/911/hang)\n",
+  "body_html": "<p dir=\"auto\"><a href=\"https://github.com/user-attachments/files/909/dead.png\">dead.png</a>\n<a href=\"https://github.com/user-attachments/files/910/login-page\">login-page</a>\n<a href=\"https://github.com/user-attachments/files/911/hang\">hang</a></p>"
+}
