@@ -585,6 +585,85 @@ or delete it, then `[r]etry`).
   because v3's history includes child spend. Compare with `--group` excluding
   `implement` and `fix ci <n>`, or add v2's child history.
 
+### fix_issue_v1
+
+A copy of [`fix_jira_issue_v3`](#fix_jira_issue_v3) that takes an issue from
+either source to an open **draft** PR with green checks. It is meant to replace
+`fix_jira_issue_v3`, which is unchanged. After the fetch nothing in the flow
+depends on the source: the gates, the child run, the code review, the ship and
+PR phases are v3's. See `fix_jira_issue_v3` for the gates, knobs, artifacts and
+resume.
+
+```bash
+norn run fix_issue_v1 123                                       # issue 123 of the launch repo (origin)
+norn run fix_issue_v1 '#123' auto                               # same issue; quote it
+norn run fix_issue_v1 other/lib#45                              # a repo and an issue number
+norn run fix_issue_v1 https://github.com/other/lib/issues/45    # the same issue by URL
+norn run fix_issue_v1 CBS-1234                                  # a Jira issue, as fix_jira_issue_v3 does it
+```
+
+**Reference forms.** Quote `'#123'`: an unquoted `#` starts a shell comment (and
+in zsh with `extendedglob` a `#` inside a word is special too), so quoting is
+always safe. Put the issue before `--require-quota`, which would otherwise take
+`123` as its value. GitHub shapes are checked before Jira. A bare number is an
+issue of the launch repo's `origin`, read with `git remote get-url origin`
+(local, no network). A pull request URL, no reference and two references are
+refused.
+
+**Names by source** (origin `https://github.com/acme/app.git`):
+
+| | Jira `CBS-1234` | GitHub, same repo (`123`, `'#123'`, `acme/app#123`) | GitHub, other repo (`other/lib#45`) |
+|---|---|---|---|
+| directory | `tmp/jira/CBS-1234/` | `tmp/github/123/` | `tmp/github/other-lib-45-2b9ddc19/` |
+| file key | `CBS-1234` | `issue-123` | `issue-other-lib-45-2b9ddc19` |
+| branch | `CBS-1234` | `issue-123` | `issue-other-lib-45-2b9ddc19` |
+| commit / PR-title prefix | `CBS-1234` | `#123` | `other/lib#45` |
+| PR body first line | `Jira: …` | `Closes #123 — <title>` | `Closes other/lib#45 — <title>` |
+
+An other-repo slug ends in an 8-hex digest so that look-alike repositories
+(`a-b/c#1` and `a/b-c#1`) never share a directory or branch.
+
+**Branches.** A GitHub run always works on its own branch `issue-<slug>` (or
+`--arg branch=<name>`): it creates or switches to it and never adopts the branch
+it starts on. Start from the base branch or pass `--arg branch=`, because
+commits already on the starting branch end up before `base.sha`. Jira keeps v3's
+rule: a current branch that contains the key is reused.
+
+**Prerequisites.**
+- `gh auth login` with push rights.
+- For a GitHub Enterprise host, `GH_HOST` (and `GH_ENTERPRISE_TOKEN`). One host
+  per run; the launch repo's origin must be on that host too. An SSH origin's
+  host is read with `ssh -G`, so an alias in `~/.ssh/config` works.
+- `JIRA_AUTH`/`JIRA_BASE` for Jira.
+- A gitignored `tmp/github/` or `tmp/jira/`. Add `tmp/github/` or `tmp/jira/` to
+  `.git/info/exclude` (the preflight prints the exact line).
+- No `commit.cleanup=strip` for `#123` prefixes.
+
+**Attachments** are downloaded from the issue's rendered `body_html`. Signed
+image and video URLs expire after 300 s, so they are started first and together.
+Private files use the `gh` token. Files on a GitHub Enterprise host are not
+downloaded. An attachment that does not download is recorded and the run
+continues.
+
+**Fetch notes.** A GitHub fetch reports: a closed issue, open linked PRs,
+attachments not downloaded, authors without write access, removed hidden HTML
+comments, and title matches (a closing keyword, a mention, an attribution
+line). They appear in five places: `issue.md` (`## Fetch notes`), the
+`fetch issue` stage output, the PR body's `## For the human` list (PR-safe
+wording; the title is not quoted), the `Stopped`/`PR ready` notifications
+(a count), and the `summary` stage. They never stop a run. A Jira run has none.
+
+**Notes.**
+- `Closes` closes the issue only when the PR merges into the default branch;
+  across repositories it needs rights there.
+- `auto` on an issue written by people without write access is a
+  prompt-injection risk: the issue text reaches the agents. Read the fetch notes
+  first.
+- Do not run `fix_issue_v1` and `fix_jira_issue_v3` on one Jira key: they share
+  `tmp/jira/<KEY>/` and the branch.
+- `norn compare fix_issue_v1 fix_jira_issue_v3` mixes GitHub and Jira runs in
+  its totals; `record run identity` stores `kind` for a later filter.
+
 ### check_and_fix_ci_v2
 
 Pushes the current branch, waits for CI, and feeds the failing GitHub Actions
