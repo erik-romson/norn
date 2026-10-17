@@ -530,3 +530,107 @@ def test_metrics_accept_a_command_stage_with_child_usage(tmp_path):
     metrics = compute_metrics(rd)
 
     assert metrics.cost_usd == pytest.approx(6.09)
+
+
+# ---------------------------------------------------------------------------
+# fix_issue_v1 additions: pipeline name and artifact directory
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rewritten_marker_error_names_the_art_dir(repo, notices):
+    marker = repo / "rewritten"
+    marker.write_text("x")
+    stage = RunChildPipelineV3(
+        cmd="true",
+        pipeline=Pipeline("parent"),
+        runs_dir=str(repo / "implement_features_v3.runs"),
+        rewritten_marker=str(marker),
+        art_dir="/x/tmp/github/123/",
+    )
+
+    result = await stage.run(_ctx())
+
+    assert result.success is False
+    assert "delete /x/tmp/github/123/ and start from a fresh branch." in result.error
+    assert "tmp/jira" not in result.error
+
+
+@pytest.mark.asyncio
+async def test_rewritten_marker_error_default_keeps_the_jira_text(repo, notices):
+    marker = repo / "rewritten"
+    marker.write_text("x")
+
+    result = await _stage(repo, "true", marker=str(marker)).run(_ctx())
+
+    assert "delete tmp/jira/<KEY>/ and start from a fresh branch." in result.error
+
+
+@pytest.mark.asyncio
+async def test_budget_notice_carries_a_non_default_pipeline_name(repo, monkeypatch):
+    calls: list[tuple[str, str, dict]] = []
+
+    async def fake_notify(title, detail, **kwargs):
+        calls.append((title, detail, kwargs))
+
+    monkeypatch.setattr(_child_cost_v3, "notify", fake_notify)
+    runs = _existing_run_six(repo)
+    cmd = _child_script(repo, runs, _payload(repo, cost=6.09), exit_code=0)
+    stage = RunChildPipelineV3(
+        cmd=cmd,
+        pipeline=Pipeline("parent").budget(max_cost_usd=10.0),
+        runs_dir=str(repo / "implement_features_v3.runs"),
+        rewritten_marker=str(repo / "rewritten"),
+        pipeline_name="fix_issue_v1",
+    )
+    ctx = _ctx()
+    ctx.usage_tracker.add(UsageRecord(stage_name="plan", total_cost_usd=5.0))
+
+    await stage.run(ctx)
+
+    assert len(calls) == 1
+    assert calls[0][2] == {"pipeline": "fix_issue_v1"}
+
+
+@pytest.mark.asyncio
+async def test_budget_notice_default_still_works_with_a_two_argument_fake(repo, notices):
+    runs = _existing_run_six(repo)
+    cmd = _child_script(repo, runs, _payload(repo, cost=6.09), exit_code=0)
+    ctx = _ctx()
+    ctx.usage_tracker.add(UsageRecord(stage_name="plan", total_cost_usd=5.0))
+
+    await _stage(repo, cmd, ceiling=10.0).run(ctx)
+
+    assert [n[0] for n in notices] == ["Budget reached"]
+
+
+@pytest.mark.asyncio
+async def test_ci_child_budget_notice_carries_a_non_default_pipeline_name(tmp_path, monkeypatch):
+    calls: list[dict] = []
+
+    async def fake_notify(title, detail, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(_child_cost_v3, "notify", fake_notify)
+    paths = _merge_state.MergePaths(str(tmp_path / "norn-work"))
+    Path(paths.root).mkdir(parents=True, exist_ok=True)
+    Path(paths.ci_fix_workflows(1)).write_text("ci.yml\n")
+    stage = CiFixChildV3(
+        paths=paths,
+        stage="fix ci 1",
+        n=1,
+        project_dir=str(tmp_path),
+        pipeline=Pipeline("parent").budget(max_cost_usd=10.0),
+        test_cmd_file=str(tmp_path / "test-cmd"),
+        ci_timeout_minutes=60,
+        pipeline_name="fix_issue_v1",
+    )
+    runs = tmp_path / "check_and_fix_ci_v2.runs"
+    (runs / "6").mkdir(parents=True)
+    stage._build_cmd = lambda ctx: _child_script(tmp_path, runs, _payload(tmp_path), exit_code=0)
+    ctx = _ctx()
+    ctx.usage_tracker.add(UsageRecord(stage_name="x", total_cost_usd=5.0))
+
+    await stage.run(ctx)
+
+    assert calls == [{"pipeline": "fix_issue_v1"}]

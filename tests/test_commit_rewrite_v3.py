@@ -597,3 +597,27 @@ def test_the_script_imports_nothing_from_norn():
             assert not (node.module or "").startswith("norn"), node.module
         elif isinstance(node, ast.Import):
             assert not any(alias.name.startswith("norn") for alias in node.names)
+
+
+_GITHUB_CASES = [
+    ("#123", "#123: add x"),
+    ("#123", "#1234: add x"),
+    ("#123", "#123:add x"),
+    ("#123", "#123: Add x"),
+    ("#123", "123: add x"),
+    ("acme/my.repo#5", "acme/my.repo#5: add x"),
+    ("acme/my.repo#5", "acme/myXrepo#5: add x"),
+    ("acme/my.repo#5", "acme/my.repo#5: " + "a" * (73 - len("acme/my.repo#5: "))),
+]
+
+
+def test_local_subject_rules_agree_for_github_prefixes():
+    for prefix, message in _GITHUB_CASES:
+        assert rewrite.subject_problems(message, prefix) == _fix_jira_v3.subject_problems(
+            message, prefix
+        ), message
+    assert len(_GITHUB_CASES[-1][1]) == 73
+    for prefix, message in (_GITHUB_CASES[0], _GITHUB_CASES[5]):
+        assert rewrite.subject_problems(message, prefix) == []
+    for prefix, message in _GITHUB_CASES[1:5] + _GITHUB_CASES[6:]:
+        assert rewrite.subject_problems(message, prefix), message

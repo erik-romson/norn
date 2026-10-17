@@ -421,3 +421,72 @@ async def test_notify_uses_pipeline_name(monkeypatch):
     assert sent[0].title == "PR ready"
     assert "CBS-1 is ready" in sent[0].body
     assert v3.PIPELINE == "fix_jira_issue_v3"
+
+
+# ---------------------------------------------------------------------------
+# fix_issue_v1 additions: pipeline name, run kind, base hint, prefixes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_notify_accepts_another_pipeline_name(monkeypatch):
+    sent = []
+
+    async def fake_fire(self, msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(AlertManager, "fire", fake_fire)
+    await notify("PR ready", "x", pipeline="fix_issue_v1")
+    assert len(sent) == 1
+    assert sent[0].pipeline_name == "fix_issue_v1"
+
+
+@pytest.mark.asyncio
+async def test_record_run_identity_kind(repo):
+    result = await RecordRunIdentity("acme/app#123", str(repo), kind="github").run(PipelineContext())
+    assert result.output == {"issue": "acme/app#123", "branch": "feat/x", "kind": "github"}
+
+
+@pytest.mark.asyncio
+async def test_record_run_identity_without_kind_has_two_keys(repo):
+    result = await RecordRunIdentity("CBS-1", str(repo)).run(PipelineContext())
+    assert set(result.output) == {"issue", "branch"}
+
+
+@pytest.mark.asyncio
+async def test_identity_stale_base_names_the_base_hint(repo):
+    base = repo / "base.sha"
+    hint = "/abs/tmp/github/123/base.sha"
+    stage = CheckRunIdentity("CBS-1", str(repo), str(base), base_hint=hint)
+    base.write_text(_git(repo, "rev-parse", "HEAD"))
+    _commit(repo, "b.txt")
+    _git(repo, "push", "origin", "feat/x:develop")
+    result = await stage.run(_ctx({"issue": "CBS-1", "branch": "feat/x"}))
+    assert not result.success
+    assert result.error.splitlines()[-1] == f"Delete {hint} and start from a fresh branch."
+    assert "tmp/jira" not in result.error
+
+
+@pytest.mark.asyncio
+async def test_identity_stale_base_without_hint_keeps_the_jira_text(repo):
+    stage, base = _identity_stage(repo)
+    base.write_text(_git(repo, "rev-parse", "HEAD"))
+    _commit(repo, "b.txt")
+    _git(repo, "push", "origin", "feat/x:develop")
+    result = await stage.run(_ctx({"issue": "CBS-1", "branch": "feat/x"}))
+    assert result.error.splitlines()[-1] == (
+        "Delete tmp/jira/CBS-1/base.sha and start from a fresh branch."
+    )
+
+
+def test_subject_problems_with_a_same_repo_prefix():
+    assert v3.subject_problems("#123: add x", "#123") == []
+    for bad in ("#1234: add x", "#123:add x", "#123: Add x", "123: add x"):
+        assert v3.subject_problems(bad, "#123"), bad
+
+
+def test_subject_problems_with_an_owner_repo_prefix():
+    key = "acme/my.repo#5"
+    assert v3.subject_problems(f"{key}: add x", key) == []
+    assert v3.subject_problems("acme/myXrepo#5: add x", key)
+    assert v3.subject_problems(f"{key}: " + "a" * (73 - len(key) - 2), key)

@@ -427,8 +427,8 @@ test_steps.__test__ = False  # type: ignore[attr-defined]
 class _Notice(AlertMessage):
     """An ``AlertMessage`` whose ``title`` is an explicit heading."""
 
-    def __init__(self, heading: str, detail: str) -> None:
-        super().__init__(event=AlertEvent.COMPLETE, pipeline_name=PIPELINE, detail=detail)
+    def __init__(self, heading: str, detail: str, pipeline: str = PIPELINE) -> None:
+        super().__init__(event=AlertEvent.COMPLETE, pipeline_name=pipeline, detail=detail)
         self._heading = heading
 
     @property
@@ -436,10 +436,10 @@ class _Notice(AlertMessage):
         return self._heading
 
 
-async def notify(title: str, detail: str) -> None:
-    """Fire an in-run notification branded ``fix_jira_issue_v3``."""
+async def notify(title: str, detail: str, *, pipeline: str = PIPELINE) -> None:
+    """Fire an in-run notification branded with *pipeline* (default ``fix_jira_issue_v3``)."""
     manager = AlertManager(channels=[MacOSChannel()])
-    await manager.fire(_Notice(title, detail))
+    await manager.fire(_Notice(title, detail, pipeline))
 
 
 # ---------------------------------------------------------------------------
@@ -494,9 +494,10 @@ class RecordRunIdentity(BaseStage):
 
     needs_agent = False
 
-    def __init__(self, key: str, project_dir: str) -> None:
+    def __init__(self, key: str, project_dir: str, kind: str | None = None) -> None:
         self._key = key
         self._project_dir = project_dir
+        self._kind = kind
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         proc = _git(self._project_dir, "symbolic-ref", "--short", "HEAD")
@@ -510,11 +511,10 @@ class RecordRunIdentity(BaseStage):
                     "Switch to the issue branch, then rerun.",
                 ),
             )
-        return StageResult(
-            name="",
-            success=True,
-            output={"issue": self._key, "branch": proc.stdout.strip()},
-        )
+        output = {"issue": self._key, "branch": proc.stdout.strip()}
+        if self._kind is not None:
+            output["kind"] = self._kind
+        return StageResult(name="", success=True, output=output)
 
 
 class CheckRunIdentity(BaseStage):
@@ -528,11 +528,13 @@ class CheckRunIdentity(BaseStage):
         project_dir: str,
         base_file: str,
         record_stage: str = "record run identity",
+        base_hint: str | None = None,
     ) -> None:
         self._key = key
         self._project_dir = project_dir
         self._base_file = base_file
         self._record_stage = record_stage
+        self._base_hint = base_hint
 
     def _fail(self, summary: str, items: list[str], action: str) -> StageResult:
         return StageResult(
@@ -613,6 +615,10 @@ class CheckRunIdentity(BaseStage):
                 return self._fail(
                     f"base.sha is stale: {ref} already contains {first[:7]}",
                     [],
-                    f"Delete tmp/jira/{self._key}/base.sha and start from a fresh branch.",
+                    (
+                        f"Delete tmp/jira/{self._key}/base.sha and start from a fresh branch."
+                        if self._base_hint is None
+                        else f"Delete {self._base_hint} and start from a fresh branch."
+                    ),
                 )
         return StageResult(name="", success=True)

@@ -26,7 +26,7 @@ from typing import Any
 from norn.dsl import Pipeline
 from norn.models import PipelineContext, StageResult, UsageRecord
 from norn.pipelines._child_run import failed_stage_error, latest_run_dir
-from norn.pipelines._fix_jira_v3 import notify
+from norn.pipelines._fix_jira_v3 import PIPELINE, notify
 from norn.pipelines._merge_gh import CiFixChild, ci_fix_child_cmd
 from norn.pipelines._merge_state import MergePaths
 from norn.stages.run_command import RunCommand
@@ -164,6 +164,14 @@ def _lowest_limit(pipeline: Pipeline) -> float | None:
     return min(limits) if limits else None
 
 
+async def _notify(title: str, detail: str, pipeline: str) -> None:
+    """Send *title*/*detail*; the default pipeline name keeps the two-argument call."""
+    if pipeline == PIPELINE:
+        await notify(title, detail)
+    else:
+        await notify(title, detail, pipeline=pipeline)
+
+
 async def _attach_cost(
     result: StageResult,
     *,
@@ -171,6 +179,7 @@ async def _attach_cost(
     pipeline: Pipeline,
     ctx: PipelineContext,
     child: str,
+    pipeline_name: str = PIPELINE,
 ) -> StageResult:
     """Attach the child's usage to *result*, note it in the output, and notify
     when the child's cost takes the run past its ceiling.  Raises
@@ -185,9 +194,10 @@ async def _attach_cost(
     if usage is not None and limit is not None:
         total = (ctx.usage_tracker.total_cost_usd or 0.0) + usage.total_cost_usd
         if total > limit:
-            await notify(
+            await _notify(
                 "Budget reached",
                 f"{child} brought this run to ${total:.2f} of its ${limit:.2f} ceiling",
+                pipeline_name,
             )
     return result
 
@@ -204,8 +214,12 @@ class RunChildPipelineV3(RunCommand):
         runs_dir: str,
         rewritten_marker: str,
         timeout: float | None = None,
+        pipeline_name: str = PIPELINE,
+        art_dir: str | None = None,
     ) -> None:
         super().__init__(cmd=cmd, timeout=timeout)
+        self._pipeline_name = pipeline_name
+        self._art_dir = art_dir
         self._base_cmd = cmd
         self._pipeline = pipeline
         self._runs_dir = Path(runs_dir)
@@ -216,13 +230,14 @@ class RunChildPipelineV3(RunCommand):
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         if self._rewritten_marker.exists():
+            art = "tmp/jira/<KEY>/" if self._art_dir is None else self._art_dir
             return StageResult(
                 name="",
                 success=False,
                 error=(
                     "implement: this branch was already rewritten into house-style commits; "
                     "a fresh run would re-implement every step.\n"
-                    "Resume the earlier run with --resume, or delete tmp/jira/<KEY>/ "
+                    f"Resume the earlier run with --resume, or delete {art} "
                     "and start from a fresh branch."
                 ),
             )
@@ -234,7 +249,12 @@ class RunChildPipelineV3(RunCommand):
         child = self._runs_dir.name.removesuffix(".runs")
         try:
             result = await _attach_cost(
-                result, run_dir=run_dir, pipeline=self._pipeline, ctx=ctx, child=child
+                result,
+                run_dir=run_dir,
+                pipeline=self._pipeline,
+                ctx=ctx,
+                child=child,
+                pipeline_name=self._pipeline_name,
             )
             if not result.success:
                 diagnosis = child_diagnosis(run_dir, str(self._runs_dir.parent), child=child)
@@ -260,7 +280,9 @@ class CiFixChildV3(CiFixChild):
         pipeline: Pipeline,
         test_cmd_file: str,
         ci_timeout_minutes: int,
+        pipeline_name: str = PIPELINE,
     ) -> None:
+        self._pipeline_name = pipeline_name
         self._test_cmd_file = test_cmd_file
         self._ci_timeout_minutes = ci_timeout_minutes
         super().__init__(
@@ -295,6 +317,7 @@ class CiFixChildV3(CiFixChild):
                 pipeline=self._pipeline,
                 ctx=ctx,
                 child=self._ci_pipeline,
+                pipeline_name=self._pipeline_name,
             )
         except ChildCostError as exc:
             return StageResult(name="", success=False, output=result.output, error=str(exc))
