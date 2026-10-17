@@ -22,6 +22,7 @@ Run with::
     norn run check_and_fix_ci_v2 --arg workflow=ci.yml,release.yml
     norn run check_and_fix_ci_v2 --arg test_cmd="uv run python -m pytest tests/test_runner.py -v"
     norn run check_and_fix_ci_v2 --arg skip_local=true
+    norn run check_and_fix_ci_v2 --arg ci_timeout_minutes=60
 
 Set ``FIX_CI_LOOP_VERBOSE=1`` to dump full extracted CI logs to stderr.
 
@@ -140,6 +141,8 @@ MIN_USEFUL_LOG_CHARS = 80
 
 MAX_FIX_ATTEMPTS = 3
 
+DEFAULT_CI_TIMEOUT_MINUTES = 20
+
 VERBOSE = os.environ.get("FIX_CI_LOOP_VERBOSE", "").lower() in ("1", "true", "yes")
 
 metadata = {
@@ -151,6 +154,9 @@ metadata = {
         ),
         "test_cmd": "Local test command (default: auto-detected from project markers)",
         "skip_local": "Set to true to skip the local test loop and go straight to CI",
+        "ci_timeout_minutes": (
+            "Minutes to wait for each workflow run before giving up (default: 20)"
+        ),
         "app_packages": (
             "Comma-separated app package globs for the Surefire log compressor "
             "(e.g. 'com.e4marine.*,com.wilhelmsen.*'). Frames matching these "
@@ -193,6 +199,16 @@ LOCAL_TEST_CMD = (
     or detect_test_cmd(PROJECT_DIR)
 )
 SKIP_LOCAL = _args.get("skip_local", "false").lower() in ("1", "true", "yes")
+
+
+def _positive_int_arg(name: str, default: int) -> int:
+    raw = _args.get(name, str(default)).strip()
+    if not raw.isdigit() or int(raw) < 1:
+        raise ValueError(f"--arg {name}: must be a positive whole number, got {raw!r}")
+    return int(raw)
+
+
+CI_TIMEOUT_MINUTES = _positive_int_arg("ci_timeout_minutes", DEFAULT_CI_TIMEOUT_MINUTES)
 
 # Model selection — both fix stages do code reasoning over a failure
 # trace and produce edits across multiple files, so Sonnet is the right
@@ -297,7 +313,8 @@ class CheckCIWithLogs(BaseStage):
     the FIRST one that isn't green so the fix prompt has a single failure
     to focus on. Aborts the loop when a NEW run produces byte-identical
     logs to the previous run — the fix made no progress, retrying would
-    just burn tokens.
+    just burn tokens. Also aborts when the poll times out: a run that is
+    still going has not failed, so there are no logs to fix.
 
     Emits the raw failure log verbatim. Compression (format-aware
     extract + Haiku for surefire) is the responsibility of a downstream
@@ -350,6 +367,18 @@ class CheckCIWithLogs(BaseStage):
 
             if result.success:
                 continue
+
+            if output.get("timed_out"):
+                msg = (
+                    f"{result.error} Watched for {workflow}: "
+                    f"{output.get('name')} run {run_id} ({url}). The run has "
+                    "not failed, so there is nothing to fix. Rerun once it "
+                    "finishes, or raise --arg ci_timeout_minutes."
+                )
+                raise PipelineError(
+                    "check ci",
+                    StageResult(name="check ci", success=False, error=msg),
+                )
 
             if VERBOSE:
                 print(
@@ -444,16 +473,22 @@ class AssertFixProducedDiff(BaseStage):
         self.project_dir = project_dir
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
-        unstaged_rc, _ = await _capture(
-            "git", "-C", self.project_dir, "diff", "--quiet",
+        # `git status --porcelain` lists new files too, matching the
+        # `git add -A` the commit stage runs; `git diff` would call a fix
+        # that only adds a file "no edits".
+        rc, status = await _capture(
+            "git", "-C", self.project_dir, "status", "--porcelain",
         )
-        staged_rc, _ = await _capture(
-            "git", "-C", self.project_dir, "diff", "--cached", "--quiet",
-        )
-
-        # `git diff --quiet` exits 0 when there are no changes, 1 when
-        # there are. Both clean → fix stage made no edits.
-        if unstaged_rc == 0 and staged_rc == 0:
+        if rc != 0:
+            raise PipelineError(
+                "assert fix produced diff",
+                StageResult(
+                    name="assert fix produced diff",
+                    success=False,
+                    error=f"git status failed in {self.project_dir}",
+                ),
+            )
+        if not status:
             msg = (
                 "fix ci stage produced no edits — the LLM concluded the "
                 "failure is already addressed locally (or it doesn't know "
@@ -966,7 +1001,7 @@ if not SKIP_LOCAL:
         "commit local fixes",
         RunCommand(cmd=(
             f"cd {shlex.quote(PROJECT_DIR)} && "
-            'git add -u && '
+            'git add -A && '
             'if git diff --cached --quiet; then '
             '  echo "No local fixes to commit"; '
             '  exit 0; '
@@ -1122,7 +1157,7 @@ pipeline.loop(
             "commit push ci fix",
             RunCommand(cmd=(
                 f"cd {shlex.quote(PROJECT_DIR)} && "
-                'git add -u && '
+                'git add -A && '
                 'git status --short && '
                 f"{attribution_guard_sh(messages_range='@{u}..HEAD')} && "
                 'git commit -m "fix(ci): auto-fix from check_and_fix_ci" && '
@@ -1136,7 +1171,7 @@ pipeline.loop(
                 workflows=WORKFLOWS,
                 poll=True,
                 poll_interval=60,
-                timeout_minutes=20,
+                timeout_minutes=CI_TIMEOUT_MINUTES,
             ),
         ),
     ],

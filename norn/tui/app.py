@@ -21,10 +21,11 @@ from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import Screen
-from textual.widgets import Footer
+from textual.widgets import Footer, Tree
 
 from norn.catalog import get_pipeline_info
 from norn.tui.args_prompt import ArgsPromptScreen, run_fzf
@@ -113,15 +114,23 @@ class RunScreen(Screen):
     NornHeader.-status-pending {
         background: $surface;
     }
+    #run-body {
+        height: 1fr;
+    }
     NornGraph {
         height: 1fr;
         width: 30;
+    }
+    #stage-pane {
+        width: 1fr;
     }
     Transcript {
         height: 1fr;
     }
     StageDetail {
         height: auto;
+        max-height: 50%;
+        overflow-y: auto;
         border-top: solid $primary;
     }
     BudgetMeter {
@@ -174,6 +183,10 @@ class RunScreen(Screen):
         self._modal_open: bool = False
         # True while the stop-run confirmation is on screen (avoids double-push).
         self._confirm_open: bool = False
+        # Latest stage named by a run event; the panels show it unless pinned.
+        self._followed_stage: str | None = None
+        # Node the user picked in the graph; None means follow the run.
+        self._pinned_stage: str | None = None
 
     # ------------------------------------------------------------------
     # Layout
@@ -181,10 +194,15 @@ class RunScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield NornHeader(self._vm)
-        if self._graph is not None:
-            yield NornGraph(self._graph, self._vm)
-        yield Transcript(self._vm)
-        yield StageDetail(self._vm)
+        # Graph on the left, the selected stage's output on the right. Stacked
+        # vertically, the graph left a dead area beside it and pushed the
+        # detail panel off the bottom of a short terminal.
+        with Horizontal(id="run-body"):
+            if self._graph is not None:
+                yield NornGraph(self._graph, self._vm)
+            with Vertical(id="stage-pane"):
+                yield Transcript(self._vm)
+                yield StageDetail(self._vm)
         yield BudgetMeter(self._vm, self._budget)
         # Footer renders the key bindings (Pause/Resume, Cancel, Answer, Back,
         # Quit). Disabled actions grey out via check_action/_is_action_enabled.
@@ -362,7 +380,10 @@ class RunScreen(Screen):
         *event* so the user always sees live output and — on failure — the
         error text for the stage that is currently running or just finished.
         Without this, a failed stage shows only its tree glyph (``✗``) with no
-        explanation of what went wrong.
+        explanation of what went wrong.  Events on container nodes
+        (``LoopExhausted``, ``LoopAttempt`` …) are not followed: a loop has no
+        output of its own, and following it would blank the failed stage.
+        A node picked in the graph pins the panels until the root is picked.
         """
         self._vm.apply(event)
         self.query_one(NornHeader).refresh_vm()
@@ -371,15 +392,31 @@ class RunScreen(Screen):
         except NoMatches:
             pass
         stage_id = _event_stage_id(event)
+        if stage_id is not None and self._vm.is_stage(stage_id):
+            self._followed_stage = stage_id
+        self._refresh_stage_panels()
+        self.query_one(BudgetMeter).refresh_vm()
+
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted[str]) -> None:
+        """Show the output of the graph node under the cursor (click or arrow keys).
+
+        The root node carries no data; picking it returns the panels to
+        following the run.
+        """
+        self._pinned_stage = event.node.data
+        self._refresh_stage_panels()
+
+    def _refresh_stage_panels(self) -> None:
+        """Point the transcript and detail panels at the pinned or followed stage."""
         transcript = self.query_one(Transcript)
         detail = self.query_one(StageDetail)
-        if stage_id is not None:
-            transcript.set_stage(stage_id)
-            detail.set_stage(stage_id)
-        else:
+        stage_id = self._pinned_stage or self._followed_stage
+        if stage_id is None:
             transcript.refresh_vm()
             detail.refresh_vm()
-        self.query_one(BudgetMeter).refresh_vm()
+            return
+        transcript.set_stage(stage_id)
+        detail.set_stage(stage_id)
 
     def on__run_event(self, message: _RunEvent) -> None:
         self.apply_event(message.event)

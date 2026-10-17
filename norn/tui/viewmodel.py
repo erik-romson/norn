@@ -208,6 +208,15 @@ class RunViewModel:
         if self.is_running:
             self._finish(success)
 
+    def is_stage(self, node_id: str) -> bool:
+        """True if *node_id* is a stage that started or finished in this run.
+
+        Container nodes (loops, parallel blocks, clear-context markers) carry a
+        node id on their events too, but never have a transcript or a detail
+        record, so the panels must not follow them.
+        """
+        return node_id in self._seen_stage_ids or node_id in self.stage_details
+
     # ------------------------------------------------------------------
     # Event dispatch
     # ------------------------------------------------------------------

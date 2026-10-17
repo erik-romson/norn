@@ -22,7 +22,14 @@ from norn.stages.base import BaseStage
 from norn.tui import app as app_mod
 from norn.tui.app import NornUIApp, RunScreen
 from norn.tui.args_prompt import ArgsPromptScreen
-from norn.tui.launch import pipeline_args_meta, resolve_ref
+from norn.tui.launch import (
+    BUDGET_PARAM,
+    TOKEN_BUDGET_PARAM,
+    launch_argv,
+    load_pipeline_with_args,
+    pipeline_args_meta,
+    resolve_ref,
+)
 from norn.tui.screens import HistoryBrowserScreen, LauncherScreen
 
 
@@ -63,6 +70,45 @@ def test_pipeline_args_meta_reads_bundled_args() -> None:
 
 def test_pipeline_args_meta_empty_for_unknown() -> None:
     assert pipeline_args_meta("/nope/missing.py") == {}
+
+
+def test_launch_argv_splits_positional_args() -> None:
+    assert launch_argv({"args": "tmp/plan 'two words'"}) == ["tmp/plan", "two words"]
+
+
+def test_launch_argv_turns_named_params_into_arg_flags() -> None:
+    """Named params reach import-time argv readers the way `norn run --arg` does."""
+    params = {"args": "x", "workflow": "test-pg.yml", "test_cmd": "mvn test -Dtest.db=postgres"}
+
+    assert launch_argv(params) == [
+        "x",
+        "--arg", "workflow=test-pg.yml",
+        "--arg", "test_cmd=mvn test -Dtest.db=postgres",
+    ]
+
+
+def test_launch_argv_leaves_out_blank_and_budget_params() -> None:
+    params = {"workflow": "", "skip_local": "  ", BUDGET_PARAM: "5", TOKEN_BUDGET_PARAM: "100"}
+
+    assert launch_argv(params) == []
+
+
+def test_load_pipeline_with_args_exposes_named_params_at_import(tmp_path, monkeypatch) -> None:
+    """A file pipeline that parses `--arg` at import sees the launch params."""
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "argv_reader.py"
+    source.write_text(
+        "import sys\n"
+        "from norn.dsl import Pipeline\n"
+        "config = Pipeline('argv_reader')\n"
+        "config.seen_argv = sys.argv[1:]\n"
+    )
+
+    pipe = load_pipeline_with_args(
+        str(source), is_bundled=False, params={"workflow": "test-pg.yml", "test_cmd": ""}
+    )
+
+    assert pipe.seen_argv == ["--arg", "workflow=test-pg.yml"]
 
 
 def test_resolve_ref_bundled() -> None:

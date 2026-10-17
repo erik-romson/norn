@@ -368,6 +368,83 @@ async def test_assert_launch_tree_fails_with_different_dir(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Resume preflight: HEAD must still be at the interrupted phase's baseline
+# ---------------------------------------------------------------------------
+
+
+def _resume_setup(tmp_path: Path, monkeypatch, *checkpoint_stages: str):
+    """Point the module at a temp repo whose aggregate baseline is the initial commit."""
+    from norn.models import PipelineContext
+    mod = _import_v2(GOOD_DIR)
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    repo = _init_temp_repo(repo_dir)
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    (snapshots / "aggregate.head").write_text(repo.head.commit.hexsha + "\n")
+    monkeypatch.setattr(mod, "GIT_TOPLEVEL", str(repo_dir))
+    monkeypatch.setattr(mod, "PROJECT_DIR", str(repo_dir))
+    monkeypatch.setattr(mod, "snapshot_root", str(snapshots))
+    monkeypatch.setattr(mod, "feature_dir", str(repo_dir / "tmp" / "plan"))
+    ctx = PipelineContext()
+    ctx.checkpoint_stages = set(checkpoint_stages)
+    return mod, repo, ctx
+
+
+def _commit_file(repo: Repo, name: str, subject: str) -> None:
+    path = Path(repo.working_tree_dir) / name
+    path.write_text(subject + "\n")
+    repo.index.add([name])
+    repo.index.commit(subject)
+
+
+def test_resume_head_error_names_commit_and_fresh_run_when_head_moved(tmp_path, monkeypatch) -> None:
+    mod, repo, ctx = _resume_setup(tmp_path, monkeypatch, "aggregate baseline")
+    _commit_file(repo, "fix.txt", "fix flaky test")
+
+    error = mod._resume_head_error(ctx)
+
+    assert error is not None
+    assert "'aggregate baseline'" in error
+    assert "fix flaky test" in error
+    assert "norn run implement_features_v3 tmp/plan" in error
+    assert "without --resume" in error
+
+
+def test_resume_head_error_is_none_when_head_unchanged(tmp_path, monkeypatch) -> None:
+    mod, _, ctx = _resume_setup(tmp_path, monkeypatch, "aggregate baseline")
+    assert mod._resume_head_error(ctx) is None
+
+
+def test_resume_head_error_accepts_the_phase_own_commit(tmp_path, monkeypatch) -> None:
+    mod, repo, ctx = _resume_setup(
+        tmp_path, monkeypatch, "aggregate baseline", "aggregate commit"
+    )
+    _commit_file(repo, "repair.txt", "fix: aggregate validation repair")
+    assert mod._resume_head_error(ctx) is None
+
+
+def test_resume_head_error_is_none_outside_an_interrupted_phase(tmp_path, monkeypatch) -> None:
+    mod, repo, ctx = _resume_setup(
+        tmp_path, monkeypatch, "aggregate baseline", "aggregate committed"
+    )
+    _commit_file(repo, "later.txt", "later commit")
+    assert mod._resume_head_error(ctx) is None
+
+
+@pytest.mark.asyncio
+async def test_preflight_repository_fails_fast_when_resume_head_moved(tmp_path, monkeypatch) -> None:
+    mod, repo, ctx = _resume_setup(tmp_path, monkeypatch, "aggregate baseline")
+    _commit_file(repo, "fix.txt", "fix flaky test")
+    stage = mod._PreflightRepository("true", "true")
+
+    result = await stage.run(ctx)
+
+    assert not result.success
+    assert "--resume cannot continue" in result.error
+
+
+# ---------------------------------------------------------------------------
 # Catalog discovery
 # ---------------------------------------------------------------------------
 

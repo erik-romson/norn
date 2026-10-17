@@ -13,6 +13,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 from norn.dsl import Loop, Parallel, Stage
 from norn.pipelines._comment_style import COMMENT_RULE
 from tests.merge_fakes import make_repo_with_remote
@@ -95,6 +97,63 @@ def test_workflows_drops_blank_entries_and_strips_whitespace(tmp_path) -> None:
     assert mod.WORKFLOWS == ["a.yml", "b.yml"]
 
 
+def test_ci_timeout_defaults_to_twenty_minutes(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+
+    assert _find_stage(mod.pipeline.items, "check ci").impl.ci_kwargs["timeout_minutes"] == 20
+
+
+def test_ci_timeout_arg_sets_the_poll_limit(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(["--arg", "ci_timeout_minutes=60"], cwd=tmp_path)
+    try:
+        assert _find_stage(mod.pipeline.items, "check ci").impl.ci_kwargs["timeout_minutes"] == 60
+    finally:
+        _import_check_and_fix_ci(cwd=tmp_path)
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "1.5", "soon"])
+def test_bogus_ci_timeout_fails_at_import(tmp_path, value) -> None:
+    try:
+        with pytest.raises(ValueError, match="ci_timeout_minutes"):
+            _import_check_and_fix_ci(["--arg", f"ci_timeout_minutes={value}"], cwd=tmp_path)
+    finally:
+        _import_check_and_fix_ci(cwd=tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_ci_timeout_stops_the_run_with_its_own_error(tmp_path, monkeypatch) -> None:
+    """A run still going at the deadline is not a failure to hand to the fix loop."""
+    from norn.models import PipelineContext, StageResult
+    from norn.runner import PipelineError
+
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+
+    class _TimedOut:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def run(self, ctx, **_kwargs):
+            return StageResult(
+                name="", success=False,
+                error="CI timed out after 20 minutes. Last status: in_progress",
+                output={
+                    "run_id": 7, "name": "test (postgres)", "status": "in_progress",
+                    "conclusion": None, "url": "https://example.test/runs/7",
+                    "logs": "", "timed_out": True,
+                },
+            )
+
+    monkeypatch.setattr(mod, "CheckCI", _TimedOut)
+
+    with pytest.raises(PipelineError) as raised:
+        await mod.CheckCIWithLogs(workflows=["test-pg.yml"]).run(PipelineContext())
+
+    error = raised.value.result.error
+    assert "timed out after 20 minutes" in error
+    assert "https://example.test/runs/7" in error
+    assert "--arg ci_timeout_minutes" in error
+
+
 # ---------------------------------------------------------------------------
 # COMMENT_RULE in both fix prompts
 # ---------------------------------------------------------------------------
@@ -130,7 +189,7 @@ def test_commit_local_fixes_keeps_fixed_subject_and_has_guard(tmp_path) -> None:
     # human's own commits.
     assert "@{u}..HEAD" not in cmd
     # The guard runs after staging and before the commit.
-    assert cmd.index("git add -u") < cmd.index("refusing to commit") < cmd.index("git commit")
+    assert cmd.index("git add -A") < cmd.index("refusing to commit") < cmd.index("git commit")
 
 
 def test_commit_push_ci_fix_keeps_fixed_subject_and_has_guard(tmp_path) -> None:
@@ -141,7 +200,7 @@ def test_commit_push_ci_fix_keeps_fixed_subject_and_has_guard(tmp_path) -> None:
     assert 'git commit -m "fix(ci): auto-fix from check_and_fix_ci"' in cmd
     assert "refusing to commit" in cmd
     assert "@{u}..HEAD" in cmd
-    assert cmd.index("git add -u") < cmd.index("refusing to commit") < cmd.index("git commit")
+    assert cmd.index("git add -A") < cmd.index("refusing to commit") < cmd.index("git commit")
 
 
 def test_commit_push_ci_fix_blocks_attribution_line(tmp_path) -> None:
@@ -172,6 +231,53 @@ def test_commit_push_ci_fix_blocks_attribution_line(tmp_path) -> None:
 
     after_remote = repo.repo.git.rev_parse("origin/feature-x")
     assert after_remote == before_remote
+
+
+def test_commit_push_ci_fix_commits_and_pushes_a_clean_fix(tmp_path) -> None:
+    """The fix's new files go in the commit too, or CI gets code that references them."""
+    repo = make_repo_with_remote(tmp_path)
+    repo.repo.git.checkout("-b", "feature-x")
+    repo.repo.git.push("origin", "feature-x", "--set-upstream")
+    with open(repo.path + "/README.md", "a") as f:
+        f.write("an ordinary fix\n")
+    with open(repo.path + "/Helper.java", "w") as f:
+        f.write("class Helper {}\n")
+
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    cmd = _find_stage(mod.pipeline.items, "commit push ci fix").impl.cmd
+    result = subprocess.run(["sh", "-c", cmd], cwd=repo.path, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    head = repo.repo.head.commit
+    assert head.message.strip() == "fix(ci): auto-fix from check_and_fix_ci"
+    assert set(head.stats.files) == {"README.md", "Helper.java"}
+    assert repo.repo.git.rev_parse("origin/feature-x") == head.hexsha
+
+
+@pytest.mark.asyncio
+async def test_fix_that_only_adds_a_file_counts_as_a_change(tmp_path) -> None:
+    from norn.models import PipelineContext
+
+    repo = make_repo_with_remote(tmp_path)
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+    with open(repo.path + "/Helper.java", "w") as f:
+        f.write("class Helper {}\n")
+
+    result = await mod.AssertFixProducedDiff(project_dir=repo.path).run(PipelineContext())
+
+    assert result.success
+
+
+@pytest.mark.asyncio
+async def test_fix_with_no_changes_stops_the_run(tmp_path) -> None:
+    from norn.models import PipelineContext
+    from norn.runner import PipelineError
+
+    repo = make_repo_with_remote(tmp_path)
+    mod = _import_check_and_fix_ci(cwd=repo.path)
+
+    with pytest.raises(PipelineError, match="produced no edits"):
+        await mod.AssertFixProducedDiff(project_dir=repo.path).run(PipelineContext())
 
 
 # ---------------------------------------------------------------------------

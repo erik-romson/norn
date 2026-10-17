@@ -21,13 +21,25 @@ from norn.agents.base import (
     ToolUseBlock,
 )
 from norn.dsl import Budget, Pipeline, Stage
-from norn.events import EventKey, RunStarted, StageFinished, StageStarted, TurnEvent, UsageUpdated
+from textual.app import App
+from textual.widgets import Tree
+
+from norn.events import (
+    EventKey,
+    LoopAttempt,
+    LoopExhausted,
+    RunStarted,
+    StageFinished,
+    StageStarted,
+    TurnEvent,
+    UsageUpdated,
+)
 from norn.graph import build_graph
 from norn.models import PipelineContext, StageResult
 from norn.stages.base import BaseStage
-from norn.tui.app import NornApp
+from norn.tui.app import NornApp, RunScreen
 from norn.tui.viewmodel import RunViewModel
-from norn.tui.widgets import BudgetMeter, StageDetail, Transcript
+from norn.tui.widgets import BudgetMeter, NornGraph, StageDetail, Transcript
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +537,125 @@ async def test_pilot_apply_event_auto_follows_failed_stage():
         content = detail.get_content()
         assert "failed" in content
         assert "Working tree is not clean" in content
+
+
+@pytest.mark.asyncio
+async def test_pilot_loop_events_keep_panels_on_the_failed_stage():
+    """A loop giving up must not blank the panels showing its failed stage.
+
+    ``LoopExhausted`` and ``LoopAttempt`` carry the loop's node id, which has no
+    transcript or detail record. Following it left a finished, failed run with
+    an empty transcript and no error text.
+    """
+    pipeline = Pipeline("p").stage("tests", _Stub())
+    graph = build_graph(pipeline)
+    vm = RunViewModel()
+    app = NornApp(graph=graph, vm=vm)
+
+    async with app.run_test() as pilot:
+        app.apply_event(_run_started("p"))
+        app.apply_event(LoopAttempt(key=_key(stage_id="loop:fix"), name="fix", attempt=3, max_retries=3))
+        app.apply_event(_stage_started("loop:fix/stage:tests"))
+        app.apply_event(_turn("loop:fix/stage:tests", TextBlock(text="[ERROR] enforcer failed")))
+        app.apply_event(
+            _stage_finished("loop:fix/stage:tests", status="failed", error="command exited with status 1")
+        )
+        app.apply_event(LoopExhausted(key=_key(stage_id="loop:fix"), loop_id="loop:fix"))
+        await pilot.pause()
+
+        assert app.query_one(Transcript).get_lines() == ["[ERROR] enforcer failed"]
+        assert "command exited with status 1" in app.query_one(StageDetail).get_content()
+
+
+def _two_stage_app() -> NornApp:
+    graph = build_graph(Pipeline("p").stage("first", _Stub()).stage("second", _Stub()))
+    return NornApp(graph=graph, vm=RunViewModel())
+
+
+def _run_two_stages(app: NornApp) -> None:
+    app.apply_event(_run_started("p"))
+    for name in ("first", "second"):
+        app.apply_event(_stage_started(f"stage:{name}"))
+        app.apply_event(_turn(f"stage:{name}", TextBlock(text=f"{name} output")))
+        app.apply_event(_stage_finished(f"stage:{name}", status="passed"))
+
+
+@pytest.mark.asyncio
+async def test_pilot_picking_a_graph_node_shows_its_output_and_pins_it():
+    """Moving the graph cursor to a stage shows that stage, and run events no longer move the panels."""
+    app = _two_stage_app()
+
+    async with app.run_test() as pilot:
+        _run_two_stages(app)
+        await pilot.pause()
+        transcript = app.query_one(Transcript)
+        assert transcript.get_lines() == ["second output"]
+
+        app.query_one(Tree).focus()
+        await pilot.press("down")  # root -> first
+        assert transcript.get_lines() == ["first output"]
+        assert "Stage: first" in app.query_one(StageDetail).get_content()
+
+        app.apply_event(_turn("stage:second", TextBlock(text="late output"), seq=1))
+        await pilot.pause()
+        assert transcript.get_lines() == ["first output"]
+
+
+@pytest.mark.asyncio
+async def test_pilot_clicking_a_graph_node_shows_its_output():
+    """A mouse click on a stage in the graph shows that stage's transcript."""
+    app = _two_stage_app()
+
+    async with app.run_test() as pilot:
+        _run_two_stages(app)
+        await pilot.pause()
+
+        await pilot.click(Tree, offset=(6, 1))  # row 0 is the root, row 1 is "first"
+        assert app.query_one(Transcript).get_lines() == ["first output"]
+
+
+@pytest.mark.asyncio
+async def test_pilot_picking_the_graph_root_resumes_following_the_run():
+    """Back on the root, the panels show the latest stage again and follow new events."""
+    app = _two_stage_app()
+
+    async with app.run_test() as pilot:
+        _run_two_stages(app)
+        app.query_one(Tree).focus()
+        await pilot.press("down")
+        await pilot.press("up")  # back to the root
+        transcript = app.query_one(Transcript)
+        assert transcript.get_lines() == ["second output"]
+
+        app.apply_event(_turn("stage:second", TextBlock(text="late output"), seq=1))
+        await pilot.pause()
+        assert transcript.get_lines() == ["second output", "late output"]
+
+
+@pytest.mark.asyncio
+async def test_pilot_stage_panels_sit_beside_the_graph():
+    """Transcript and detail fill the space right of the graph, both on screen.
+
+    Stacked under the graph they left a dead area beside it, and a short
+    terminal pushed the detail panel off the bottom.
+    """
+    graph = build_graph(Pipeline("p").stage("gen", _Stub()))
+    screen = RunScreen(graph=graph)
+
+    class _Host(App):
+        def on_mount(self) -> None:
+            self.push_screen(screen)
+
+    async with _Host().run_test(size=(100, 20)) as pilot:
+        await pilot.pause()
+        graph_region = screen.query_one(NornGraph).region
+        transcript_region = screen.query_one(Transcript).region
+        detail_region = screen.query_one(StageDetail).region
+
+        assert transcript_region.x == graph_region.right
+        assert detail_region.x == graph_region.right
+        assert transcript_region.y == graph_region.y
+        assert detail_region.bottom <= screen.size.height
 
 
 @pytest.mark.asyncio

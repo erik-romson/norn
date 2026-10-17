@@ -1788,6 +1788,101 @@ def _interrupted_phase(ctx: PipelineContext) -> str | None:
     return None
 
 
+def _phase_head_and_commit(opening: str) -> tuple[str, str, str | None]:
+    """Return the HEAD file, commit stage and step name of the phase *opening* starts.
+
+    The step name is None for the aggregate and review-fix phases.
+    """
+    if opening == "aggregate baseline":
+        return os.path.join(snapshot_root, "aggregate.head"), "aggregate commit", None
+    if opening.startswith("review fix baseline "):
+        n = opening.rsplit(" ", 1)[1]
+        return (
+            os.path.join(snapshot_root, f"review-fix-{n}.head"), f"review fix commit {n}", None
+        )
+    name = opening.removeprefix("record baseline ")
+    return os.path.join(snapshot_root, f"{name}.head"), f"commit {name}", name
+
+
+def _git_out(*args: str) -> str:
+    """Run git in the repository and return its stripped stdout ('' on failure)."""
+    proc = subprocess.run(
+        ["git", *args], cwd=GIT_TOPLEVEL, capture_output=True, text=True, check=False
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _resume_head_error(ctx: PipelineContext) -> str | None:
+    """Explain why a resume cannot continue when HEAD left the interrupted phase's baseline.
+
+    A resume restores the phase's recorded HEAD from the checkpoint, and the
+    phase's HEAD gate compares against it only after the expensive stages
+    (agent, validation) have run again.  A commit made by hand between runs —
+    typically a fix for whatever made the run fail — therefore costs a full
+    validation run before the gate rejects it.  Checking here fails in seconds.
+
+    HEAD one commit past the baseline is accepted once the phase's own commit
+    stage is in the checkpoint: that commit is the phase's own.
+    """
+    phase = _interrupted_phase(ctx)
+    if phase is None:
+        return None
+    head_file, commit_stage, step = _phase_head_and_commit(phase)
+    try:
+        recorded = Path(head_file).read_text().strip()
+    except OSError:
+        return None
+    actual = _git_out("rev-parse", "HEAD")
+    if not recorded or not actual or actual == recorded:
+        return None
+    if commit_stage in ctx.checkpoint_stages and _git_out("rev-parse", "HEAD^") == recorded:
+        return None
+
+    def describe(sha: str) -> str:
+        return _git_out("log", "-1", "--format=%h %s", sha) or sha
+
+    lines = [
+        f"HEAD has moved since the interrupted run recorded its baseline at '{phase}', "
+        "so --resume cannot continue.",
+        f"  recorded: {describe(recorded)}",
+        f"  now:      {describe(actual)}",
+    ]
+    is_descendant = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", recorded, actual],
+        cwd=GIT_TOPLEVEL, capture_output=True, check=False,
+    ).returncode == 0
+    if is_descendant:
+        commits = _git_out("log", "--format=%h %s", f"{recorded}..{actual}").splitlines()
+        lines.append("Commits made since the baseline:")
+        lines += [f"  {c}" for c in commits]
+    else:
+        lines.append("HEAD is not a descendant of the baseline (a reset or checkout moved it).")
+    lines += [
+        "",
+        "This happens when something commits, resets or checks out between runs, for "
+        "example a fix committed by hand after the run failed. A resume keeps the old "
+        "baseline, so the phase's HEAD gate would reject the run after the validation "
+        "had been rerun.",
+        "",
+        "What to do:",
+        "  - To keep the new commits, start a fresh run without --resume:",
+        f"      norn run implement_features_v3 {shlex.quote(os.path.relpath(feature_dir, PROJECT_DIR))}",
+        "    Steps whose 'refactor: step-…' commits are on HEAD are skipped, and the "
+        "baseline is recorded again at the current HEAD.",
+    ]
+    if step:
+        lines.append(
+            f"    If a commit holds the work of {step}, give it the subject "
+            f"'refactor: {step}' first (git commit --amend) so the fresh run skips that step."
+        )
+    lines += [
+        "  - To undo the move instead (this drops the new commits from the branch), "
+        "move HEAD back and resume again:",
+        f"      git reset --keep {recorded[:12]}",
+    ]
+    return "\n".join(lines)
+
+
 class _PreflightRepository(RunCommand):
     """The repository preflight, tolerant of the work a resume stopped inside.
 
@@ -1805,6 +1900,9 @@ class _PreflightRepository(RunCommand):
         self.resume_cmd = resume_cmd
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        head_error = _resume_head_error(ctx)
+        if head_error is not None:
+            return StageResult(name="", success=False, error=head_error)
         phase = _interrupted_phase(ctx)
         if phase is None or self.cmd == self.resume_cmd:
             return await super().run(ctx, **kwargs)

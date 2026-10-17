@@ -520,6 +520,8 @@ skips them).
 norn run check_and_fix_ci_v2
 # Check more than one workflow, in order (default: ci.yml)
 norn run check_and_fix_ci_v2 --arg workflow=ci.yml,release.yml
+# Wait up to 60 minutes for each workflow run (default: 20)
+norn run check_and_fix_ci_v2 --arg ci_timeout_minutes=60
 ```
 
 `--arg workflow=` takes a comma-separated list of workflow filenames; the first

@@ -37,12 +37,15 @@ CheckCI(
     "conclusion": str | None, # "success", "failure", ...
     "url": str,              # html_url to the run
     "logs": str,             # summarised failed-step logs ("" on green)
+    "timed_out": bool,       # True when the poll deadline passed first
 }
 ```
 
 `StageResult.success` is `True` iff `conclusion == "success"`.
 `StageResult.error` is a one-liner (`"CI failure: <name> (<url>)"`); the
-full log lives only in `output["logs"]`.
+full log lives only in `output["logs"]`. A poll that hits `timeout_minutes`
+also fails; it sets `output["timed_out"]` and fills the other keys from the
+run it was waiting on, so callers can tell "still running" from "red".
 
 ---
 

@@ -70,13 +70,32 @@ def resolve_ref(info: Any) -> tuple[str, bool]:
     return (info.name if is_bundled else str(info.path)), is_bundled
 
 
-def load_pipeline_with_args(pipeline_ref: str, *, is_bundled: bool, params: dict[str, str]):
-    """Load the pipeline object, exposing positional args via ``sys.argv``.
+def launch_argv(params: dict[str, str]) -> list[str]:
+    """Return the ``sys.argv`` tail that ``norn run`` would have for *params*.
 
-    Some bundled pipelines (e.g. ``implement_features_v1``) read ``sys.argv`` at
-    import time to build their structure. Reconstruct ``argv`` from the
-    positional ``args`` param around the import (and reload an already-imported
-    module so a repeat selection with different args isn't served stale).
+    The positional ``args`` param is shell-split; every other declared param
+    becomes ``--arg KEY=VALUE``, the form pipelines such as
+    ``check_and_fix_ci_v2`` parse at import time. Blank values are left out,
+    like a flag never typed on the command line, so the pipeline's own default
+    applies. The budget keys are launch-time limits, not pipeline args.
+    """
+    positional = params.get("args", "")
+    tail = shlex.split(positional) if positional else []
+    for key, value in params.items():
+        if key in ("args", BUDGET_PARAM, TOKEN_BUDGET_PARAM) or not value.strip():
+            continue
+        tail += ["--arg", f"{key}={value}"]
+    return tail
+
+
+def load_pipeline_with_args(pipeline_ref: str, *, is_bundled: bool, params: dict[str, str]):
+    """Load the pipeline object, exposing the launch params via ``sys.argv``.
+
+    Some bundled pipelines (e.g. ``implement_features_v1``,
+    ``check_and_fix_ci_v2``) read ``sys.argv`` at import time to build their
+    structure. Reconstruct ``argv`` from the params around the import (see
+    :func:`launch_argv`), and reload an already-imported module so a repeat
+    selection with different args isn't served stale.
 
     This is also the TUI's single pipeline-import site, so it is where the state
     key is published. Pipelines that compute step ownership by diffing worktree
@@ -87,10 +106,9 @@ def load_pipeline_with_args(pipeline_ref: str, *, is_bundled: bool, params: dict
     postcondition on the very next journal write.
     """
     publish_state_key(pipeline_ref)
-    positional = (params or {}).get("args", "")
     saved = list(sys.argv)
     try:
-        sys.argv = [saved[0]] + (shlex.split(positional) if positional else [])
+        sys.argv = [saved[0]] + launch_argv(params or {})
         if is_bundled:
             mod = sys.modules.get(f"norn.pipelines.{pipeline_ref}")
             if mod is not None:

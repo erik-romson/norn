@@ -6,6 +6,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.merge_fakes import make_repo_with_remote
 
 from norn.pipelines._comment_style import (
@@ -108,6 +110,21 @@ def test_guard_exits_0_on_clean_staged_diff(tmp_path):
         ["sh", "-c", attribution_guard_sh()], cwd=repo_path, capture_output=True, text=True
     )
     assert result.returncode == 0
+
+
+@pytest.mark.parametrize("messages_range", [None, "HEAD~1..HEAD"])
+def test_passing_guard_continues_an_and_chain(tmp_path, messages_range):
+    """Callers write `<guard> && git commit`; a passing guard must reach the commit."""
+    repo_path = _init_repo(tmp_path)
+    (repo_path / "README.md").write_text("hello\n\nan ordinary change\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "ordinary"], cwd=repo_path, check=True)
+
+    cmd = f"{attribution_guard_sh(messages_range=messages_range)} && echo chained"
+    result = subprocess.run(["sh", "-c", cmd], cwd=repo_path, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "chained"
 
 
 # ---------------------------------------------------------------------------

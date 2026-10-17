@@ -33,7 +33,9 @@ def attribution_guard_sh(messages_range: str | None = None) -> str:
     (``git log --format=%B <range>``), both against ``ATTRIBUTION_ERE``. On a
     match it prints the matching lines and an error to stderr and exits 1;
     otherwise it falls through with exit 0. One compound command (``{ ...; }``)
-    so it composes inside a ``git add -u && ... && git commit`` chain. Never
+    so it composes inside a ``git add -u && ... && git commit`` chain; it ends
+    at the closing brace, because a newline before the next ``&&`` is a shell
+    syntax error that only surfaces when the guard passes. Never
     checks the human's own commits: callers pass only a range an agent alone
     could have filled.
     """
@@ -60,5 +62,5 @@ def attribution_guard_sh(messages_range: str | None = None) -> str:
         "    exit 1\n"
         "  fi\n"
         "  true\n"
-        "}\n"
+        "}"
     )

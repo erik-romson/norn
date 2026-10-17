@@ -80,7 +80,19 @@ Launcher ──select──▶ [Args prompt, if the pipeline declares args] ─�
   `{param.*}` substitution. A pipeline that declares an arg named `budget` or
   `token_budget` owns that question and the matching field is not rendered.
 - **Run** (`RunScreen`) — the live run. **`b`**/**Esc** returns to the
-  launcher; **`q`** quits.
+  launcher; **`q`** quits. The graph sits on the left (30 columns); the
+  transcript and the stage detail share the space to its right, with the
+  detail capped at half that column and scrollable, so a long error cannot
+  squeeze the transcript away. `apply_event` points both panels at the stage
+  named by each event, but only when `RunViewModel.is_stage()` holds (the node
+  had a `StageStarted` or `StageFinished`). Loop, parallel and clear-context
+  events carry their container's node id, which never has output; following
+  them would blank the failed stage when a loop gives up. Clicking a graph
+  node, or moving the tree cursor to it with the arrow keys
+  (`on_tree_node_highlighted`), shows that node's transcript and detail and
+  pins the panels there; run events then only refresh it. Picking the root
+  node (it carries no data) unpins, and the panels jump back to the latest
+  stage and follow the run again.
 
 In direct mode (`norn ui <pipeline>`) there is no launcher to return to, so
 Back exits.
@@ -181,7 +193,7 @@ second run can start against the same repo while the first is still live.
 | `screens.py` | `LauncherScreen`/`LauncherApp`, `HistoryBrowserScreen`/`HistoryBrowserApp`, `LaunchRequest`, the `OPEN_FILE` sentinel. |
 | `args_prompt.py` | `ArgsPromptScreen`/`ArgsPromptApp`, `is_path_arg`/`is_dir_arg`, `run_fzf`, the budget fields (keys imported from `launch.py`). |
 | `modals.py` | `InputDecisionModal` — the in-run retry/continue/abort modal shown when the runner blocks on a `WaitingInput`. Textual-only, imported lazily by the run screen. |
-| `launch.py` | Textual-free loading helpers: `pipeline_args_meta`, `resolve_ref`, `load_pipeline_with_args` (publishes `NORN_STATE_KEY`, sets `sys.argv` + reloads dynamic bundled modules), `build_run_setup` (builds graph/budget/run_kwargs and sets `config_path` so every TUI run persists history and checkpoints), `apply_budget_params` + the `BUDGET_PARAM`/`TOKEN_BUDGET_PARAM` keys (launch-time budget overrides), and history helpers (`load_run_history`, `history_config_key`, `load_run_checkpoint`). |
+| `launch.py` | Textual-free loading helpers: `pipeline_args_meta`, `resolve_ref`, `launch_argv` (params → the `norn run` argv tail), `load_pipeline_with_args` (publishes `NORN_STATE_KEY`, sets `sys.argv` from `launch_argv` + reloads dynamic bundled modules), `build_run_setup` (builds graph/budget/run_kwargs and sets `config_path` so every TUI run persists history and checkpoints), `apply_budget_params` + the `BUDGET_PARAM`/`TOKEN_BUDGET_PARAM` keys (launch-time budget overrides), and history helpers (`load_run_history`, `history_config_key`, `load_run_checkpoint`). |
 
 ---
 
@@ -323,7 +335,11 @@ The runner is the **single source of truth**; the UI is a pure projection.
 - Collected values flow into the run two ways: as `params` to `run_pipeline`
   (so `{param.args}` / `{param.KEY}` resolve), and via `sys.argv` reconstructed
   around the load so pipelines that read argv at **import time** (e.g.
-  `implement_features_v1`) see them. `load_pipeline_with_args` also reloads an
+  `implement_features_v1`, `check_and_fix_ci_v2`) see them. `launch.launch_argv`
+  builds the argv `norn run` would have: `args` is shell-split into positionals
+  and every other param becomes `--arg KEY=VALUE`. Blank values and the budget
+  keys are left out, so an empty field means "use the pipeline's default", the
+  same as not typing the flag. `load_pipeline_with_args` also reloads an
   already-imported bundled module so a repeat run with different args isn't
   served a stale structure.
 - **`load_pipeline_with_args` is the TUI's only pipeline-import site, so it is

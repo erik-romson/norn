@@ -251,6 +251,34 @@ async def test_smart_wait_fires_when_latest_run_pending(_patch_env, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_poll_timeout_marks_output_timed_out(_patch_env):
+    """A run still going at the deadline fails with the run it was waiting on."""
+    _patch_env()
+    gh = _mock_gh([_make_run(run_id=55, status="in_progress", conclusion=None)])
+
+    with patch("norn.stages.check_ci._create_client", return_value=gh):
+        stage = CheckCI(poll=True, timeout_minutes=0, smart_wait=False)
+        result = await stage.run(PipelineContext())
+
+    assert not result.success
+    assert "timed out after 0 minutes" in result.error
+    assert result.output["timed_out"] is True
+    assert result.output["run_id"] == 55
+    assert result.output["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_completed_run_is_not_timed_out(_patch_env):
+    _patch_env()
+    gh = _mock_gh([_make_run()])
+
+    with patch("norn.stages.check_ci._create_client", return_value=gh):
+        result = await CheckCI().run(PipelineContext())
+
+    assert result.output["timed_out"] is False
+
+
+@pytest.mark.asyncio
 async def test_no_runs_found(_patch_env):
     _patch_env(branch="feature-x")
     gh = _mock_gh([])

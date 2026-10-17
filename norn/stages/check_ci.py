@@ -383,13 +383,18 @@ class CheckCI(BaseStage):
             "url": str,                  # html_url to the run page on github.com
             "logs": str,                 # summarized failed-step logs
                                          # (empty when conclusion is "success")
+            "timed_out": bool,           # True when the poll deadline passed
+                                         # before the run completed
         }
 
     ``StageResult.success`` is ``True`` when ``conclusion == "success"``,
     otherwise ``False``. On failure, ``StageResult.error`` is a single
     short line in the form
     ``"CI failure: <workflow name> (<run url>)"`` — the full log lives
-    in ``output["logs"]`` so it isn't duplicated.
+    in ``output["logs"]`` so it isn't duplicated. A poll that hits
+    ``timeout_minutes`` also fails, with ``output["timed_out"]`` set and the
+    run it was waiting on in the other keys, so a caller can tell "still
+    running" from "red" without parsing the error text.
 
     Downstream usage
     ----------------
@@ -576,6 +581,7 @@ class CheckCI(BaseStage):
                             f"waiting for a workflow run on {local_head[:8]}; "
                             f"latest indexed run is for ancestor {run_sha[:8]}."
                         ),
+                        output=_run_output(run_info, timed_out=True),
                     )
                 log.debug(
                     "Latest run %s is for ancestor %s of local HEAD %s — "
@@ -606,14 +612,7 @@ class CheckCI(BaseStage):
                             lead_context=self.lead_context,
                         )
 
-                output = {
-                    "run_id": run_info["run_id"],
-                    "name": run_info["name"],
-                    "status": status,
-                    "conclusion": conclusion,
-                    "url": run_info["url"],
-                    "logs": logs,
-                }
+                output = _run_output(run_info, logs=logs)
                 success = conclusion == "success"
                 error = None
                 if not success:
@@ -625,14 +624,7 @@ class CheckCI(BaseStage):
                 return StageResult(
                     name="", success=False,
                     error=f"CI run is still {status}: {run_info['name']} ({run_info['url']})",
-                    output={
-                        "run_id": run_info["run_id"],
-                        "name": run_info["name"],
-                        "status": status,
-                        "conclusion": None,
-                        "url": run_info["url"],
-                        "logs": "",
-                    },
+                    output=_run_output(run_info),
                 )
 
             # The latest run is pending (queued / in_progress). Smart wait
@@ -662,10 +654,24 @@ class CheckCI(BaseStage):
                 return StageResult(
                     name="", success=False,
                     error=f"CI timed out after {self.timeout_minutes} minutes. Last status: {status}",
+                    output=_run_output(run_info, timed_out=True),
                 )
 
             log.debug("CI status: %s — waiting %ds", status, self.poll_interval)
             await asyncio.sleep(self.poll_interval)
+
+
+def _run_output(run_info: dict, *, logs: str = "", timed_out: bool = False) -> dict:
+    """Build ``CheckCI``'s ``StageResult.output`` dict for *run_info*."""
+    return {
+        "run_id": run_info["run_id"],
+        "name": run_info["name"],
+        "status": run_info["status"],
+        "conclusion": run_info["conclusion"],
+        "url": run_info["url"],
+        "logs": logs,
+        "timed_out": timed_out,
+    }
 
 
 def _create_client(token: str) -> Any:
