@@ -5132,10 +5132,14 @@ def test_fix_prompt_has_retry_discipline() -> None:
         prompt = _get_fix_prompt(mod, stem)
         assert "## Retry discipline" in prompt
         assert f"{{retry ledger {stem}.output}}" in prompt
-        for label in ("PREVIOUS HYPOTHESIS:", "EVIDENCE:", "NEW HYPOTHESIS:"):
+        for label in ("Previous fix:", "What the new failure shows:", "This fix:"):
             assert label in prompt, f"{stem}: fix prompt missing {label!r}"
-        assert "invalidated" in prompt
-        assert "End your response with the same three lines" in prompt
+        assert "ruled out" in prompt
+        assert "End your response with this short report" in prompt
+        # Asking the agent to write its reasoning out before acting tripped the
+        # provider's reasoning-extraction classifier on every retry.
+        assert "Before any edit" not in prompt
+        assert "HYPOTHESIS" not in prompt
 
 
 def test_fix_prompt_template_has_no_stray_braces() -> None:
@@ -5583,7 +5587,7 @@ async def test_collect_learning_evidence_sections_caps_and_baseline(tmp_path, mo
 
     ctx = _learn_ctx(_journal(tmp_path))
     ctx.results[f"fix {step}"] = StageResult(
-        name="", success=True, output="the passing fix\nNEW HYPOTHESIS: the import order"
+        name="", success=True, output="the passing fix\nThis fix: the import order"
     )
     ctx.results[f"closeout {step}"] = StageResult(
         name="", success=True, output="EVIDENCE: test_a failed first"
@@ -5622,7 +5626,7 @@ async def test_collect_learning_evidence_sections_caps_and_baseline(tmp_path, mo
     assert "fix2 line 19" not in attempts, "only the last 30 lines of a fix response"
     assert "Paths it changed: `a.py`" in attempts
     assert "Paths it changed: `feature.py`" in attempts
-    assert "NEW HYPOTHESIS: the import order" in attempts
+    assert "This fix: the import order" in attempts
     assert "+def feature():" in attempts, "the passing fix's diff in the step commit"
     assert attempts.index("Fix before run 2") < attempts.index("Failed run 2")
     validation = text[text.index("## Validation attempts"):text.index("## Oscillations")]
