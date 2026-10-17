@@ -94,6 +94,13 @@ def test_fix_jira_issue_v1_is_listed() -> None:
     assert "fix_jira_issue_v1" in names
 
 
+def test_fix_issue_v1_is_listed() -> None:
+    """fix_issue_v1 is discoverable via norn list; as a _v1 it needs no predecessor."""
+    names = [info.name for info in list_pipelines()]
+    assert "fix_issue_v1" in names
+    assert "fix_issue_v0" not in names
+
+
 def test_bundled_pipeline_names_are_versioned() -> None:
     """Every bundled pipeline name carries a ``_v<N>`` suffix."""
     for info in list_pipelines():
