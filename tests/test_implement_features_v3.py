@@ -7160,3 +7160,21 @@ def test_final_audit_ignores_followups_inside_the_repo() -> None:
     assert flag.startswith(" --ignore ")
     assert flag in mod._extra_ignore_flags
     assert flag in mod._final_audit_cmd
+
+
+def test_commit_subject_drops_h1_that_would_exceed_header_limit() -> None:
+    mod = _import_v2(GOOD_DIR)
+    name = "step-01-spec-signer-dependent-freshness"
+
+    subject = mod._commit_subject(name, "Step 01: Spec Signer Dependent Freshness")
+
+    assert subject == f"refactor: {name}"
+
+
+def test_commit_subject_keeps_h1_that_fits() -> None:
+    mod = _import_v2(GOOD_DIR)
+
+    subject = mod._commit_subject("step-01-a", "Short title")
+
+    assert subject == "refactor: step-01-a — Short title"
+    assert len(subject) <= 72

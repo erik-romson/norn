@@ -141,6 +141,18 @@ def first_h1(text: str) -> str | None:
     return None
 
 
+_COMMIT_HEADER_MAX = 72
+
+
+def _commit_subject(name: str, h1: str) -> str:
+    # Target repos commonly reject headers over 72 chars in a commit-msg hook.
+    subject = f"refactor: {name}"
+    with_h1 = f"{subject} — {h1}"
+    if h1 != name and len(with_h1) <= _COMMIT_HEADER_MAX:
+        return with_h1
+    return subject
+
+
 def _resolve_test_cmd(
     step_fm: dict,
     step_file: str,
@@ -447,8 +459,7 @@ for step_file in step_files:
     step_model = step_fm.get("model") or None
 
     # Commit subject: first H1 from the step body, falling back to the stem.
-    h1 = first_h1(step_body) or name
-    commit_subject = f"refactor: {name} — {h1}" if h1 != name else f"refactor: {name}"
+    commit_subject = _commit_subject(name, first_h1(step_body) or name)
 
     test_name = f"test {name}"
     bats_name = f"bats {name}"

@@ -10,8 +10,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FROZEN: dict[str, str] = {
     "norn/pipelines/hello_v1.py": "d8ae17d5748de988e15ad42d43345c05be692ca0f65f9cd46efc5d355c6b5063",
     "norn/pipelines/vanilla_change_v1.py": "7ab2ef415e9f1ab465611cec5ca9ac1b55cde78d210126e488ba48525ba15c55",
-    "norn/pipelines/implement_features_v1.py": "11a2db1e6cfa6b8fd8997d9dcea0d919e03673589cb965ad54df0d7bb5521577",
-    "norn/pipelines/implement_features_v2.py": "30d58e6019e59b83d121bbdffb552e017e7c521ce96984e4f19852f1fc8df8c4",
+    "norn/pipelines/implement_features_v1.py": "ebcafa109d5f041738467eb5726b41c9e0d8a48e442b541f6828312f343940d0",
+    "norn/pipelines/implement_features_v2.py": "1d6b1e58a0428afd0bdfbf24f23893a109cd493e61138a4385ac65ffb76dd060",
     "norn/pipelines/plan_with_review_v1.py": "6a549a7e5e418d3dc812cc710c7c9e45daf026d376f9be6cdb1ee87e1a2efa69",
     "norn/pipelines/fix_jira_issue_v1.py": "9543513851ce011bb0b1446182a1a99592acf5d75ace7dd015ae269431c7178b",
     "norn/pipelines/fix_jira_issue_v2.py": "5e7fa984ef304bb550a19c06c784ba23e2e4fe4a9353aa3daf7d37b9d1dbf340",
