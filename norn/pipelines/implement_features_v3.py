@@ -1754,8 +1754,9 @@ _preflight_parts = [
         'python3 -c "import json, hashlib"'
     ),
 ]
+_index_check = ""
 if not ALLOW_DIRTY_INDEX:
-    _preflight_parts.append(
+    _index_check = (
         'echo "=== clean index ===" && '
         "git diff --cached --quiet || "
         '{ echo "ERROR: the index has staged changes at run start:"; '
@@ -1778,7 +1779,7 @@ if not ALLOW_DIRTY_WORKTREE:
         "already sitting in the tree fails the 'changed nothing' guard.\"; exit 1; }"
     )
 
-_preflight_cmd = " && ".join(_preflight_parts + ([_worktree_check] if _worktree_check else []))
+_preflight_cmd = " && ".join(_preflight_parts + [c for c in (_index_check, _worktree_check) if c])
 
 # Phases that record a worktree baseline and later commit against it, as
 # (opening stage, closing stage).  A resume whose checkpoint holds an opening
@@ -1903,7 +1904,8 @@ class _PreflightRepository(RunCommand):
     that step's own work, the check rejects it, and the only ways forward were
     to commit it by hand (which moves HEAD and fails the step's HEAD guard) or
     to throw the work away.  So when the checkpoint shows an interrupted phase
-    the modified files are listed rather than rejected.  A resume between
+    the modified and staged files are listed rather than rejected; a commit
+    stage that failed leaves the step's work staged.  A resume between
     phases keeps the strict check: nothing would own those edits.
     """
 
@@ -1924,14 +1926,22 @@ class _PreflightRepository(RunCommand):
         return await resumed.run(ctx, **kwargs)
 
 
-_preflight_resume_cmd = _preflight_cmd
+_preflight_resume_parts = list(_preflight_parts)
+if _index_check:
+    _preflight_resume_parts.append(
+        'echo "=== clean index ===" && '
+        "{ git diff --cached --quiet || "
+        '{ echo "NOTE: resuming inside" __PHASE__"; its staged work is expected '
+        'in the index:"; git diff --cached --name-only; }; }'
+    )
 if _worktree_check:
-    _preflight_resume_cmd = " && ".join(_preflight_parts + [
+    _preflight_resume_parts.append(
         'echo "=== clean worktree ===" && '
         "{ git diff --quiet || "
         '{ echo "NOTE: resuming inside" __PHASE__"; its uncommitted work is expected '
         'in the tree:"; git diff --name-only; }; }'
-    ])
+    )
+_preflight_resume_cmd = " && ".join(_preflight_resume_parts)
 
 # ---------------------------------------------------------------------------
 # Aggregate validation command and timeout

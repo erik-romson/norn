@@ -4404,6 +4404,36 @@ async def test_preflight_accepts_the_work_of_the_step_a_resume_stopped_inside(
 
 
 @pytest.mark.asyncio
+async def test_preflight_accepts_the_staged_work_of_a_step_whose_commit_failed(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    shutil.copytree(GOOD_DIR, repo_path / "feat")
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(repo_path / "feat", monkeypatch)
+
+    from norn.models import PipelineContext
+
+    (repo_path / "work.txt").write_text("the interrupted step's staged work\n")
+    repo.index.add(["work.txt"])
+    stem = "step-01-v2-fixture-alpha"
+    preflight = _stage(mod, "preflight repository").impl
+
+    commit_failed = PipelineContext()
+    commit_failed.checkpoint_stages = {f"record baseline {stem}", f"closeout {stem}"}
+    resumed = await preflight.run(commit_failed)
+    assert resumed.success, _combined_output(resumed)
+    assert "work.txt" in _combined_output(resumed)
+
+    between_steps = PipelineContext()
+    between_steps.checkpoint_stages = {f"record baseline {stem}", f"facts {stem}"}
+    assert not (await preflight.run(between_steps)).success, (
+        "a staged change no interrupted step owns must still be rejected"
+    )
+
+
+@pytest.mark.asyncio
 async def test_head_moved_names_the_subject_that_skips_the_step(tmp_path, monkeypatch) -> None:
     repo = _init_temp_repo(tmp_path / "repo")
     repo_path = tmp_path / "repo"
