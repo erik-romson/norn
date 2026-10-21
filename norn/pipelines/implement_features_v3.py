@@ -239,10 +239,12 @@ import tempfile
 from datetime import date, datetime, timezone
 from glob import glob
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from norn.alerts import MacOSChannel
-from norn.dsl import Pipeline, Stage, ask_user, fail, file_exists, file_missing, stage_failed
+from norn.dsl import (
+    Pipeline, Stage, ask_user, fail, file_exists, file_missing, output_contains, stage_failed,
+)
 from norn.models import PipelineContext, StageResult
 from norn.stages.base import BaseStage
 from norn.stages.compress_test_log import CompressTestLog
@@ -1040,11 +1042,18 @@ class _RetryLedger(BaseStage):
         last_round = entries[-1]["round"] if entries else 0
         rnd = last_round + 1 if attempt == 1 else max(last_round, 1)
 
-        # The fix runs exactly when this stage passed in the same attempt (both
-        # share the `run validation` predicate), and this stage's previous
-        # result is still in ctx.results: a skipped stage leaves output None.
+        # The fix runs only when this stage passed in the same attempt, and
+        # this stage's previous result is still in ctx.results: a skipped stage
+        # leaves output None. The fix is also skipped after a run the
+        # unchanged-tree guard stopped (_failed_with_new_evidence), so its own
+        # result says whether it ran.
         prev = ctx.results.get(f"retry ledger {self.step}")
-        fix_ran = prev is not None and prev.success and prev.output is not None
+        fix_prev = ctx.results.get(f"fix {self.step}")
+        fix_ran = (
+            prev is not None and prev.success and prev.output is not None
+            and fix_prev is not None
+            and not (fix_prev.success and fix_prev.output is None)
+        )
 
         pre_fix = _ledger_attempt_path(self.root, self.step, attempt, "pre-fix.json")
         proc = await asyncio.create_subprocess_exec(
@@ -1479,6 +1488,25 @@ def _assert_index_clean(during: str) -> str:
     )
 
 
+# What the in-loop validation prints, instead of running, when the fix before it
+# changed nothing (see :func:`_proven_validation`).
+_UNCHANGED_SINCE_FAILURE = "the fix changed nothing since the last failing run"
+
+
+def _failed_with_new_evidence(run_stage: str) -> Callable[[PipelineContext], bool]:
+    """Predicate: *run_stage* failed, and it actually ran the validation.
+
+    When the unchanged-tree guard stops a run, its own message is the only
+    failure output, so a fix agent started after it has no evidence to work
+    from: one went on to probe Docker by hand and was killed with a container
+    still running. The loop then exhausts on the guard again at no cost, and an
+    operator's retry reruns the validation in full.
+    """
+    failed = stage_failed(run_stage)
+    guarded = output_contains(run_stage, _UNCHANGED_SINCE_FAILURE)
+    return lambda ctx: failed(ctx) and not guarded(ctx)
+
+
 def _validation_proof_path(key: str, validation_cmd: str) -> str:
     """The snapshot a passing in-loop run of *validation_cmd* leaves for *key*.
 
@@ -1527,7 +1555,7 @@ def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
         f"python3 {q(SNAPSHOT_HELPER)} diff {q(failed)} {q(failed_now)}{NORN_STATE_IGNORE_FLAGS}"
         f" > {q(failed_delta)} && "
         f"if [ ! -s {q(failed_delta)} ]; then "
-        f'echo "ERROR: the fix changed nothing since the last failing run, so the validation '
+        f'echo "ERROR: {_UNCHANGED_SINCE_FAILURE}, so the validation '
         f'was not rerun: it would fail the same way. The previous failure stands." 1>&2; '
         f'echo "To rerun it anyway (a flaky failure, or something outside the tree was fixed), '
         f'answer [r] once the loop is exhausted." 1>&2; '
@@ -2326,7 +2354,8 @@ for step_file in step_files:
     #                   gives the fix prompt the attempt number, and fails
     #                   before the fix on an A→B→A oscillation (_RetryLedger)
     #   fix           — only when the last run_stage_name failed (skipped on
-    #                   the first iteration and after a success)
+    #                   the first iteration, after a success, and after a run
+    #                   the unchanged-tree guard stopped: it has no evidence)
     #   run           — the acceptance command; this is the contract
     # ------------------------------------------------------------------
     loop_stages = [
@@ -2353,7 +2382,7 @@ for step_file in step_files:
                 setting_sources=["project"],
                 model=step_model,
             ),
-            when=stage_failed(run_stage_name),
+            when=_failed_with_new_evidence(run_stage_name),
             timeout=TIMEOUT_FIX,
         ),
         Stage(
@@ -2643,7 +2672,7 @@ _agg_loop_stages = [
             setting_sources=["project"],
             model=AGGREGATE_MODEL,
         ),
-        when=stage_failed("aggregate run"),
+        when=_failed_with_new_evidence("aggregate run"),
         timeout=TIMEOUT_AGGREGATE_FIX,
     ),
     Stage(

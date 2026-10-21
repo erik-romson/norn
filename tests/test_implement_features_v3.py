@@ -855,6 +855,24 @@ def test_fix_when_falsy_after_successful_run_validation() -> None:
     assert fix_stage.when(ctx) is False
 
 
+def test_fix_when_falsy_after_run_stopped_by_unchanged_guard() -> None:
+    """A run the unchanged-tree guard stopped gives the fix no evidence, so it is skipped."""
+    from norn.models import PipelineContext, StageResult
+
+    mod = _import_v2(GOOD_DIR)
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+    ctx.results[f"run validation {stem}"] = StageResult(
+        name=f"run validation {stem}", success=False,
+        output={"stdout": "", "stderr": f"ERROR: {mod._UNCHANGED_SINCE_FAILURE}, so ...",
+                "returncode": 1},
+    )
+    assert _stage(mod, f"fix {stem}").when(ctx) is False
+    assert _stage(mod, f"retry ledger {stem}").when(ctx) is True, (
+        "the ledger still records the run, so a [r]etry starts a new round"
+    )
+
+
 def test_fix_when_falsy_with_no_prior_result() -> None:
     """fix stage `when` predicate returns False when run validation has not run yet."""
     from norn.models import PipelineContext
@@ -2373,6 +2391,26 @@ def test_aggregate_fix_when_falsy_after_successful_aggregate_run() -> None:
         name="aggregate run", success=True, output="passed"
     )
     assert fix_stage.when(ctx) is False
+
+
+def test_aggregate_fix_when_falsy_after_run_stopped_by_unchanged_guard() -> None:
+    """aggregate fix is skipped when the guard, not the suite, failed the aggregate run."""
+    from norn.models import PipelineContext, StageResult
+
+    mod = _import_v2(GOOD_DIR)
+    ctx = PipelineContext()
+    ctx.results["aggregate run"] = StageResult(
+        name="aggregate run", success=False,
+        output={"stdout": "", "stderr": f"ERROR: {mod._UNCHANGED_SINCE_FAILURE}, so ...",
+                "returncode": 1},
+    )
+    assert _stage(mod, "aggregate fix").when(ctx) is False
+
+
+def test_unchanged_guard_prints_the_marker_the_fix_predicate_reads() -> None:
+    """The guard's message carries _UNCHANGED_SINCE_FAILURE, or the skip never fires."""
+    mod = _import_v2(GOOD_DIR)
+    assert mod._UNCHANGED_SINCE_FAILURE in mod._AGG_IN_LOOP
 
 
 def test_aggregate_fix_when_falsy_with_no_prior_result() -> None:
@@ -4990,12 +5028,14 @@ def test_detect_oscillation_requires_consecutive_attempts() -> None:
     assert mod.detect_oscillation(entries) is None
 
 
-def _ledger_harness(mod, root: Path, git_root: Path, max_retries: int, run_failsets: list):
+def _ledger_harness(mod, root: Path, git_root: Path, max_retries: int, run_failsets: list,
+                    fix_when=None):
     """Build a real loop: mock compress, real retry ledger, mock fix, mock run.
 
     ``run_failsets[i]`` is the set of test names attempt i+1's run reports as
-    FAILED; ``None`` makes that run pass.  Returns (pipeline, ledger, fix_calls,
-    run_calls).
+    FAILED; ``None`` makes that run pass, and ``"guard"`` makes it fail the way
+    the unchanged-tree guard does.  *fix_when* defaults to the ledger's own
+    predicate.  Returns (pipeline, ledger, fix_calls, run_calls).
     """
     from norn.dsl import OnFailure, Pipeline, Stage, stage_failed
     from norn.models import StageResult
@@ -5030,6 +5070,13 @@ def _ledger_harness(mod, root: Path, git_root: Path, max_retries: int, run_fails
             if failset is None:
                 return StageResult(name="", success=True,
                                    output={"stdout": "1 passed", "stderr": "", "returncode": 0})
+            if failset == "guard":
+                return StageResult(
+                    name="", success=False, error="Command exited with code 1",
+                    output={"stdout": "",
+                            "stderr": f"ERROR: {mod._UNCHANGED_SINCE_FAILURE}, so ...\n",
+                            "returncode": 1},
+                )
             filler = "".join(f"progress line {i}\n" for i in range(80))
             failed = "".join(f"FAILED {t} - AssertionError\n" for t in sorted(failset))
             return StageResult(
@@ -5058,7 +5105,7 @@ def _ledger_harness(mod, root: Path, git_root: Path, max_retries: int, run_fails
         stages=[
             Stage(f"compress {step}", _Compress()),
             Stage(ledger_name, ledger, when=stage_failed(run_name)),
-            Stage(f"fix {step}", fix, when=stage_failed(run_name)),
+            Stage(f"fix {step}", fix, when=(fix_when or stage_failed)(run_name)),
             Stage(run_name, run),
         ],
     )
@@ -5187,6 +5234,33 @@ async def test_retry_ledger_stops_on_oscillation_through_a_real_loop(tmp_path) -
     assert "tests/test_x.py::test_a" in osc and "tests/test_x.py::test_b" in osc
     assert "FAILED tests/test_x.py::test_b - AssertionError" in osc
     assert sum(1 for line in osc.splitlines() if line.startswith("### ")) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_ledger_skips_fix_after_unchanged_guard(tmp_path) -> None:
+    """A guarded run skips the next fix, and the ledger records no fix for it."""
+    from norn.runner import run_pipeline
+
+    mod = _import_v2(GOOD_DIR)
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    _init_temp_repo(tmp_path / "repo")
+    pipeline, ledger, fix, run = _ledger_harness(
+        mod, root, tmp_path / "repo", 4, [_A, "guard", _B, None],
+        fix_when=mod._failed_with_new_evidence,
+    )
+
+    ctx = await run_pipeline(pipeline)
+
+    step = _LEDGER_STEP
+    assert ctx.results[f"run validation {step}"].success
+    assert run.calls == 4
+    assert [c[0] for c in ledger.calls] == [2, 3, 4], "the ledger still records every failure"
+    assert len(fix.calls) == 2, "no fix runs after the guarded run of attempt 2"
+    assert (root / f"{step}.attempt-2.fix.txt").read_text() == "fix response 1"
+    assert not (root / f"{step}.attempt-3.fix.txt").exists(), (
+        "the fix of attempt 3 was skipped, so the ledger must not record one"
+    )
 
 
 @pytest.mark.asyncio
