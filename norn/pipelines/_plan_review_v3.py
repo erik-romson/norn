@@ -160,7 +160,9 @@ def render_plan_approval(
         "\n"
         "DECISION: pending\n"
         "\n"
-        f"Set DECISION to approve when the plan is right. Edit the plan freely first: {plan}\n"
+        "The run waits until you change the line above to exactly `DECISION: approve` "
+        "and save this file.\n"
+        f"Edit the plan freely first: {plan}\n"
         f"- Codex review: {review} — {total} findings: {counts['accepted']} accepted, "
         f"{counts['rejected']} rejected, {counts['deferred']} deferred\n"
         f"- Questions: {questions} — {answered} answered, {from_rec} from a recommendation\n"
@@ -425,18 +427,22 @@ def add_plan_review_stages_v3(
             ),
             on_failure=fail,
         )
-    _approve_action = f"Set DECISION to approve in {approval}, then [r]etry."
+    _approve_action = (
+        f"To approve the plan, edit {approval}: change the DECISION line to exactly "
+        "`DECISION: approve`, save the file, then [r]etry."
+    )
+    _approve_values = frozenset({"approve", "approved"})
     pipeline.stage(
         "plan approved",
         DecisionGate(
-            path=approval, field="DECISION", accept=frozenset({"approve"}), action=_approve_action
+            path=approval, field="DECISION", accept=_approve_values, action=_approve_action
         ),
         on_failure=ask_user,
     )
     pipeline.stage(
         "plan approval recorded",
         DecisionGate(
-            path=approval, field="DECISION", accept=frozenset({"approve"}), action=_approve_action
+            path=approval, field="DECISION", accept=_approve_values, action=_approve_action
         ),
         on_failure=fail,
         always_run=True,

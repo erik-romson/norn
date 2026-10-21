@@ -216,9 +216,12 @@ def test_gate_two_placement_and_policies(paths):
 
 def test_gate_two_action_names_the_file_and_retry(paths):
     approved = _stage(_build(paths), "plan approved").impl
-    assert approved.action == f"Set DECISION to approve in {paths.approval}, then [r]etry."
+    assert approved.action == (
+        f"To approve the plan, edit {paths.approval}: change the DECISION line to exactly "
+        "`DECISION: approve`, save the file, then [r]etry."
+    )
     assert approved.field == "DECISION"
-    assert approved.accept == frozenset({"approve"})
+    assert approved.accept == frozenset({"approve", "approved"})
 
 
 def test_auto_approve_exists_only_in_auto_or_gate_off(paths):
