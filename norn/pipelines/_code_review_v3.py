@@ -629,14 +629,15 @@ Write {paths.code_review} in exactly this shape:
 # Code review — {key} (<base7>..<head7>)
 
 STATUS: PROPOSED
-<!-- Set each Disposition to fix, skip or follow-up, then set the STATUS line to DECIDED. -->
+
+To decide: set each Disposition to fix, skip or follow-up, then change PROPOSED above to DECIDED.
 
 ## C1. <title> [critical|major|minor|nit]
+Disposition: fix
 Where: <path>:<line>
 Problem: <what is wrong>
 Fix: <the change to make>
 Source: <claude, codex, followups, review>
-Disposition: fix
 
 ## Dropped as false positives
 - <source> <id> <title> — <why it is wrong>
@@ -657,7 +658,13 @@ Rules:
   remaining nits go under `## Omitted findings` as one-line `- <title> [nit]`
   bullets. Only nits may go under `## Omitted findings`.
 - A section is at most 8 lines, the heading included. Each field starts its own
-  line, in plain text; `Where:`, `Problem:` and `Disposition:` are required.
+  line, in plain text, in the order shown; `Disposition:`, `Where:` and
+  `Problem:` are required.
+- Write the title as one plain sentence that states the defect. `Problem:` is
+  at most two short sentences a reader understands without opening the code;
+  `Fix:` says what to change, not how the reviewer found it.
+- The fix agent cannot run git, so a finding about commit messages or history
+  gets `skip (reworded at gate 4 with COMMITS: rewrite)`, never `fix`.
 - Propose a Disposition: `fix` for critical and major findings and for small
   minor ones; `follow-up` for larger minor ones; `skip (<reason>)` for nits.
 - Leave out an empty `## Dropped as false positives` or `## Omitted findings`

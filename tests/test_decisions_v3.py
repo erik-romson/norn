@@ -338,6 +338,39 @@ async def test_code_review_gate_require_decided(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_code_review_gate_proposed_asks_for_a_decision(tmp_path):
+    p = tmp_path / "r.md"
+    p.write_text(_review(_finding(1), _finding(2, disposition="skip (nit)")))
+    result = await CodeReviewGate(path=str(p), require_decided=True).run(_ctx())
+    assert not result.success
+    lines = result.error.splitlines()
+    assert lines[0].startswith("Code review waits for your decision: 2 findings")
+    assert "1 fix, 1 skip proposed" in lines[0]
+    assert lines[1].lstrip().startswith("C1") and lines[2].lstrip().startswith("C2")
+    assert "STATUS: DECIDED" in lines[-1]
+    assert "problem" not in result.error
+    assert len(lines) <= 8
+
+
+@pytest.mark.asyncio
+async def test_code_review_gate_decision_request_caps_rows(tmp_path):
+    p = tmp_path / "r.md"
+    p.write_text(_review(*(_finding(n) for n in range(1, 8))))
+    result = await CodeReviewGate(path=str(p), require_decided=True).run(_ctx())
+    lines = result.error.splitlines()
+    assert len(lines) == 8
+    assert "\u2026 and 2 more" in lines[6]
+
+
+@pytest.mark.asyncio
+async def test_code_review_gate_one_problem_is_singular(tmp_path):
+    p = tmp_path / "r.md"
+    p.write_text(_review(_finding(1, disposition="maybe")))
+    result = await CodeReviewGate(path=str(p)).run(_ctx())
+    assert result.error.startswith("1 problem in ")
+
+
+@pytest.mark.asyncio
 async def test_code_review_gate_no_findings(tmp_path):
     p = tmp_path / "r.md"
     p.write_text(_review("No findings.\n", status="DECIDED"))

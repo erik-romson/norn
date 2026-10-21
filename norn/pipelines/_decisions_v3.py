@@ -554,6 +554,12 @@ class CodeReviewGate(BaseStage):
             )
         review = parse_code_review(resolved.read_text())
         problems = list(review.problems)
+        shown = _shown_path(resolved)
+        if self.require_decided and review.status == "PROPOSED" and not problems:
+            # Not a broken file: the run waits for the human's decision.
+            self._record(ctx, [])
+            request = _decision_request(review, shown)
+            return _fail(request, output=request)
         if self.require_decided and review.status != "DECIDED":
             problems.append(
                 f"STATUS is {review.status or 'missing'}; set each Disposition, "
@@ -561,15 +567,49 @@ class CodeReviewGate(BaseStage):
             )
         self._record(ctx, problems)
         if problems:
+            noun = "problem" if len(problems) == 1 else "problems"
             return _fail(
                 format_gate_error(
-                    f"{len(problems)} problems in {resolved}",
+                    f"{len(problems)} {noun} in {shown}",
                     problems,
                     "Fix them in that file, then choose [r]etry.",
                 ),
                 output="\n".join(problems),
             )
         return _ok()
+
+
+def _shown_path(path: Path) -> str:
+    """*path* relative to the launch directory when it lies inside it, so it fits the modal."""
+    try:
+        return str(path.resolve().relative_to(Path.cwd().resolve()))
+    except ValueError:
+        return str(path)
+
+
+def _decision_request(review: CodeReview, shown: str) -> str:
+    """The gate-3 prompt for a well-formed PROPOSED file: what is proposed, and what to do."""
+    counts: dict[str, int] = {}
+    for f in review.findings:
+        counts[f.disposition] = counts.get(f.disposition, 0) + 1
+    proposed = ", ".join(f"{n} {d}" for d, n in counts.items())
+    noun = "finding" if len(review.findings) == 1 else "findings"
+    summary = f"Code review waits for your decision: {len(review.findings)} {noun}"
+    if proposed:
+        summary += f" ({proposed} proposed)"
+    rows = [
+        f"{f.cid:<3} {f.severity or '-':<5} {f.disposition:<9} {_cut(f.title, 60)}"
+        for f in review.findings
+    ]
+    return format_gate_error(
+        summary,
+        rows,
+        f"Change any Disposition in {shown}, set STATUS: DECIDED, then [r]etry.",
+    )
+
+
+def _cut(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: width - 1].rstrip() + "\u2026"
 
 
 class AutoDecideCodeReview(BaseStage):
