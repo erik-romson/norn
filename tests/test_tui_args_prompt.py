@@ -18,8 +18,8 @@ from norn.tui.args_prompt import (
     is_path_arg,
     run_fzf,
 )
-from norn.tui.launch import BUDGET_PARAM, TOKEN_BUDGET_PARAM
-from textual.widgets import Input
+from norn.tui.launch import BUDGET_PARAM, TOKEN_BUDGET_PARAM, launch_argv
+from textual.widgets import Checkbox, Input
 
 
 # ---------------------------------------------------------------------------
@@ -246,3 +246,54 @@ async def test_args_prompt_declared_arg_wins_over_the_budget_field() -> None:
         await pilot.press("ctrl+s")
         await pilot.pause()
     assert app.params == {"budget": "17"}
+
+
+# ---------------------------------------------------------------------------
+# Switch args (a checkbox, sent as --arg <name>=on)
+# ---------------------------------------------------------------------------
+
+_SWITCH_META = {
+    "args": "Issue key",
+    "auto": {"type": "switch", "help": "Run without asking"},
+}
+
+
+@pytest.mark.asyncio
+async def test_ticked_switch_is_on_and_reaches_the_pipeline_as_an_arg() -> None:
+    app = ArgsPromptApp("p", _SWITCH_META)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = app.screen
+        assert not screen.query("Input#arg-auto")
+        screen.query_one("#arg-args", Input).value = "123"
+        screen.query_one("#arg-auto", Checkbox).value = True
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+    assert app.params == {"args": "123", "auto": "on"}
+    assert launch_argv(app.params) == ["123", "--arg", "auto=on"]
+
+
+@pytest.mark.asyncio
+async def test_unticked_switch_is_left_out_of_the_launch() -> None:
+    app = ArgsPromptApp("p", _SWITCH_META)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#arg-args", Input).value = "123"
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+    assert app.params == {"args": "123", "auto": ""}
+    assert launch_argv(app.params) == ["123"]
+
+
+@pytest.mark.asyncio
+async def test_resume_ticks_a_switch_the_run_was_started_with() -> None:
+    screen = ArgsPromptScreen("p", _SWITCH_META, initial={"args": "123", "auto": "on"}, resume=True)
+
+    class _Host(ArgsPromptApp):
+        async def on_mount(self) -> None:
+            await self.push_screen(screen)
+
+    app = _Host("p", _SWITCH_META)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert screen.query_one("#arg-auto", Checkbox).value is True

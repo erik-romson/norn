@@ -112,6 +112,9 @@ def resolve_issue(
                 "(lower-case)."
             )
 
+    # `--arg auto=on` means the same as the positional: it is what the norn ui checkbox sends.
+    auto = auto or _fix_jira_v3.on_off_knob(dict(args), "auto", False)
+
     if not refs:
         raise ValueError(
             "fix_issue_v1 needs one issue reference: a Jira key (CBS-1234), a /browse/ "

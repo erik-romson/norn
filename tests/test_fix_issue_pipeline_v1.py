@@ -752,13 +752,16 @@ _DOC_MARKERS = (
 
 
 def test_catalog_entry():
+    from norn.catalog import arg_help, is_switch_arg
     from norn.tui.args_prompt import is_path_arg
 
     info = get_pipeline_info("fix_issue_v1")
     assert info is not None
     assert info.env_vars == ["ANTHROPIC_API_KEY"]
-    assert list(info.args) == ["args"]
+    assert list(info.args) == ["args", "auto"]
     assert not is_path_arg(info.args["args"])
+    assert is_switch_arg(info.args["auto"])
+    assert "never pauses to ask you" in arg_help(info.args["auto"])
     assert info.short.startswith("Fix a Jira or GitHub issue")
     for marker in _DOC_MARKERS:
         assert marker in info.long, marker

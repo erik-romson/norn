@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from norn.catalog import _extract_metadata
+from norn.catalog import _extract_metadata, arg_help
 from norn.dsl import Pipeline
 from norn.graph import PipelineNode, build_graph
 
@@ -26,8 +26,8 @@ def to_markdown(pipeline: Pipeline, config_path: str) -> str:
         lines.append("")
         lines.append("## Inputs")
         if args:
-            for arg_name, arg_desc in args.items():
-                lines.append(f"- **{arg_name}**: {arg_desc}")
+            for arg_name, arg_spec in args.items():
+                lines.append(f"- **{arg_name}**: {arg_help(arg_spec)}")
         if env_vars:
             lines.append("")
             lines.append("Environment variables: " + ", ".join(f"`{v}`" for v in env_vars))

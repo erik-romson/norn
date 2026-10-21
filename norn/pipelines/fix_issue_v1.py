@@ -33,9 +33,12 @@ in the issue directory (shown here with <KEY>; issue-<slug> for GitHub):
   4. <KEY>-ship.md             COMMITS (rewrite or keep), TITLE, then
                                STATUS: DECIDED; nothing is pushed before it
 
-`auto` decides every gate it safely can and stops, with a prompt and an
-alert, where it cannot.  `auto --non-interactive` turns every such stop into
-an abort with a FAILED alert.
+`auto` (or `--arg auto=on`, the `auto` checkbox under `norn ui`) runs
+hands-off: no gate pauses for you.  It answers the plan questions with their
+recommendations, approves the plan, fixes every code-review finding except
+nits and accepts the proposed commits and PR title.  It stops, with a prompt
+and an alert, only where it cannot decide safely.  `auto --non-interactive`
+turns every such stop into an abort with a FAILED alert.
 
 Fetch notes.  A GitHub fetch also records fetch notes: attachments that did
 not download, text written by people without write access, a title that
@@ -209,8 +212,18 @@ metadata = {
     "args": {
         "args": (
             "Issue: a Jira key (CBS-2249), a GitHub issue number (123), owner/repo#123 "
-            "or an issue URL, optionally followed by `auto`"
-        )
+            "or an issue URL"
+        ),
+        "auto": {
+            "type": "switch",
+            "help": (
+                "Hands-off run: the pipeline never pauses to ask you and approves every "
+                "gate itself. It answers the plan questions with their recommendations, "
+                "approves the plan, fixes every code-review finding except nits, accepts "
+                "the proposed commits and PR title, and opens the draft PR. It still "
+                "stops, with an alert, where it cannot decide safely."
+            ),
+        },
     },
 }
 

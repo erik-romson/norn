@@ -13,6 +13,21 @@ log = logging.getLogger(__name__)
 
 _PIPELINES_DIR = Path(__file__).parent / "pipelines"
 
+# An ``args`` entry is a description string (a text input; the one named
+# ``args`` is the positional) or ``{"type": "switch", "help": ...}``: a
+# checkbox in ``norn ui``, sent as ``--arg <name>=on`` when ticked.
+type ArgSpec = str | dict[str, str]
+
+
+def is_switch_arg(spec: ArgSpec) -> bool:
+    """Return whether an ``args`` entry declares an on/off switch."""
+    return isinstance(spec, dict) and spec.get("type") == "switch"
+
+
+def arg_help(spec: ArgSpec) -> str:
+    """Return the description of an ``args`` entry."""
+    return spec.get("help", "") if isinstance(spec, dict) else spec
+
 
 @dataclass
 class PipelineInfo:
@@ -20,11 +35,11 @@ class PipelineInfo:
     short: str
     long: str
     env_vars: list[str] = field(default_factory=list)
-    args: dict[str, str] = field(default_factory=dict)
+    args: dict[str, ArgSpec] = field(default_factory=dict)
     path: Path = field(default_factory=lambda: Path())
 
 
-def _extract_metadata(source: str) -> tuple[str, str, list[str], dict[str, str]]:
+def _extract_metadata(source: str) -> tuple[str, str, list[str], dict[str, ArgSpec]]:
     """Extract docstring and metadata dict from pipeline source using AST.
 
     Returns (short_description, long_description, env_vars, args).
@@ -38,7 +53,7 @@ def _extract_metadata(source: str) -> tuple[str, str, list[str], dict[str, str]]
 
     # Walk top-level assignments looking for `metadata = {...}`
     env_vars: list[str] = []
-    args: dict[str, str] = {}
+    args: dict[str, ArgSpec] = {}
     for node in ast.iter_child_nodes(tree):
         if not isinstance(node, ast.Assign):
             continue

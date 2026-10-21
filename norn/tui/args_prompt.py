@@ -6,6 +6,9 @@ their ``metadata`` need values before a run can start (e.g. the bundled
 files).  This module renders one input per declared arg and, for args whose
 description looks like a filesystem path, offers an ``fzf`` picker
 (``ctrl+o``) so the user can fuzzy-find a file or folder instead of typing it.
+An arg declared as a switch (:func:`norn.catalog.is_switch_arg`) is a checkbox
+instead; ticked, its value is ``on``, which reaches the pipeline as
+``--arg <name>=on``.
 
 The screen also collects the run's cost and token ceilings (:data:`BUDGET_PARAM`
 and :data:`TOKEN_BUDGET_PARAM`).  Both are optional — blank keeps whatever the
@@ -27,7 +30,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Input, Label, Static
+from textual.widgets import Checkbox, Footer, Header, Input, Label, Static
+
+from norn.catalog import ArgSpec, arg_help, is_switch_arg
 
 # The param keys carrying these values back to the caller live in `launch.py`
 # (textual-free), which turns them into `Budget` limits for the run.
@@ -163,6 +168,7 @@ class ArgsPromptScreen(Screen):
         padding: 1 2;
     }
     ArgsPromptScreen Label {
+        width: 100%;
         margin-top: 1;
         color: $text-muted;
     }
@@ -176,7 +182,7 @@ class ArgsPromptScreen(Screen):
     def __init__(
         self,
         pipeline_name: str,
-        args_meta: dict[str, str],
+        args_meta: dict[str, ArgSpec],
         *,
         initial: dict[str, str] | None = None,
         resume: bool = False,
@@ -188,7 +194,12 @@ class ArgsPromptScreen(Screen):
         self._initial = dict(initial or {})
         self._resume = resume
         self._id_to_name: dict[str, str] = {_input_id(n): n for n in self._args_meta}
-        self._path_args = {n for n, d in self._args_meta.items() if is_path_arg(d)}
+        self._switch_args = {n for n, spec in self._args_meta.items() if is_switch_arg(spec)}
+        self._path_args = {
+            n
+            for n, spec in self._args_meta.items()
+            if n not in self._switch_args and is_path_arg(arg_help(spec))
+        }
         # A pipeline that declares an arg of the same name owns that name; the
         # launch-time override field is dropped rather than shadowing it.
         self._budget_fields = {
@@ -207,7 +218,14 @@ class ArgsPromptScreen(Screen):
                 )
             else:
                 yield Label(f"Arguments for [b]{self._pipeline_name}[/b]")
-            for name, desc in self._args_meta.items():
+            for name, spec in self._args_meta.items():
+                desc = arg_help(spec)
+                if name in self._switch_args:
+                    yield Label(f"{name}: {desc}")
+                    yield Checkbox(
+                        name, value=self._initial.get(name) == "on", id=_input_id(name)
+                    )
+                    continue
                 hint = " — ctrl+o to browse" if name in self._path_args else ""
                 yield Label(f"{name}: {desc}{hint}")
                 yield Input(value=self._initial.get(name, ""), id=_input_id(name), placeholder=desc)
@@ -225,16 +243,24 @@ class ArgsPromptScreen(Screen):
         # Focus the first input so the user can type / browse immediately.
         first = next(iter(self._args_meta), None)
         if first is not None:
-            self.query_one(f"#{_input_id(first)}", Input).focus()
+            self.query_one(f"#{_input_id(first)}").focus()
 
     # ------------------------------------------------------------------
     # Accessors (used in tests)
     # ------------------------------------------------------------------
 
     def get_values(self) -> dict[str, str]:
-        """Return the current ``{arg_name: value}`` mapping from the inputs."""
+        """Return the current ``{arg_name: value}`` mapping from the inputs.
+
+        A ticked switch is ``on`` and an unticked one blank, so it is left out
+        of the launch like an untyped flag.
+        """
         return {
-            name: self.query_one(f"#{_input_id(name)}", Input).value
+            name: (
+                ("on" if self.query_one(f"#{_input_id(name)}", Checkbox).value else "")
+                if name in self._switch_args
+                else self.query_one(f"#{_input_id(name)}", Input).value
+            )
             for name in self._args_meta
         }
 
@@ -304,7 +330,7 @@ class ArgsPromptApp(App):
 
     TITLE = "Norn — Arguments"
 
-    def __init__(self, pipeline_name: str, args_meta: dict[str, str]) -> None:
+    def __init__(self, pipeline_name: str, args_meta: dict[str, ArgSpec]) -> None:
         super().__init__()
         self._pipeline_name = pipeline_name
         self._args_meta = dict(args_meta)

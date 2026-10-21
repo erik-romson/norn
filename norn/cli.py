@@ -10,7 +10,13 @@ from pathlib import Path
 
 from norn.agents import session_totals
 from norn.alerts import AlertManager
-from norn.catalog import get_pipeline_info, list_pipelines, load_bundled_pipeline
+from norn.catalog import (
+    arg_help,
+    get_pipeline_info,
+    is_switch_arg,
+    list_pipelines,
+    load_bundled_pipeline,
+)
 from norn.envfile import apply_env_files
 from norn.checkpoint import Checkpoint, load_checkpoint
 from norn.dsl import Pipeline, apply_budget_overrides
@@ -561,13 +567,16 @@ def main() -> None:
             console.print()
         if info.args:
             console.print("  [bold]Arguments:[/bold]")
-            for arg_name, arg_desc in info.args.items():
-                console.print(f"    {arg_name:12s}{arg_desc}")
+            for arg_name, arg_spec in info.args.items():
+                console.print(f"    {arg_name:12s}{arg_help(arg_spec)}")
             console.print()
         console.print(f"  [bold]Usage:[/bold]")
         usage = f"    norn run {info.name}"
         if info.args:
-            usage += " " + " ".join(f"<{a}>" for a in info.args)
+            usage += " " + " ".join(
+                f"[--arg {a}=on]" if is_switch_arg(spec) else f"<{a}>"
+                for a, spec in info.args.items()
+            )
         console.print(usage)
         console.print()
         # Model labels: load the actual pipeline and walk Generate stages

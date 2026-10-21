@@ -27,7 +27,7 @@ from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Footer, Tree
 
-from norn.catalog import get_pipeline_info
+from norn.catalog import ArgSpec, get_pipeline_info
 from norn.tui.args_prompt import ArgsPromptScreen, run_fzf
 from norn.tui.launch import (
     build_run_setup,
@@ -787,7 +787,7 @@ class NornUIApp(App):
         is_bundled: bool,
         display_name: str,
         from_launcher: bool,
-        args_meta: dict[str, str] | None = None,
+        args_meta: dict[str, ArgSpec] | None = None,
         use_worktree: bool = False,
     ) -> None:
         if args_meta is None:
@@ -893,7 +893,7 @@ class NornUIApp(App):
         self._show_launcher()
 
     def _begin_resume(
-        self, ref: str, is_bundled: bool, display_name: str, args_meta: dict[str, str]
+        self, ref: str, is_bundled: bool, display_name: str, args_meta: dict[str, ArgSpec]
     ) -> None:
         """Resume from the checkpoint with the params the run was launched with.
 

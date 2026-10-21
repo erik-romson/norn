@@ -197,6 +197,14 @@ def test_auto_flag(repo):
         _resolve(["123", "Auto"], repo)
 
 
+def test_auto_arg_is_the_same_as_the_positional(repo):
+    assert _resolve(["123"], repo, {"auto": "on"})[1] is True
+    assert _resolve(["123"], repo, {"auto": "off"})[1] is False
+    assert _resolve(["123", "auto"], repo, {"auto": "off"})[1] is True
+    with pytest.raises(ValueError, match="--arg auto: must be 'on' or 'off'"):
+        _resolve(["123"], repo, {"auto": "yes"})
+
+
 def test_pipeline_tokens(repo):
     assert _resolve(["run", "fix_issue_v1", "123"], repo)[0].display == "#123"
     s, auto = _resolve(["run", "/x/fix_issue_v1.py", "123", "auto", "--resume"], repo)

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from norn.agents import resolve_agent_provider
-from norn.catalog import _extract_metadata, get_pipeline_info, load_bundled_pipeline
+from norn.catalog import ArgSpec, _extract_metadata, get_pipeline_info, load_bundled_pipeline
 from norn.dsl import apply_budget_overrides
 from norn.graph import build_graph
 from norn.loader import load_pipeline as _load_pipeline_from_file
@@ -41,7 +41,7 @@ def _bundled_dir() -> Path:
     return Path(_pkg.__file__).parent
 
 
-def pipeline_args_meta(pipeline_ref: str) -> dict[str, str]:
+def pipeline_args_meta(pipeline_ref: str) -> dict[str, ArgSpec]:
     """Return a pipeline's declared ``args`` metadata (name → description).
 
     Works for a bundled name or an external file path. Empty when the
