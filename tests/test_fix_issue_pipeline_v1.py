@@ -607,6 +607,14 @@ def test_prepare_branch_writes_base_branch_only_with_base_sha(tmp_path):
     assert Path(mod.START_BRANCH_FILE).read_text() == "main\n"
 
 
+def test_gate_4_errors_name_the_ship_file_line(tmp_path):
+    v1 = _import_fix_issue(["CBS-1234"], cwd=tmp_path)
+    v3 = _import_v3(["CBS-1234"], cwd=tmp_path)
+    for name in ("ship decided", "ship decision recorded"):
+        assert _find_stage(v1.config.items, name).impl.show_line, name
+        assert not _find_stage(v3.config.items, name).impl.show_line, name
+
+
 def test_check_pr_base_and_resolve_branch_read_the_start_branch(tmp_path):
     mod = _import_fix_issue(["CBS-1234"], cwd=tmp_path)
     items = mod.config.items

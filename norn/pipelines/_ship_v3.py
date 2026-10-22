@@ -1294,6 +1294,7 @@ def add_ship_stages(
     issue_line_ok: Callable[[str], bool] | None = None,
     issue_label: str = "Jira",
     extra_checklist: Callable[[], list[str]] | None = None,
+    field_lines: bool = False,
 ) -> Pipeline:
     """Add stages 52-68 (``record rewrite range`` … ``record shipped head``).
 
@@ -1301,7 +1302,8 @@ def add_ship_stages(
     of the PR title; every stage here checks against it.  *issue_line* and
     *issue_line_ok* (both or neither) replace the Jira first line of the PR
     body and its check; *issue_label* names the issue source in the prompts;
-    *extra_checklist* adds ``## For the human`` items.
+    *extra_checklist* adds ``## For the human`` items.  *field_lines* makes
+    the gate-4 errors name the line of the ship file to edit.
     """
     if (issue_line is None) != (issue_line_ok is None):
         raise ValueError(
@@ -1420,12 +1422,13 @@ def add_ship_stages(
             field="STATUS",
             accept=frozenset({"DECIDED"}),
             action=f"Set the STATUS line to DECIDED in {paths.ship}, then [r]etry.",
+            show_line=field_lines,
         ),
         on_failure=ask_user,
     )
     pipeline.stage(
         "ship decision recorded",
-        ShipDecisionGate(path=paths.ship, key=prefix),
+        ShipDecisionGate(path=paths.ship, key=prefix, show_line=field_lines),
         on_failure=fail,
         always_run=True,
     )

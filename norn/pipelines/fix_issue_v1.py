@@ -616,6 +616,7 @@ add_ship_stages(
     issue_line_ok=SOURCE.issue_line_ok,
     issue_label=SOURCE.issue_label,
     extra_checklist=SOURCE.fetch_checklist,
+    field_lines=True,
 )
 
 # 69-82. The PR phase: every stage is always_run.

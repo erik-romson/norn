@@ -669,6 +669,8 @@ wording; the title is not quoted), the `Stopped`/`PR ready` notifications
 - `auto` on an issue written by people without write access is a
   prompt-injection risk: the issue text reaches the agents. Read the fetch notes
   first.
+- Gate-4 errors name the line of the ship file to edit and quote it
+  (`…-ship.md:3: STATUS is PROPOSED.` / `line 3 now: STATUS: PROPOSED`).
 - Do not run `fix_issue_v1` and `fix_jira_issue_v3` on one Jira key: they share
   `tmp/jira/<KEY>/` and the branch.
 - `norn compare fix_issue_v1 fix_jira_issue_v3` mixes GitHub and Jira runs in
