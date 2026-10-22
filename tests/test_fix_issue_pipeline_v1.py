@@ -264,13 +264,23 @@ def test_jira_parity_with_v3(tmp_path, argv):
     v3 = _import_v3(argv, cwd=tmp_path)
     v1 = _import_fix_issue(argv, cwd=tmp_path)
 
-    assert _collect_top_names(v1.config.items) == _collect_top_names(v3.config.items)
-    assert _all_stage_names(v1.config.items) == _all_stage_names(v3.config.items)
-    for name in ("prepare branch", "fetch issue"):
-        assert (
-            _find_stage(v1.config.items, name).impl.cmd
-            == _find_stage(v3.config.items, name).impl.cmd
-        ), name
+    # The one stage v1 adds: the PR base is checked right after the run identity.
+    v1_top = _collect_top_names(v1.config.items)
+    assert v1_top[v1_top.index("check run identity") + 1] == "check pr base"
+    v1_top.remove("check pr base")
+    v1_all = _all_stage_names(v1.config.items)
+    v1_all.remove("check pr base")
+    assert v1_top == _collect_top_names(v3.config.items)
+    assert v1_all == _all_stage_names(v3.config.items)
+    assert (
+        _find_stage(v1.config.items, "fetch issue").impl.cmd
+        == _find_stage(v3.config.items, "fetch issue").impl.cmd
+    )
+    # `prepare branch` differs only in also writing base.branch with base.sha.
+    v1_prepare = _find_stage(v1.config.items, "prepare branch").impl.cmd
+    v3_prepare = _find_stage(v3.config.items, "prepare branch").impl.cmd
+    assert v1_prepare.split("mkdir -p ")[0] == v3_prepare.split("mkdir -p ")[0]
+    assert v1.START_BRANCH_FILE in v1_prepare
 
     abs_dir = v3.ART.dir.rstrip("/")
     expected = (
@@ -562,6 +572,50 @@ def test_prepare_branch_writes_base_sha_only_when_missing(tmp_path):
     assert r.returncode == 0, r.stderr
     assert Path(mod.BASE_FILE).read_text().strip() == first
     assert _git(repo, "rev-parse", "HEAD") != first
+
+
+def test_prepare_branch_records_the_branch_it_was_cut_from(tmp_path):
+    repo = _repo_on_branch(tmp_path, "main")
+    mod = _import_fix_issue(["123"], cwd=repo)
+
+    r = _run_prepare_branch(mod, repo)
+
+    assert r.returncode == 0, r.stderr
+    assert _git(repo, "branch", "--show-current") == "issue-123"
+    assert Path(mod.START_BRANCH_FILE).read_text() == "main\n"
+
+
+def test_prepare_branch_records_no_start_branch_when_it_stays(tmp_path):
+    repo = _repo_on_branch(tmp_path, "feature/cbs-1234-x")
+    mod = _import_fix_issue(["CBS-1234"], cwd=repo)
+
+    r = _run_prepare_branch(mod, repo)
+
+    assert r.returncode == 0, r.stderr
+    assert Path(mod.START_BRANCH_FILE).read_text() == "\n"
+
+
+def test_prepare_branch_writes_base_branch_only_with_base_sha(tmp_path):
+    repo = _repo_on_branch(tmp_path, "main")
+    mod = _import_fix_issue(["123"], cwd=repo)
+    assert _run_prepare_branch(mod, repo).returncode == 0
+    _git(repo, "switch", "-q", "-c", "elsewhere")
+
+    r = _run_prepare_branch(mod, repo)
+
+    assert r.returncode == 0, r.stderr
+    assert Path(mod.START_BRANCH_FILE).read_text() == "main\n"
+
+
+def test_check_pr_base_and_resolve_branch_read_the_start_branch(tmp_path):
+    mod = _import_fix_issue(["CBS-1234"], cwd=tmp_path)
+    items = mod.config.items
+    for name in ("check pr base", "resolve branch"):
+        impl = _find_stage(items, name).impl
+        assert impl._start_branch_file == mod.START_BRANCH_FILE, name
+        assert impl._base_file == mod.BASE_FILE, name
+    assert isinstance(_find_stage(items, "check pr base").impl, _pr_v3.CheckPrBase)
+    assert _find_stage(items, "check pr base").always_run
 
 
 # ---------------------------------------------------------------------------

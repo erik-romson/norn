@@ -629,6 +629,16 @@ it starts on. Start from the base branch or pass `--arg branch=`, because
 commits already on the starting branch end up before `base.sha`. Jira keeps v3's
 rule: a current branch that contains the key is reused.
 
+**PR base.** `prepare branch` records the branch the run was cut from in
+`base.branch`, next to `base.sha` (empty when the run stays on, or switches to, a
+branch with work of its own). That branch is the PR base unless `--arg base=` or
+an open PR names another; only an empty `base.branch` leaves it to v3's
+fork-point guess. `check pr base`, right after `check run identity`, resolves the
+base the same way and stops the run before any spend when `origin/<base>` is
+missing or does not contain `base.sha` — say a start branch with unpushed
+commits — naming those commits and the push that fixes it. `resolve branch`
+checks again in the PR phase, because origin can move while the run works.
+
 **Prerequisites.**
 - `gh auth login` with push rights.
 - For a GitHub Enterprise host, `GH_HOST` (and `GH_ENTERPRISE_TOKEN`). One host

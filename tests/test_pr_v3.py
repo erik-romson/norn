@@ -27,6 +27,7 @@ from norn.pipelines._pr_v3 import (
     WAIT_FOR_CHECKS_TIMEOUT,
     AnnouncePrReady,
     ChecksGreen,
+    CheckPrBase,
     CheckPrProvenance,
     CheckPrRange,
     ResetPrState,
@@ -516,6 +517,154 @@ async def test_resolve_still_fails_on_two_native_prs(tmp_path):
 
     assert not result.success
     assert "more than one open PR" in result.error
+
+
+def _start_branch_run(tmp_path: Path, *, push_tip: bool = True, work: bool = True) -> tuple[Run, Path]:
+    """CBS-1 cut from ``feature-x``, a branch with a commit of its own on top of main.
+
+    With *push_tip* False, origin/feature-x lacks the tip the run started from.
+    With *work* False, CBS-1 has no commit yet, as before any work.
+    """
+    rr = make_repo_with_remote(tmp_path / "checkout")
+    repo = Path(rr.path)
+    _git(repo, "checkout", "-q", "-b", "feature-x", "main")
+    _commit(repo, "feature: pushed part", {"f1.txt": "1\n"})
+    _git(repo, "push", "-q", "-u", "origin", "feature-x")
+    if not push_tip:
+        _commit(repo, "feature: unpushed part", {"f2.txt": "2\n"})
+    _git(repo, "checkout", "-q", "-b", KEY)
+    base = _git(repo, "rev-parse", "HEAD")
+    head = _commit(repo, "CBS-1: change the greeting", {"greet.txt": "hi\n"}) if work else base
+    art = tmp_path / "art"
+    art.mkdir()
+    base_file = art / "base.sha"
+    base_file.write_text(base + "\n")
+    start_file = art / "base.branch"
+    start_file.write_text("feature-x\n")
+    paths = V3Paths(str(art), KEY)
+    Path(paths.work).mkdir(parents=True)
+    Path(paths.shipped_heads).write_text(head + "\n")
+    run = Run(repo=repo, paths=paths, pr=pr_paths(paths), base_file=base_file, base=base, head=head)
+    return run, start_file
+
+
+def _resolver(
+    run: Run, start_file: Path, cls=ResolveBranchV3, base_arg: str = "", check_base: bool = True
+):
+    return cls(
+        paths=run.pr,
+        project_dir=str(run.repo),
+        base_arg=base_arg,
+        overwrite_remote="",
+        start_branch_file=str(start_file),
+        base_file=str(run.base_file) if check_base else None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_takes_the_start_branch_ahead_of_the_fork_point(tmp_path):
+    run, start_file = _start_branch_run(tmp_path)
+    env, _log = _gh(tmp_path, _resolve_routes([]))
+
+    result = await _resolver(run, start_file).run(ctx_for(env=env))
+
+    assert result.success, result.error
+    assert (result.output["base"], result.output["source"]) == ("feature-x", "start branch")
+    assert Path(run.pr.base).read_text().strip() == "feature-x"
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_an_empty_start_branch_falls_to_the_fork_point(tmp_path):
+    run = _run_repo(tmp_path, push=False)
+    start_file = tmp_path / "art" / "base.branch"
+    start_file.write_text("\n")
+    env, _log = _gh(tmp_path, _resolve_routes([]))
+
+    result = await _resolver(run, start_file).run(ctx_for(env=env))
+
+    assert result.success, result.error
+    assert result.output["base"] == "main"
+    assert result.output["source"] != "start branch"
+
+
+@pytest.mark.asyncio
+async def test_resolve_prefers_an_open_pr_and_base_arg_over_the_start_branch(tmp_path):
+    run, start_file = _start_branch_run(tmp_path)
+    # Only the order is under test: base.sha is on feature-x, not on main.
+    pr = {"number": 7, "baseRefName": "main", "isCrossRepository": False}
+    env, _log = _gh(tmp_path, _resolve_routes([pr]))
+    by_pr = await _resolver(run, start_file, check_base=False).run(ctx_for(env=env))
+    env, _log = _gh(tmp_path, _resolve_routes([]))
+    by_arg = await _resolver(run, start_file, base_arg="main", check_base=False).run(
+        ctx_for(env=env)
+    )
+
+    assert by_pr.success, by_pr.error
+    assert (by_pr.output["base"], by_pr.output["source"]) == ("main", "open PR")
+    assert by_arg.success, by_arg.error
+    assert (by_arg.output["base"], by_arg.output["source"]) == ("main", "--arg base")
+
+
+@pytest.mark.asyncio
+async def test_resolve_stops_when_origin_base_lacks_base_sha(tmp_path):
+    run, start_file = _start_branch_run(tmp_path, push_tip=False)
+    env, _log = _gh(tmp_path, _resolve_routes([]))
+
+    result = await _resolver(run, start_file).run(ctx_for(env=env))
+
+    assert not result.success
+    lines = result.error.splitlines()
+    assert lines[0] == (
+        f"origin/feature-x (start branch) does not contain base.sha {run.base[:7]}: "
+        "the PR would carry 1 commits this run did not make"
+    )
+    assert "feature: unpushed part" in lines[1]
+    assert "`git push origin feature-x`" in lines[-1]
+    assert not Path(run.pr.base).exists()
+
+
+@pytest.mark.asyncio
+async def test_resolve_stops_when_an_open_pr_base_lacks_base_sha(tmp_path):
+    run, start_file = _start_branch_run(tmp_path)
+    pr = {"number": 7, "baseRefName": "main", "isCrossRepository": False}
+    env, _log = _gh(tmp_path, _resolve_routes([pr]))
+
+    result = await _resolver(run, start_file).run(ctx_for(env=env))
+
+    assert not result.success
+    assert result.error.splitlines()[0].startswith("origin/main (open PR) does not contain base.sha")
+    assert "feature: pushed part" in result.error
+
+
+@pytest.mark.asyncio
+async def test_check_pr_base_passes_before_any_work_and_writes_nothing(tmp_path):
+    run, start_file = _start_branch_run(tmp_path, work=False)
+    env, _log = _gh(tmp_path, _resolve_routes([]))
+
+    result = await _resolver(run, start_file, cls=CheckPrBase).run(ctx_for(env=env))
+
+    assert result.success, result.error
+    assert (result.output["base"], result.output["source"]) == ("feature-x", "start branch")
+    assert not Path(run.pr.root).exists()
+
+
+@pytest.mark.asyncio
+async def test_check_pr_base_stops_before_any_work_on_an_unpushed_base(tmp_path):
+    run, start_file = _start_branch_run(tmp_path, push_tip=False, work=False)
+    env, _log = _gh(tmp_path, _resolve_routes([]))
+
+    result = await _resolver(run, start_file, cls=CheckPrBase).run(ctx_for(env=env))
+
+    assert not result.success
+    assert "does not contain base.sha" in result.error.splitlines()[0]
+
+
+def test_v3_resolve_branch_has_no_start_branch_or_base_check(tmp_path):
+    _paths, _pipeline, stages = _build(tmp_path)
+    impl = stages["resolve branch"].impl
+
+    assert impl._start_branch_file is None
+    assert impl._base_file is None
 
 
 def test_reused_resolver_methods_keep_their_keyword_only_signatures():
