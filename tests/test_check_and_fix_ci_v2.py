@@ -155,6 +155,178 @@ async def test_ci_timeout_stops_the_run_with_its_own_error(tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# CheckCIWithLogs: no run, infrastructure failures
+# ---------------------------------------------------------------------------
+
+MAVEN_RESET_LOG = (
+    "[INFO] Building Swagger UI 1.0.0 [35/37]\n"
+    "[ERROR] Plugin org.apache.maven.plugins:maven-jar-plugin:3.4.2 or one of its "
+    "dependencies could not be resolved:\n"
+    "[ERROR] \tThe following artifacts could not be resolved: "
+    "org.apache.maven.plugins:maven-jar-plugin:pom:3.4.2 (absent): Could not transfer "
+    "artifact org.apache.maven.plugins:maven-jar-plugin:pom:3.4.2 from/to central "
+    "(https://repo.maven.apache.org/maven2): Connection reset\n"
+    "[ERROR] -> [Help 1]\n"
+)
+
+COMPILE_ERROR_LOG = (
+    "[ERROR] COMPILATION ERROR :\n"
+    "[ERROR] IHeaderType.java:[25,12] cannot access com.example.ModelUtil\n"
+)
+
+
+def _red(run_id: int, logs: str):
+    from norn.models import StageResult
+
+    return StageResult(
+        name="", success=False,
+        error=f"CI failure: build ({run_id})",
+        output={
+            "run_id": run_id, "name": "build", "status": "completed",
+            "conclusion": "failure", "url": f"https://example.test/runs/{run_id}",
+            "logs": logs, "timed_out": False,
+        },
+    )
+
+
+def _green(run_id: int):
+    from norn.models import StageResult
+
+    return StageResult(
+        name="", success=True,
+        output={
+            "run_id": run_id, "name": "build", "status": "completed",
+            "conclusion": "success", "url": f"https://example.test/runs/{run_id}",
+            "logs": "", "timed_out": False,
+        },
+    )
+
+
+def _fake_ci(mod, monkeypatch, results):
+    """Make CheckCI return *results* in order and record each re-run request."""
+    pending = list(results)
+    reruns: list[int] = []
+
+    class _Scripted:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def run(self, ctx, **_kwargs):
+            return pending.pop(0)
+
+    async def _no_sha(_run_id):
+        return None
+
+    async def _record_rerun(run_id):
+        reruns.append(run_id)
+
+    monkeypatch.setattr(mod, "CheckCI", _Scripted)
+    monkeypatch.setattr(mod, "_run_head_sha", _no_sha)
+    monkeypatch.setattr(mod, "_rerun_failed_jobs", _record_rerun)
+    return reruns
+
+
+def test_infra_failure_matches_the_maven_connection_reset(tmp_path) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+
+    line = mod._infra_failure(MAVEN_RESET_LOG)
+
+    assert line is not None
+    assert line.endswith("(https://repo.maven.apache.org/maven2): Connection reset")
+
+
+@pytest.mark.parametrize("logs", [
+    COMPILE_ERROR_LOG,
+    "[WARNING] Could not transfer metadata /.meta/prefixes.txt from/to github "
+    "(https://maven.pkg.github.com/org/repo): HTTP Status: 422\n",
+    "WARNING: Prelogin error: host localhost port 32769 Error reading prelogin "
+    "response: Connection reset\n",
+    "expected status 200 but was 503 Service Unavailable\n",
+])
+def test_infra_failure_ignores_code_and_test_failures(tmp_path, logs) -> None:
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+
+    assert mod._infra_failure(logs) is None
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_reruns_the_failed_jobs_instead_of_fixing(tmp_path, monkeypatch) -> None:
+    from norn.models import PipelineContext
+
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    reruns = _fake_ci(mod, monkeypatch, [_red(41, MAVEN_RESET_LOG), _green(41)])
+
+    result = await mod.CheckCIWithLogs(workflows=["build.yml"]).run(PipelineContext())
+
+    assert reruns == [41]
+    assert result.success
+
+
+@pytest.mark.asyncio
+async def test_second_infra_failure_on_the_same_run_stops_the_run(tmp_path, monkeypatch) -> None:
+    from norn.models import PipelineContext
+    from norn.runner import PipelineError
+
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    reruns = _fake_ci(mod, monkeypatch, [_red(41, MAVEN_RESET_LOG), _red(41, MAVEN_RESET_LOG)])
+
+    with pytest.raises(PipelineError) as raised:
+        await mod.CheckCIWithLogs(workflows=["build.yml"]).run(PipelineContext())
+
+    assert reruns == [41]
+    error = raised.value.result.error
+    assert "infrastructure again after a re-run" in error
+    assert "Connection reset" in error
+
+
+@pytest.mark.asyncio
+async def test_code_failure_after_an_infra_rerun_goes_to_the_fix_loop(tmp_path, monkeypatch) -> None:
+    from norn.models import PipelineContext
+
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    reruns = _fake_ci(mod, monkeypatch, [_red(41, MAVEN_RESET_LOG), _red(41, COMPILE_ERROR_LOG)])
+
+    result = await mod.CheckCIWithLogs(workflows=["build.yml"]).run(PipelineContext())
+
+    assert reruns == [41]
+    assert not result.success
+    assert "cannot access com.example.ModelUtil" in result.output
+
+
+@pytest.mark.asyncio
+async def test_code_failure_is_not_rerun(tmp_path, monkeypatch) -> None:
+    from norn.models import PipelineContext
+
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    reruns = _fake_ci(mod, monkeypatch, [_red(41, COMPILE_ERROR_LOG)])
+
+    result = await mod.CheckCIWithLogs(workflows=["build.yml"]).run(PipelineContext())
+
+    assert reruns == []
+    assert not result.success
+
+
+@pytest.mark.asyncio
+async def test_no_workflow_run_stops_the_run_with_its_own_error(tmp_path, monkeypatch) -> None:
+    from norn.models import PipelineContext, StageResult
+    from norn.runner import PipelineError
+
+    mod = _import_check_and_fix_ci(cwd=tmp_path)
+    no_run = StageResult(
+        name="", success=False,
+        error="No workflow runs found for org/repo on branch feature (workflow: build.yml)",
+    )
+    _fake_ci(mod, monkeypatch, [no_run])
+
+    with pytest.raises(PipelineError) as raised:
+        await mod.CheckCIWithLogs(workflows=["build.yml"]).run(PipelineContext())
+
+    error = raised.value.result.error
+    assert "No workflow runs found" in error
+    assert "branch is pushed" in error
+
+
+# ---------------------------------------------------------------------------
 # COMMENT_RULE in both fix prompts
 # ---------------------------------------------------------------------------
 

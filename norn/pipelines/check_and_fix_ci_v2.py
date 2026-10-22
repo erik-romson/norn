@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -142,6 +143,26 @@ MIN_USEFUL_LOG_CHARS = 80
 MAX_FIX_ATTEMPTS = 3
 
 DEFAULT_CI_TIMEOUT_MINUTES = 20
+
+# Failures caused by the runner's network or a package registry, not by the
+# code: the fix agent can only answer them with "nothing to change". Each
+# alternative is tied to a download error line, so a test that merely logs a
+# 503 or a reset connection does not match.
+INFRA_FAILURE_RE = re.compile(
+    # Maven: [ERROR] ... Could not transfer artifact g:a:v from/to central (...): Connection reset
+    r"\[ERROR\][^\n]*Could not transfer artifact [^\n]*: "
+    r"(?:Connection reset|Read timed out|Connect timed out|"
+    r"Remote host terminated the handshake|status code: 5\d\d)"
+    # Gradle: Could not GET 'https://...'. Received status code 502 from server
+    r"|Could not (?:GET|HEAD) '[^'\n]+'\. "
+    r"(?:Received status code 5\d\d|Read timed out|Connection reset)"
+    # npm: npm ERR! code ECONNRESET
+    r"|npm (?:ERR!|error) code (?:ECONNRESET|ETIMEDOUT|EAI_AGAIN)"
+)
+
+# How long to wait for GitHub to show a re-run as started.
+RERUN_START_TIMEOUT_SECONDS = 120
+RERUN_START_POLL_SECONDS = 5
 
 VERBOSE = os.environ.get("FIX_CI_LOOP_VERBOSE", "").lower() in ("1", "true", "yes")
 
@@ -306,6 +327,53 @@ async def _run_head_sha(run_id: int) -> str | None:
     return out if rc == 0 and out else None
 
 
+def _infra_failure(logs: str) -> str | None:
+    """Return the first log line that marks an infrastructure failure, or None."""
+    match = INFRA_FAILURE_RE.search(logs)
+    if match is None:
+        return None
+    start = logs.rfind("\n", 0, match.start()) + 1
+    end = logs.find("\n", match.end())
+    return logs[start:end if end != -1 else len(logs)].strip()
+
+
+def _check_ci_error(msg: str) -> PipelineError:
+    return PipelineError("check ci", StageResult(name="check ci", success=False, error=msg))
+
+
+async def _rerun_failed_jobs(run_id: int) -> None:
+    """Re-run the failed jobs of ``run_id`` and wait until GitHub shows it going again.
+
+    Without the wait, the next ``CheckCI`` poll can still read the finished
+    attempt and report the same failure as the re-run's result.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "gh", "run", "rerun", str(run_id), "--failed",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise _check_ci_error(
+            f"gh run rerun {run_id} --failed failed: {stderr.decode().strip()}"
+        )
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + RERUN_START_TIMEOUT_SECONDS
+    while True:
+        rc, status = await _capture(
+            "gh", "run", "view", str(run_id), "--json", "status", "--jq", ".status",
+        )
+        if rc == 0 and status and status != "completed":
+            return
+        if loop.time() >= deadline:
+            raise _check_ci_error(
+                f"Re-ran the failed jobs of run {run_id}, but GitHub still shows "
+                f"it {status or 'unknown'} after {RERUN_START_TIMEOUT_SECONDS}s."
+            )
+        await asyncio.sleep(RERUN_START_POLL_SECONDS)
+
+
 # --- helper stages --------------------------------------------------------
 
 class CheckCIWithLogs(BaseStage):
@@ -314,7 +382,13 @@ class CheckCIWithLogs(BaseStage):
     to focus on. Aborts the loop when a NEW run produces byte-identical
     logs to the previous run — the fix made no progress, retrying would
     just burn tokens. Also aborts when the poll times out: a run that is
-    still going has not failed, so there are no logs to fix.
+    still going has not failed, so there are no logs to fix, and when no
+    run could be read at all.
+
+    A failure whose logs match ``INFRA_FAILURE_RE`` (a dropped connection
+    to a package registry, say) is not handed to the fix agent: the failed
+    jobs are re-run once and the workflows checked again. A second
+    infrastructure failure on the same run aborts, naming the log line.
 
     Emits the raw failure log verbatim. Compression (format-aware
     extract + Haiku for surefire) is the responsibility of a downstream
@@ -340,6 +414,8 @@ class CheckCIWithLogs(BaseStage):
         # run — same historical run with same logs doesn't prove the fix
         # failed, it just means we haven't tested it yet.
         self._last_failure: tuple[str, int | None, str] | None = None
+        # Runs already re-run for an infrastructure failure; each gets one.
+        self._rerun_ids: set[int] = set()
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         for raw in self.workflows:
@@ -367,6 +443,15 @@ class CheckCIWithLogs(BaseStage):
 
             if result.success:
                 continue
+
+            # No run read at all (no run on the branch yet, no token, no
+            # repo): the loop would only meet an empty log further down.
+            if not output:
+                raise _check_ci_error(
+                    f"{result.error}. There is no CI run to fix: check that the "
+                    f"branch is pushed, that {workflow} triggers on it and that "
+                    "gh can reach the repository, then rerun."
+                )
 
             if output.get("timed_out"):
                 msg = (
@@ -418,6 +503,24 @@ class CheckCIWithLogs(BaseStage):
                     "check ci",
                     StageResult(name="check ci", success=False, error=msg),
                 )
+
+            infra_line = _infra_failure(logs)
+            if infra_line and isinstance(run_id, int):
+                if run_id in self._rerun_ids:
+                    raise _check_ci_error(
+                        f"{workflow} run {run_id} ({url}) failed on infrastructure "
+                        f"again after a re-run: {infra_line}. There is nothing in "
+                        "the code to fix; rerun once the runner or registry recovers."
+                    )
+                print(
+                    f"[check_and_fix_ci_v2]   infrastructure failure, re-running "
+                    f"failed jobs of run {run_id}: {infra_line}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._rerun_ids.add(run_id)
+                await _rerun_failed_jobs(run_id)
+                return await self.run(ctx, **kwargs)
 
             last = self._last_failure
             if (
