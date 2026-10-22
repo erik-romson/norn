@@ -17,6 +17,7 @@ from norn.pipelines._decisions_v3 import (
     QuestionsGate,
     ShipDecisionGate,
     WriteDecision,
+    field_line,
     has_fix,
     parse_code_review,
     parse_recommendations,
@@ -264,6 +265,46 @@ async def test_decision_gate(tmp_path):
     assert (await gate.run(_ctx())).success
 
 
+def test_field_line_finds_the_line_read_field_reads(tmp_path):
+    p = tmp_path / "ship.md"
+    p.write_text("# Ship\n<!--\nSTATUS: commented out\n-->\nstatus:  PROPOSED  \n")
+
+    assert field_line(p, "STATUS") == (5, "status:  PROPOSED")
+    assert field_line(p, "TITLE") is None
+    assert field_line(tmp_path / "missing.md", "STATUS") is None
+
+
+@pytest.mark.asyncio
+async def test_decision_gate_with_show_line_names_the_line(tmp_path):
+    p = tmp_path / "ship.md"
+    p.write_text(_ship(status="PROPOSED"))
+    gate = DecisionGate(
+        path=str(p), field="STATUS", accept=frozenset({"DECIDED"}), action="Set it.", show_line=True
+    )
+
+    result = await gate.run(_ctx())
+
+    assert not result.success
+    assert result.error.splitlines() == [
+        f"{p}:3: STATUS is PROPOSED.",
+        "  line 3 now: STATUS: PROPOSED",
+        "Set it.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_decision_gate_with_show_line_and_no_field_keeps_the_plain_error(tmp_path):
+    p = tmp_path / "ship.md"
+    p.write_text("# Ship\n")
+    gate = DecisionGate(
+        path=str(p), field="STATUS", accept=frozenset({"DECIDED"}), action="Set it.", show_line=True
+    )
+
+    result = await gate.run(_ctx())
+
+    assert result.error == f"{p}: STATUS is missing. Set it."
+
+
 # ---------------------------------------------------------------------------
 # Gate 3
 # ---------------------------------------------------------------------------
@@ -490,6 +531,19 @@ async def test_ship_decision_gate(tmp_path):
     p.write_text(_ship(status="PROPOSED"))
     result = await gate.run(_ctx())
     assert not result.success and "STATUS" in result.error
+
+
+@pytest.mark.asyncio
+async def test_ship_decision_gate_with_show_line_numbers_each_problem(tmp_path):
+    p = tmp_path / "ship.md"
+    p.write_text(_ship(status="PROPOSED", commits="rewite"))
+    plain = await ShipDecisionGate(path=str(p), key="CBS-1").run(_ctx())
+
+    result = await ShipDecisionGate(path=str(p), key="CBS-1", show_line=True).run(_ctx())
+
+    assert "  line 3: STATUS is PROPOSED; set it to DECIDED" in result.error.splitlines()
+    assert "  line 4: COMMITS is rewite; it must be rewrite or keep" in result.error.splitlines()
+    assert "line 3" not in plain.error
 
 
 @pytest.mark.asyncio

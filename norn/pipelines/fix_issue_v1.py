@@ -70,7 +70,11 @@ Optional ``--arg`` knobs (not available under ``norn ui``):
   --arg ci_rounds=2            CI-fix rounds on red PR checks (default: 2)
   --arg ci_timeout_minutes=60  Per-wait CI timeout of the CI-fix child (default: 60)
   --arg plan_gate=on           off approves gate 2 without a pause (default: on)
-  --arg base=<branch>          PR base branch. Default: resolved like merge_branch_v2
+  --arg base=<branch>          PR base branch. Default: an open PR's base, else
+                               the branch the run was cut from (base.branch),
+                               else resolved like merge_branch_v2.  Checked
+                               before any work: origin/<base> must contain
+                               base.sha
   --arg overwrite_remote=<sha> One-shot: allow overwriting origin/<branch> at
                                exactly <sha> (default: none)
   --arg jira_browse=<url>      Jira issues only. Jira browse URL ending in
@@ -122,7 +126,7 @@ from norn.pipelines._jira_issue import BRIEF_HEADINGS, brief_prompt
 from norn.pipelines._launch_tree import AssertLaunchTree
 from norn.pipelines._plan_review_v2 import _SUBAGENT_LABEL, resolve_split_skill
 from norn.pipelines._plan_review_v3 import add_plan_review_stages_v3
-from norn.pipelines._pr_v3 import add_pr_stages
+from norn.pipelines._pr_v3 import CheckPrBase, add_pr_stages, pr_paths
 from norn.pipelines._preplan import derive_paths, parse_arg_flags, steps_dir_of
 from norn.pipelines._ship_v3 import add_ship_stages, resolve_commit_skill
 from norn.stages.generate import Generate
@@ -147,6 +151,9 @@ PLAN, QUESTIONS, REVIEW, RESPONSE = derive_paths(ART.preplan)
 STEPS_DIR = steps_dir_of(PLAN)
 V3 = V3Paths(ART.dir, SOURCE.file_key)
 BASE_FILE = ART.dir + "base.sha"
+# The branch the run was cut from: the PR base unless --arg base or an open PR
+# says otherwise.  Empty when the run did not start from a branch at base.sha.
+START_BRANCH_FILE = ART.dir + "base.branch"
 
 COMMIT_SKILL, COMMIT_SKILL_SEARCHED = resolve_commit_skill()
 SPLIT_SKILL = resolve_split_skill()
@@ -296,7 +303,13 @@ _preflight_cmd = SOURCE.env_check_sh + _SHARED + SOURCE.issue_check_sh
 # case-insensitive because branch names are often lowercased by hand.  A GitHub
 # run never adopts the branch it starts on: `123` would match far too many
 # branch names, so it always switches to (or creates) its own branch.
+#
+# base.branch is written with base.sha, and names the branch the run started
+# on only when that branch's tip is base.sha — the branch this run's PR goes
+# into.  When the run stays on its issue branch, or switches to one with work
+# of its own, the file is empty and the PR base is resolved without it.
 _base_sha_q = shlex.quote(BASE_FILE)
+_start_branch_q = shlex.quote(START_BRANCH_FILE)
 _prepare_branch_cmd = (
     f"cd {shlex.quote(PROJECT_DIR)} && "
     f"BRANCH={shlex.quote(BRANCH)} && "
@@ -316,7 +329,12 @@ _prepare_branch_cmd = (
     'git switch "$BRANCH" 2>/dev/null || git switch -c "$BRANCH"; '
     'fi && '
     f"mkdir -p {shlex.quote(ART.dir)} && "
-    f"{{ [ -f {_base_sha_q} ] || git rev-parse HEAD > {_base_sha_q}; }}"
+    f"{{ [ -f {_base_sha_q} ] || {{ "
+    f"git rev-parse HEAD > {_base_sha_q} && "
+    'START= && '
+    'if [ "$CURRENT" != "$(git branch --show-current)" ] && '
+    '[ "$(git rev-parse "refs/heads/$CURRENT")" = "$(git rev-parse HEAD)" ]; then START=$CURRENT; fi && '
+    f'printf "%s\\n" "$START" > {_start_branch_q}; }}; }}'
 )
 
 # ---------------------------------------------------------------------------
@@ -427,6 +445,24 @@ config.stage(
 config.stage(
     "check run identity",
     CheckRunIdentity(SOURCE.identity, PROJECT_DIR, BASE_FILE, base_hint=BASE_FILE),
+    on_failure=fail,
+    always_run=True,
+)
+
+# 6b. check pr base — the PR base is resolved here exactly as `resolve branch`
+#     resolves it, so a base that is not on origin, is ambiguous, or does not
+#     contain base.sha stops the run before any spend.  `resolve branch`
+#     checks again: origin can move while the run works.
+config.stage(
+    "check pr base",
+    CheckPrBase(
+        paths=pr_paths(V3),
+        project_dir=PROJECT_DIR,
+        base_arg=BASE,
+        overwrite_remote=OVERWRITE_REMOTE,
+        start_branch_file=START_BRANCH_FILE,
+        base_file=BASE_FILE,
+    ),
     on_failure=fail,
     always_run=True,
 )
@@ -580,6 +616,7 @@ add_ship_stages(
     issue_line_ok=SOURCE.issue_line_ok,
     issue_label=SOURCE.issue_label,
     extra_checklist=SOURCE.fetch_checklist,
+    field_lines=True,
 )
 
 # 69-82. The PR phase: every stage is always_run.
@@ -600,4 +637,5 @@ add_pr_stages(
     resume_arg=SOURCE.resume_arg,
     fetch_notes=SOURCE.fetch_notes,
     notes_path=SOURCE.notes_path,
+    start_branch_file=START_BRANCH_FILE,
 )

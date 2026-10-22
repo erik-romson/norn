@@ -20,7 +20,9 @@ The merge helpers are reused by import and composition only
 
 ``fix_issue_v1`` reuses the builder through keyword parameters whose defaults
 keep fix_jira_issue_v3 unchanged: the commit-subject prefix, the pipeline name
-of notices and resume hints, the resume argument, and the fetch notes.
+of notices and resume hints, the resume argument, the fetch notes, and the
+start branch that sets the PR base. ``CheckPrBase`` is the same resolution run
+before any work; only fix_issue_v1 adds it.
 """
 from __future__ import annotations
 
@@ -330,48 +332,114 @@ class ResolveBranchV3(ResolveBranch):
 
     Only ``run`` is overridden; ``_resolve_base`` and ``_check_remote_branch``
     are inherited unchanged.
+
+    *start_branch_file* names the file ``prepare branch`` writes with the
+    branch the run was cut from. A name in it is the base after ``--arg base``
+    and an open PR, ahead of the fork-point guess, which only knows the
+    default branch and ``_FORK_POINT_CANDIDATES``. An empty or missing file
+    leaves the resolution to ``_resolve_base``.
+
+    *base_file* (``base.sha``) adds the check that ``origin/<base>`` contains
+    the commit the run started from; without it the PR would also carry every
+    commit between the two, none of which this run reviewed.
+
+    Both default to None, which keeps fix_jira_issue_v3 unchanged.
     """
 
-    # Copied from _merge_gh.py:269-356 (cannot be edited: _merge_gh.py is frozen for this change)
+    def __init__(
+        self,
+        *,
+        paths: MergePaths,
+        project_dir: str,
+        base_arg: str,
+        overwrite_remote: str,
+        start_branch_file: str | None = None,
+        base_file: str | None = None,
+    ) -> None:
+        super().__init__(
+            paths=paths, project_dir=project_dir, base_arg=base_arg, overwrite_remote=overwrite_remote
+        )
+        self._start_branch_file = start_branch_file
+        self._base_file = base_file
+
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        Path(self._paths.root).mkdir(parents=True, exist_ok=True)
+        try:
+            resolved = await self._resolve(ctx, early=False)
+        except _Fail as exc:
+            return StageResult(name="", success=False, error=str(exc))
+
         paths = self._paths
+        _write(paths.branch, resolved["branch"])
+        _write(paths.slug, resolved["slug"])
+        _write(paths.repo, resolved["repo"])
+        _write(paths.base, resolved["base"])
+        _write(paths.base_source, resolved["source"])
+        _write(paths.default_branch, resolved["default_branch"])
+        _write(paths.start_head, resolved["start_head"])
+        _write(paths.remote_head, resolved["remote_head"])
+
+        message = f"base: {resolved['base']} ({resolved['source']})"
+        if resolved["note"]:
+            message = f"{message}\n{resolved['note']}"
+        print(message)
+
+        return StageResult(
+            name="",
+            success=True,
+            output={k: resolved[k] for k in ("base", "source", "branch", "repo", "note")},
+        )
+
+    def _start_branch(self, ctx: PipelineContext) -> str:
+        if self._start_branch_file is None:
+            return ""
+        path = resolve_run_path(ctx, self._start_branch_file)
+        return path.read_text().strip() if path.is_file() else ""
+
+    # Copied from _merge_gh.py:269-356 (cannot be edited: _merge_gh.py is frozen for this change),
+    # with the start branch, the base.sha check and *early*: before any work,
+    # HEAD is still base.sha, so there is nothing to merge yet and no remote
+    # branch of this run to guard.
+    async def _resolve(self, ctx: PipelineContext, *, early: bool) -> dict[str, str]:
         project_dir = self._project_dir
         env = ctx.env
-        Path(paths.root).mkdir(parents=True, exist_ok=True)
 
-        try:
-            await git(["fetch", "origin", "--prune"], cwd=project_dir, env=env)
+        await git(["fetch", "origin", "--prune"], cwd=project_dir, env=env)
 
-            _, out, _ = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=project_dir, env=env)
-            branch = out.strip()
-            slug = re.sub(r"[^A-Za-z0-9._-]", "-", branch)
+        _, out, _ = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=project_dir, env=env)
+        branch = out.strip()
+        slug = re.sub(r"[^A-Za-z0-9._-]", "-", branch)
 
-            _, out, _ = await git(["remote", "get-url", "origin"], cwd=project_dir, env=env)
-            remote_url = out.strip()
+        _, out, _ = await git(["remote", "get-url", "origin"], cwd=project_dir, env=env)
+        remote_url = out.strip()
 
-            _, out, _ = await gh(
-                ["repo", "view", remote_url, "--json", "nameWithOwner,defaultBranchRef"],
-                cwd=project_dir, env=env,
-            )
-            repo_data = json.loads(out)
-            repo = repo_data["nameWithOwner"]
-            default_branch = repo_data["defaultBranchRef"]["name"]
+        _, out, _ = await gh(
+            ["repo", "view", remote_url, "--json", "nameWithOwner,defaultBranchRef"],
+            cwd=project_dir, env=env,
+        )
+        repo_data = json.loads(out)
+        repo = repo_data["nameWithOwner"]
+        default_branch = repo_data["defaultBranchRef"]["name"]
 
-            _, out, _ = await gh(
-                [
-                    "pr", "list", "-R", repo, "--head", branch, "--state", "open",
-                    "--json", "number,baseRefName,isCrossRepository",
-                ],
-                cwd=project_dir, env=env,
-            )
-            # The one change: a fork's PR that shares the branch name is not
-            # this branch's PR, so it can neither set the base nor count below.
-            open_prs = [pr for pr in json.loads(out) if not pr["isCrossRepository"]]
-            if len(open_prs) > 1:
-                listing = "; ".join(f"#{pr['number']} (base {pr['baseRefName']})" for pr in open_prs)
-                raise _Fail(f"more than one open PR for {branch}: {listing}")
-            open_pr = open_prs[0] if open_prs else None
+        _, out, _ = await gh(
+            [
+                "pr", "list", "-R", repo, "--head", branch, "--state", "open",
+                "--json", "number,baseRefName,isCrossRepository",
+            ],
+            cwd=project_dir, env=env,
+        )
+        # The one change: a fork's PR that shares the branch name is not
+        # this branch's PR, so it can neither set the base nor count below.
+        open_prs = [pr for pr in json.loads(out) if not pr["isCrossRepository"]]
+        if len(open_prs) > 1:
+            listing = "; ".join(f"#{pr['number']} (base {pr['baseRefName']})" for pr in open_prs)
+            raise _Fail(f"more than one open PR for {branch}: {listing}")
+        open_pr = open_prs[0] if open_prs else None
 
+        start = self._start_branch(ctx)
+        if start and not self._base_arg and not open_pr and start != branch:
+            base, source = start, "start branch"
+        else:
             base, source = await self._resolve_base(
                 branch=branch,
                 project_dir=project_dir,
@@ -380,52 +448,94 @@ class ResolveBranchV3(ResolveBranch):
                 open_pr=open_pr,
             )
 
-            if branch == base:
-                raise _Fail(f"branch and base are both {branch!r}; pass --arg base=<name> or switch branches")
+        if branch == base:
+            raise _Fail(f"branch and base are both {branch!r}; pass --arg base=<name> or switch branches")
 
-            rc, _, _ = await git(
-                ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}"],
-                cwd=project_dir, env=env, ok=(0, 1),
-            )
-            if not base or rc != 0:
-                raise _Fail(f"base {base!r} ({source}) does not exist on origin; push it first or pass --arg base=<name>")
+        rc, _, _ = await git(
+            ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}"],
+            cwd=project_dir, env=env, ok=(0, 1),
+        )
+        if not base or rc != 0:
+            raise _Fail(f"base {base!r} ({source}) does not exist on origin; push it first or pass --arg base=<name>")
 
-            _, out, _ = await git(["rev-list", "--count", f"origin/{base}..HEAD"], cwd=project_dir, env=env)
-            if out.strip() == "0":
-                raise _Fail(f"nothing to merge: HEAD has no commits ahead of origin/{base}")
+        if self._base_file is not None:
+            base_path = resolve_run_path(ctx, self._base_file)
+            if not base_path.is_file():
+                raise _Fail(f"base.sha is missing: {base_path}")
+            problem = base_sha_problem(project_dir, base, source, base_path.read_text().strip())
+            if problem:
+                raise _Fail(problem)
 
-            note = await self._check_remote_branch(branch=branch, project_dir=project_dir, env=env)
+        if early:
+            return {"base": base, "source": source, "branch": branch, "repo": repo}
 
-            _, out, _ = await git(["rev-parse", "HEAD"], cwd=project_dir, env=env)
-            start_head = out.strip()
+        _, out, _ = await git(["rev-list", "--count", f"origin/{base}..HEAD"], cwd=project_dir, env=env)
+        if out.strip() == "0":
+            raise _Fail(f"nothing to merge: HEAD has no commits ahead of origin/{base}")
 
-            rc, out, _ = await git(
-                ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
-                cwd=project_dir, env=env, ok=(0, 1),
-            )
-            remote_head = out.strip() if rc == 0 else ""
+        note = await self._check_remote_branch(branch=branch, project_dir=project_dir, env=env)
+
+        _, out, _ = await git(["rev-parse", "HEAD"], cwd=project_dir, env=env)
+        start_head = out.strip()
+
+        rc, out, _ = await git(
+            ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+            cwd=project_dir, env=env, ok=(0, 1),
+        )
+        remote_head = out.strip() if rc == 0 else ""
+
+        return {
+            "base": base, "source": source, "branch": branch, "repo": repo, "note": note,
+            "slug": slug, "default_branch": default_branch, "start_head": start_head,
+            "remote_head": remote_head,
+        }
+
+
+class CheckPrBase(ResolveBranchV3):
+    """Resolve the PR base before any work, and stop when it cannot take this run's PR.
+
+    The same resolution as ``resolve branch``, so a base that is missing on
+    origin, ambiguous, or behind ``base.sha`` stops the run in its first
+    minute rather than after the review and the ship gate. Writes nothing:
+    the PR phase resolves the base again, because origin can move while the
+    run works.
+    """
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        try:
+            resolved = await self._resolve(ctx, early=True)
         except _Fail as exc:
             return StageResult(name="", success=False, error=str(exc))
+        print(f"PR base: {resolved['base']} ({resolved['source']})")
+        return StageResult(name="", success=True, output=resolved)
 
-        _write(paths.branch, branch)
-        _write(paths.slug, slug)
-        _write(paths.repo, repo)
-        _write(paths.base, base)
-        _write(paths.base_source, source)
-        _write(paths.default_branch, default_branch)
-        _write(paths.start_head, start_head)
-        _write(paths.remote_head, remote_head)
 
-        message = f"base: {base} ({source})"
-        if note:
-            message = f"{message}\n{note}"
-        print(message)
+def base_sha_problem(project_dir: str, base: str, source: str, base_sha: str) -> str | None:
+    """Say why ``origin/<base>`` cannot be this run's PR base, or None when it can.
 
-        return StageResult(
-            name="",
-            success=True,
-            output={"base": base, "source": source, "branch": branch, "repo": repo, "note": note},
-        )
+    It can when it contains *base_sha*, the commit the run started from: then
+    ``origin/<base>..HEAD`` holds only the run's own commits.
+    """
+    anc = _git(project_dir, "merge-base", "--is-ancestor", base_sha, f"origin/{base}")
+    if anc.returncode == 0:
+        return None
+    if anc.returncode != 1:
+        raise _Fail(f"git merge-base --is-ancestor {base_sha[:7]} origin/{base}: {anc.stderr.strip()}")
+    log = _git(project_dir, "log", "--format=%h %s", f"origin/{base}..{base_sha}")
+    if log.returncode != 0:
+        raise _Fail(f"git log origin/{base}..{base_sha[:7]}: {log.stderr.strip()}")
+    missing = _lines(log.stdout)
+    local = _git(project_dir, "rev-parse", "--verify", "--quiet", f"refs/heads/{base}")
+    if local.returncode == 0 and local.stdout.strip() == base_sha:
+        action = f"push {base} (`git push origin {base}`), or pass `--arg base=<branch>`; then --resume"
+    else:
+        action = "push those commits to origin/" + base + ", rebase, or pass `--arg base=<branch>`; then --resume"
+    return format_gate_error(
+        f"origin/{base} ({source}) does not contain base.sha {base_sha[:7]}: "
+        f"the PR would carry {len(missing)} commits this run did not make",
+        missing,
+        action,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1112,6 +1222,7 @@ def add_pr_stages(
     resume_arg: str | None = None,
     fetch_notes: FetchNotes | None = None,
     notes_path: str | None = None,
+    start_branch_file: str | None = None,
 ) -> Pipeline:
     """Add stages 69-82 (``check pr provenance`` … ``summary``); every one is ``always_run``.
 
@@ -1120,6 +1231,9 @@ def add_pr_stages(
     body refresh's Reword check expects. *pipeline_name* brands the notices,
     the resume hints and the CI-fix children's notices. *fetch_notes* and
     *notes_path* (both or neither) add the fetch notes to the ending stages.
+    *start_branch_file* makes ``resolve branch`` take the branch the run was
+    cut from as the base and check that ``origin/<base>`` contains base.sha
+    (see ``ResolveBranchV3``).
     """
     pr = pr_paths(paths)
     gate = running(pr)
@@ -1146,6 +1260,8 @@ def add_pr_stages(
             project_dir=project_dir,
             base_arg=base_arg or "",
             overwrite_remote=overwrite_remote or "",
+            start_branch_file=start_branch_file,
+            base_file=base_file if start_branch_file is not None else None,
         ),
         on_failure=fail,
         always_run=True,

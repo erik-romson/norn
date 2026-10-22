@@ -67,6 +67,22 @@ def read_field(path: str | Path, field: str, *, first_token: bool = True) -> str
     return value
 
 
+def field_line(path: str | Path, field: str) -> tuple[int, str] | None:
+    """Return the 1-based number and text of the ``FIELD:`` line in *path*, or None.
+
+    The same line ``read_field`` reads; a missing file or field returns None.
+    """
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        return None
+    m = _field_match(text, field)
+    if m is None:
+        return None
+    number = text.count("\n", 0, m.start()) + 1
+    return number, text.splitlines()[number - 1].strip()
+
+
 def _is_undecided(value: str | None) -> bool:
     return value is not None and value.lower() in ("pending", "proposed")
 
@@ -326,15 +342,28 @@ class AutoDecide(BaseStage):
 
 
 class DecisionGate(BaseStage):
-    """Fail unless *field*'s first token is one of *accept* (case-insensitive)."""
+    """Fail unless *field*'s first token is one of *accept* (case-insensitive).
+
+    With *show_line* the error names the field's line as ``<path>:<n>`` and
+    quotes it, so the human knows which line to edit.
+    """
 
     needs_agent = False
 
-    def __init__(self, *, path: str, field: str, accept: frozenset[str], action: str) -> None:
+    def __init__(
+        self,
+        *,
+        path: str,
+        field: str,
+        accept: frozenset[str],
+        action: str,
+        show_line: bool = False,
+    ) -> None:
         self.path = path
         self.field = field
         self.accept = frozenset(a.lower() for a in accept)
         self.action = action
+        self.show_line = show_line
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         resolved = resolve_run_path(ctx, self.path)
@@ -342,34 +371,54 @@ class DecisionGate(BaseStage):
         if value is not None and value.lower() in self.accept:
             return _ok(value)
         shown = "missing" if value is None else value
-        return _fail(f"{resolved}: {self.field} is {shown}. {self.action}")
+        line = field_line(resolved, self.field) if self.show_line else None
+        if line is None:
+            return _fail(f"{resolved}: {self.field} is {shown}. {self.action}")
+        number, text = line
+        return _fail(
+            f"{resolved}:{number}: {self.field} is {shown}.\n"
+            f"  line {number} now: {text}\n"
+            f"{self.action}"
+        )
 
 
 class ShipDecisionGate(BaseStage):
-    """Gate 4: STATUS DECIDED, COMMITS rewrite|keep, TITLE passing the house style."""
+    """Gate 4: STATUS DECIDED, COMMITS rewrite|keep, TITLE passing the house style.
+
+    With *show_line* each problem with a field that is in the file starts
+    with ``line <n>:``.
+    """
 
     needs_agent = False
 
-    def __init__(self, *, path: str, key: str) -> None:
+    def __init__(self, *, path: str, key: str, show_line: bool = False) -> None:
         self.path = path
         self.key = key
+        self.show_line = show_line
 
     async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
         resolved = resolve_run_path(ctx, self.path)
         if not resolved.exists():
             return _fail(f"ship decision file not written: {resolved}")
+
+        def at(field: str, problem: str) -> str:
+            line = field_line(resolved, field) if self.show_line else None
+            return problem if line is None else f"line {line[0]}: {problem}"
+
         problems: list[str] = []
         status = read_field(resolved, "STATUS")
         if status is None or status.upper() != "DECIDED":
-            problems.append(f"STATUS is {status or 'missing'}; set it to DECIDED")
+            problems.append(at("STATUS", f"STATUS is {status or 'missing'}; set it to DECIDED"))
         commits = read_field(resolved, "COMMITS")
         if commits is None or commits.lower() not in ("rewrite", "keep"):
-            problems.append(f"COMMITS is {commits or 'missing'}; it must be rewrite or keep")
+            problems.append(
+                at("COMMITS", f"COMMITS is {commits or 'missing'}; it must be rewrite or keep")
+            )
         title = read_field(resolved, "TITLE", first_token=False)
         if not title:
-            problems.append("TITLE is missing or empty")
+            problems.append(at("TITLE", "TITLE is missing or empty"))
         else:
-            problems.extend(f"TITLE: {p}" for p in subject_problems(title, self.key))
+            problems.extend(at("TITLE", f"TITLE: {p}") for p in subject_problems(title, self.key))
         if problems:
             return _fail(
                 format_gate_error(
