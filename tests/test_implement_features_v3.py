@@ -3833,6 +3833,60 @@ async def test_handoff_manifest_writes_manifest_with_commits_section(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_handoff_manifest_shows_lockfile_stat_only_and_nested_manifests(tmp_path, monkeypatch) -> None:
+    """A lockfile appears as a stat line only; a nested pyproject.toml diff is included."""
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+
+    r = await _stage(mod, "record start").impl.run(ctx)
+    assert r.success, f"record start failed: {r.output}"
+
+    lock_marker = "sha256:lockfile-body-marker"
+    (repo_path / "uv.lock").write_text("".join(f"{lock_marker}-{i}\n" for i in range(3000)))
+    nested = repo_path / "packages" / "x" / "pyproject.toml"
+    nested.parent.mkdir(parents=True)
+    nested.write_text('[project]\nname = "x"\ndependencies = ["nested-dep-marker>=1"]\n')
+    repo.index.add(["uv.lock", "packages/x/pyproject.toml"])
+    repo.index.commit("refactor: step-01-v2-fixture-alpha — Alpha")
+
+    Path(mod.REVIEWED_HEAD).parent.mkdir(parents=True, exist_ok=True)
+    Path(mod.REVIEWED_HEAD).write_text(repo.head.commit.hexsha + "\n")
+
+    r = await _stage(mod, "handoff manifest").impl.run(ctx)
+    assert r.success, f"handoff manifest failed: {r.output}"
+
+    text = (Path(mod.snapshot_root) / "handoff-manifest.md").read_text()
+    deps = text[text.index("## Dependency and configuration changes"):]
+    assert "Lockfiles (stat only):" in deps
+    assert "uv.lock |" in deps
+    assert lock_marker not in text
+    assert "nested-dep-marker" in deps
+
+
+@pytest.mark.asyncio
+async def test_handoff_manifest_truncates_long_dependency_diff(tmp_path, monkeypatch) -> None:
+    """A manifest diff longer than the cap is cut and marked as truncated."""
+    repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)
+
+    r = await _stage(mod, "record start").impl.run(ctx)
+    assert r.success, f"record start failed: {r.output}"
+
+    (repo_path / "requirements.txt").write_text("".join(f"pkg-{i}==1.0\n" for i in range(1000)))
+    repo.index.add(["requirements.txt"])
+    repo.index.commit("refactor: step-01-v2-fixture-alpha — Alpha")
+
+    Path(mod.REVIEWED_HEAD).parent.mkdir(parents=True, exist_ok=True)
+    Path(mod.REVIEWED_HEAD).write_text(repo.head.commit.hexsha + "\n")
+
+    r = await _stage(mod, "handoff manifest").impl.run(ctx)
+    assert r.success, f"handoff manifest failed: {r.output}"
+
+    text = (Path(mod.snapshot_root) / "handoff-manifest.md").read_text()
+    assert "+pkg-0==1.0" in text
+    assert "+pkg-999==1.0" not in text
+    assert f"(truncated at {mod._DEP_DIFF_MAX_LINES} lines" in text
+
+
+@pytest.mark.asyncio
 async def test_handoff_postcondition_succeeds_when_only_handoff_md_written(tmp_path, monkeypatch) -> None:
     """handoff postcondition succeeds when only handoff.md was written."""
     repo, repo_path, feat_dir, mod, ctx = _setup_reviewed_repo(tmp_path, monkeypatch)

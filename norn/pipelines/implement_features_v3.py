@@ -159,7 +159,8 @@ steps supply only facts.  Resume-skipped steps appear only as a commit ledger li
 Handoff
 -------
 The handoff document is generated from a pipeline-assembled manifest (commits,
-file diff, stat, and dependency changes since the base SHA) plus the completed
+file diff, stat, and dependency changes since the base SHA; lockfiles as a stat
+only, manifest diffs capped at ``_DEP_DIFF_MAX_LINES``) plus the completed
 ``review.md``.  The handoff agent runs in a fresh write-only session (only the
 Write tool) bounded to four turns; it builds the document from the manifest and
 review text without exploring the repository.
@@ -4967,6 +4968,19 @@ def _handoff_prompt() -> str:
 # Handoff manifest command
 # ---------------------------------------------------------------------------
 
+# git's glob magic: `**/` also matches the repo root, so root and nested
+# (e.g. packages/*/pyproject.toml) manifests are both picked up.
+_DEP_MANIFEST_PATHSPECS = " ".join(
+    shlex.quote(f":(glob)**/{name}")
+    for name in ("pyproject.toml", "package.json", "pom.xml", "build.gradle*", "requirements*.txt")
+)
+_DEP_LOCKFILE_PATHSPECS = " ".join(
+    shlex.quote(f":(glob)**/{name}")
+    for name in ("uv.lock", "poetry.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                 "Cargo.lock", "go.sum")
+)
+_DEP_DIFF_MAX_LINES = 400
+
 
 def _handoff_manifest_cmd() -> str:
     """Build the shell command that writes handoff-manifest.md and handoff.pre.json."""
@@ -4992,13 +5006,25 @@ def _handoff_manifest_cmd() -> str:
         f'echo "" >> {q(_handoff_manifest)} && '
         f'echo "## Dependency and configuration changes" >> {q(_handoff_manifest)} && '
         f'echo "" >> {q(_handoff_manifest)} && '
-        # Diff the known dependency/config files; report "none" when nothing changed.
-        f'_DEP_DIFF=$(git diff "$BASE" "$HEAD_SHA" -- '
-        f"pyproject.toml uv.lock package.json package-lock.json "
-        f"pom.xml build.gradle 'requirements*.txt' 2>/dev/null) && "
-        f'if [ -z "$_DEP_DIFF" ]; then '
+        # Diff the dependency manifests at any depth, capped at
+        # _DEP_DIFF_MAX_LINES; lockfiles get a stat only, since a full lockfile
+        # diff is mostly hashes and once made this prompt ~300k chars.
+        # Report "none" when nothing changed.
+        f'_DEP_DIFF=$(git diff "$BASE" "$HEAD_SHA" -- {_DEP_MANIFEST_PATHSPECS} 2>/dev/null) && '
+        f'_LOCK_STAT=$(git diff --stat "$BASE" "$HEAD_SHA" -- {_DEP_LOCKFILE_PATHSPECS} 2>/dev/null) && '
+        f'if [ -z "$_DEP_DIFF$_LOCK_STAT" ]; then '
         f'echo "none" >> {q(_handoff_manifest)}; '
-        f'else printf "%s\\n" "$_DEP_DIFF" >> {q(_handoff_manifest)}; fi && '
+        f'else '
+        f'if [ -n "$_DEP_DIFF" ]; then '
+        f'printf "%s\\n" "$_DEP_DIFF" | sed -n "1,{_DEP_DIFF_MAX_LINES}p" >> {q(_handoff_manifest)}; '
+        f'if [ "$(printf "%s\\n" "$_DEP_DIFF" | wc -l)" -gt {_DEP_DIFF_MAX_LINES} ]; then '
+        f'echo "(truncated at {_DEP_DIFF_MAX_LINES} lines; run git diff for the rest)" >> {q(_handoff_manifest)}; fi; '
+        f'fi; '
+        f'if [ -n "$_LOCK_STAT" ]; then '
+        f'echo "" >> {q(_handoff_manifest)}; '
+        f'echo "Lockfiles (stat only):" >> {q(_handoff_manifest)}; '
+        f'printf "%s\\n" "$_LOCK_STAT" >> {q(_handoff_manifest)}; fi; '
+        f'fi && '
         # Every oscillation the retry ledgers recorded, or "none".
         f'echo "" >> {q(_handoff_manifest)} && '
         f'echo "## Oscillations" >> {q(_handoff_manifest)} && '
