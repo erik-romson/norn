@@ -1188,6 +1188,54 @@ def test_validation_is_not_rerun_in_the_same_loop_pass_on_the_tree_it_failed_on(
     assert run_count() == 3
 
 
+def test_validation_reruns_after_a_fix_that_changed_only_ignored_files(
+    tmp_path, monkeypatch
+) -> None:
+    """The outside-tree marker lets a later attempt run on an unchanged `git status`, once."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    shutil.copytree(GOOD_DIR, repo_path / "feat")
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(repo_path / "feat", monkeypatch)
+
+    runs = tmp_path / "runs.txt"
+    fail_flag = tmp_path / "fail"
+    fail_flag.touch()
+    cmd = f"echo run >> {runs} && test ! -f {fail_flag}"
+    in_loop, _ = mod._proven_validation("step-z", cmd)
+    marker = Path(mod._outside_tree_marker_path("step-z", cmd))
+
+    def sh(attempt: int) -> subprocess.CompletedProcess:
+        env = {**os.environ, "NORN_ATTEMPT": str(attempt)}
+        return subprocess.run(in_loop, shell=True, cwd=repo_path, env=env,
+                              capture_output=True, text=True)
+
+    def run_count() -> int:
+        return len(runs.read_text().splitlines())
+
+    assert sh(1).returncode != 0
+    assert run_count() == 1
+
+    marker.touch()
+    assert sh(2).returncode != 0
+    assert run_count() == 2, "the marker must let the validation rerun"
+    assert not marker.exists(), "the run must consume the marker"
+
+    unchanged = sh(3)
+    assert "fix changed nothing" in unchanged.stderr
+    assert run_count() == 2, "without a fresh marker the guard applies again"
+
+
+def test_fix_prompts_name_the_outside_tree_marker() -> None:
+    mod = _import_v2(GOOD_DIR)
+    assert mod._outside_tree_marker_path("step-x", "CMD") in mod._fix_prompt(
+        "step-x", "/abs/step-x.md", "BODY", "CMD", 3
+    )
+    assert mod._outside_tree_marker_path("aggregate", mod.AGGREGATE_CMD) in (
+        mod._aggregate_fix_prompt()
+    )
+
+
 @pytest.mark.asyncio
 async def test_assert_owned_diff_fails_with_no_changes(tmp_path, monkeypatch) -> None:
     """assert owned diff fails when no worktree changes occurred after baseline."""

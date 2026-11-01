@@ -1311,6 +1311,9 @@ def _fix_prompt(
         "- Do not make unrelated changes\n"
         f"- Do not run any of the following: {forbidden}\n"
         "- Stop after the repair — do not run the validation command yourself\n"
+        "- The pipeline reruns the command only if `git status` changed. If your "
+        "repair changed only git-ignored files (stale build output, caches), run "
+        f"`touch {_outside_tree_marker_path(name, validation_cmd)}` so it reruns\n"
     )
 
 
@@ -1370,6 +1373,9 @@ def _aggregate_fix_prompt() -> str:
         "the operator before the run is relaunched\n"
         "- If you make no change, the pipeline does not rerun the command: the loop "
         "fails and the operator decides\n"
+        "- The pipeline sees changes only through `git status`. If your repair "
+        "changed only git-ignored files (stale build output, caches), run "
+        f"`touch {_outside_tree_marker_path('aggregate', AGGREGATE_CMD)}` so it reruns\n"
     )
 
 
@@ -1518,6 +1524,19 @@ def _validation_proof_path(key: str, validation_cmd: str) -> str:
     return os.path.join(snapshot_root, f"{key}.validated.{digest}.json")
 
 
+def _outside_tree_marker_path(key: str, validation_cmd: str) -> str:
+    """The file a fix agent touches when its repair changed only ignored files.
+
+    The unchanged-tree guard compares `git status` snapshots, which never list
+    git-ignored paths. A fix once correctly deleted a stale `build/install`
+    directory, and the guard refused to rerun the validation that would have
+    tested it. The marker makes the next in-loop run skip the guard, and that
+    run removes it (see :func:`_proven_validation`).
+    """
+    digest = hashlib.sha1(validation_cmd.encode()).hexdigest()[:12]
+    return os.path.join(snapshot_root, f"{key}.failed.{digest}.outside")
+
+
 def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
     """Build the in-loop validation shell and the gate's validation shell.
 
@@ -1540,7 +1559,9 @@ def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
     changed nothing, so it fails at once instead of rerunning a suite that can
     only fail the same way: an aggregate loop once spent six eight-minute runs
     on a fix that, each time, correctly declined to change anything. Attempt 1
-    always runs, so an operator's retry after exhaustion reruns in full.
+    always runs, so an operator's retry after exhaustion reruns in full. A fix
+    that changed only git-ignored files says so with the marker from
+    :func:`_outside_tree_marker_path`, and the guard lets that run through.
     """
     q = shlex.quote
     digest = hashlib.sha1(validation_cmd.encode()).hexdigest()[:12]
@@ -1550,12 +1571,13 @@ def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
     failed = os.path.join(snapshot_root, f"{key}.failed.{digest}.json")
     failed_now = failed + ".now"
     failed_delta = failed + ".delta"
+    outside = _outside_tree_marker_path(key, validation_cmd)
     unchanged_since_failure = (
         f'if [ "${{NORN_ATTEMPT:-1}}" -gt 1 ] && [ -f {q(failed)} ]; then '
         f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(failed_now)} && "
         f"python3 {q(SNAPSHOT_HELPER)} diff {q(failed)} {q(failed_now)}{NORN_STATE_IGNORE_FLAGS}"
         f" > {q(failed_delta)} && "
-        f"if [ ! -s {q(failed_delta)} ]; then "
+        f"if [ ! -s {q(failed_delta)} ] && [ ! -f {q(outside)} ]; then "
         f'echo "ERROR: {_UNCHANGED_SINCE_FAILURE}, so the validation '
         f'was not rerun: it would fail the same way. The previous failure stands." 1>&2; '
         f'echo "To rerun it anyway (a flaky failure, or something outside the tree was fixed), '
@@ -1563,7 +1585,7 @@ def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
         f"false; fi; fi"
     )
     in_loop = (
-        f"{unchanged_since_failure} && rm -f {q(proof)} {q(failed)} && "
+        f"{unchanged_since_failure} && rm -f {q(proof)} {q(failed)} {q(outside)} && "
         f"if {{ {validation_cmd} ; }}; then "
         f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(proof)}; "
         f"else rc=$?; "
