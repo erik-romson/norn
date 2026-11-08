@@ -1460,6 +1460,43 @@ async def test_noop_step_with_unchanged_tree_stays_a_noop(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_noop_step_stays_a_noop_when_untracked_files_become_ignored(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression: an untracked file ignored after the baseline (a resume after
+    adding an exclude) counted as changed at the recheck, so the marker was
+    dropped, and then the commit stage skipped it as unstageable and failed."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(FIXTURE_DIR / "allow-noop", feat_dir)
+    (repo_path / "issues").mkdir()
+    (repo_path / "issues" / "README.md").write_text("# issues\n")
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-02-v2-noop-gate"
+    ctx = PipelineContext()
+    marker = Path(mod.snapshot_root) / f"{stem}.noop"
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+    assert (await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)).success
+    assert marker.exists()
+
+    with (repo_path / ".git" / "info" / "exclude").open("a") as fh:
+        fh.write("/issues/\n")
+
+    r = await _stage(mod, f"recheck no-op {stem}").impl.run(ctx)
+    assert r.success, f"recheck no-op failed: {r.output}"
+    assert marker.exists(), "a newly ignored file must not clear the no-op marker"
+    assert not _stage(mod, f"commit {stem}").when(ctx)
+    assert _stage(mod, f"record no-op {stem}").when(ctx)
+
+
+@pytest.mark.asyncio
 async def test_allow_noop_does_not_leak_to_other_steps(tmp_path, monkeypatch) -> None:
     """The waiver is per step: a sibling without the key still fails the gate."""
     _init_temp_repo(tmp_path / "repo")
