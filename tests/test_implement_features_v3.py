@@ -5105,6 +5105,28 @@ def test_failing_tests_maven() -> None:
     assert mod.failing_tests(text) == {"CalculatorTest.testAdd", "com.acme.ParserTest.testEmpty"}
 
 
+def test_failing_tests_gradle() -> None:
+    """JVM ``Class > test FAILED`` and Kotlin/Native ``Class.test[target] FAILED``;
+    task and build lines are not tests."""
+    mod = _import_v2(GOOD_DIR)
+    text = (
+        "> Task :shared:jvmTest FAILED\n"
+        "TableDriftJvmTest[jvm] > utbetalingRadTemp equals the payout row[jvm] FAILED\n"
+        "    java.lang.AssertionError at TableDriftJvmTest.kt:42\n"
+        "com.acme.ParserTest > testEmpty FAILED\n"
+        "no.egnedata.dsl.BuiltinsTest.roundToLong rounds ties up[iosSimulatorArm64] FAILED\r\n"
+        "> Task :shared:iosSimulatorArm64Test FAILED\n"
+        "373 tests completed, 1 failed, 2 skipped\n"
+        "FAILURE: Build failed with an exception.\n"
+        "BUILD FAILED in 33s\n"
+    )
+    assert mod.failing_tests(text) == {
+        "TableDriftJvmTest[jvm] > utbetalingRadTemp equals the payout row[jvm]",
+        "com.acme.ParserTest > testEmpty",
+        "no.egnedata.dsl.BuiltinsTest.roundToLong rounds ties up[iosSimulatorArm64]",
+    }
+
+
 def test_failing_tests_unknown_output_is_empty() -> None:
     mod = _import_v2(GOOD_DIR)
     assert mod.failing_tests("") == frozenset()
@@ -5228,10 +5250,12 @@ def _ledger_harness(mod, root: Path, git_root: Path, max_retries: int, run_fails
         def __init__(self, **kw) -> None:
             super().__init__(**kw)
             self.calls: list[tuple[int, bool, bool]] = []
+            self.outputs: list[str | None] = []
 
         async def run(self, ctx, *, node_id, attempt, **kw):
             r = await super().run(ctx, node_id=node_id, attempt=attempt, **kw)
             self.calls.append((attempt, r.success, os.path.exists(self.paths["needs_human"])))
+            self.outputs.append(r.output)
             return r
 
     ledger = _SpyLedger(step=step, root=str(root), git_root=str(git_root),
@@ -5301,16 +5325,19 @@ async def test_retry_ledger_through_a_real_loop(tmp_path) -> None:
     assert [e["attempt"] for e in entries] == [1, 2, 3]
     assert [e["round"] for e in entries] == [1, 1, 1]
     assert [e["failset"] for e in entries] == [sorted(_A), sorted(_B), sorted(_C)]
+    assert [e["fix_ran"] for e in entries] == [False, True, True]
 
-    # Output reaches the fix: attempt 2 has no "two fixes" paragraph, attempt 3 does.
+    # Output reaches the fix: attempt 2 has no "failed fixes" paragraph, and
+    # attempts 3 and 4 count the fixes that ran before them.
     at2, at3, at4 = fix.calls
     assert at2.startswith("Validation attempt 2 of 4.")
-    assert "Two fixes have failed" not in at2
+    assert "earlier fix" not in at2
     assert "Validation attempt 3 of 4" in at3
-    assert mod.LEDGER_TWO_FIXES_FAILED in at3
-    assert "Two fixes have failed. Before editing, name the assumption" in at3
+    assert mod.ledger_fixes_failed(1) in at3
+    assert "One earlier fix has failed. Before editing, name the assumption" in at3
     assert "tests/test_x.py::test_a" in at3 and "tests/test_x.py::test_b" in at3
     assert "Validation attempt 4 of 4" in at4
+    assert "2 earlier fixes have failed." in at4
     assert not p("needs-human").exists()
     assert not p("oscillation.md").exists()
 
@@ -5400,6 +5427,38 @@ async def test_retry_ledger_skips_fix_after_unchanged_guard(tmp_path) -> None:
     assert not (root / f"{step}.attempt-3.fix.txt").exists(), (
         "the fix of attempt 3 was skipped, so the ledger must not record one"
     )
+    # Attempt 4's fix follows one fix that ran (attempt 2's); the skipped fix
+    # of attempt 3 is not counted as a failed fix.
+    assert "One earlier fix has failed." in fix.calls[1]
+
+
+@pytest.mark.asyncio
+async def test_retry_ledger_counts_only_fixes_that_ran(tmp_path) -> None:
+    """A fix whose rerun the guard refused is one failed fix, not two (attempt 3)."""
+    import json
+
+    from norn.runner import RetriesExhaustedError, run_pipeline
+
+    mod = _import_v2(GOOD_DIR)
+    root = tmp_path / "snapshots"
+    root.mkdir()
+    _init_temp_repo(tmp_path / "repo")
+    pipeline, ledger, fix, run = _ledger_harness(
+        mod, root, tmp_path / "repo", 3, [_A, "guard", "guard"],
+        fix_when=mod._failed_with_new_evidence,
+    )
+
+    with pytest.raises(RetriesExhaustedError):
+        await run_pipeline(pipeline)
+
+    step = _LEDGER_STEP
+    assert len(fix.calls) == 1
+    entries = json.loads((root / f"{step}.ledger.json").read_text())
+    assert [e["fix_ran"] for e in entries] == [False, True]
+    at3 = ledger.outputs[-1]
+    assert at3.startswith("Validation attempt 3 of 3.")
+    assert "One earlier fix has failed." in at3
+    assert "earlier fixes have failed" not in at3
 
 
 @pytest.mark.asyncio
@@ -5443,7 +5502,7 @@ async def test_retry_ledger_detection_error_names_both_sets(tmp_path) -> None:
     assert "round 2" in resumed.output
     import json
     entries = json.loads((root / f"{step}.ledger.json").read_text())
-    assert entries[-1] == {"attempt": 0, "round": 2, "failset": sorted(_C)}
+    assert entries[-1] == {"attempt": 0, "round": 2, "failset": sorted(_C), "fix_ran": False}
 
 
 def test_fix_prompt_has_retry_discipline() -> None:

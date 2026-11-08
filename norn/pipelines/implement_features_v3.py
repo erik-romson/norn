@@ -880,13 +880,21 @@ class _AssertLaunchTree(BaseStage):
 # Lines of the compressed failure log kept for each failed run.
 LEDGER_FAIL_TAIL_LINES = 60
 
-# Added to the ledger output from the third attempt on.  The fix prompt inlines
-# the ledger output verbatim, so this text reaches the agent unchanged.
-LEDGER_TWO_FIXES_FAILED = (
-    "Two fixes have failed. Before editing, name the assumption the earlier "
-    "fixes shared and test that assumption first. Do not try another variant "
-    "of the same theory."
-)
+def ledger_fixes_failed(fixes: int) -> str:
+    """The paragraph added to the ledger output once *fixes* earlier fixes failed.
+
+    It names the number of fixes that ran in this round, not the attempt
+    number: a fix the unchanged-tree guard skipped is not a failed fix.  The
+    fix prompt inlines the ledger output verbatim, so this text reaches the
+    agent unchanged.
+    """
+    counted = "One earlier fix has" if fixes == 1 else f"{fixes} earlier fixes have"
+    return (
+        f"{counted} failed. Before editing, name the assumption the earlier "
+        "attempts shared and test that assumption first. Do not try another "
+        "variant of the same theory."
+    )
+
 
 # One pattern per test-runner family whose failure lines name the test; group 1
 # is the test name.  Matched line by line, so CRLF output parses the same.
@@ -895,6 +903,9 @@ _FAILING_TEST_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^not ok \d+ (.+)$"),                 # TAP / BATS
     re.compile(r"^--- FAIL: (\S+)"),                  # go test
     re.compile(r"^\[ERROR\]\s+(\S+\.\S+):\d+"),       # Maven / Surefire
+    # Gradle: ``Class > test FAILED`` (JVM) and ``Class.test[target] FAILED``
+    # (Kotlin/Native, KMP).  ``> Task :x FAILED`` is a task, not a test.
+    re.compile(r"^(?!> )(\S.* > .+|\S.*\[[\w-]+\]) FAILED$"),
 )
 
 
@@ -902,8 +913,9 @@ def failing_tests(text: str) -> frozenset[str]:
     """Return the names of the failing tests that *text* reports.
 
     Recognises pytest (``FAILED``/``ERROR`` summary lines), TAP/BATS
-    (``not ok N name``), ``go test`` (``--- FAIL: name``) and Maven/Surefire
-    (``[ERROR]   Class.method:line``).  Anything else gives an empty set, which
+    (``not ok N name``), ``go test`` (``--- FAIL: name``), Maven/Surefire
+    (``[ERROR]   Class.method:line``) and Gradle (``Class > test FAILED``,
+    ``Class.test[target] FAILED``).  Anything else gives an empty set, which
     means *unknown*: the oscillation stop never fires on an unknown set.
     """
     found: set[str] = set()
@@ -989,8 +1001,8 @@ class _RetryLedger(BaseStage):
     - ``<step>.attempt-<k>.pre-fix.json``: a ``_step_snapshot.py`` snapshot
       taken before fix *k*, so fix *k−1* changed ``diff(pre-fix k−1, pre-fix k)``;
 
-    and appends ``{"attempt": k-1, "round": r, "failset": [...]}`` to
-    ``<step>.ledger.json``.  Attempt 1 reaches this stage only after an
+    and appends ``{"attempt": k-1, "round": r, "failset": [...], "fix_ran": bool}``
+    to ``<step>.ledger.json``; ``fix_ran`` says whether attempt *k−1*'s fix ran.  Attempt 1 reaches this stage only after an
     operator ``[r]etry`` restarted the loop: that starts round *r+1*, whose
     entry ``attempt 0`` is the failure carried over from the previous round.
 
@@ -1086,10 +1098,13 @@ class _RetryLedger(BaseStage):
             Path(_ledger_attempt_path(self.root, self.step, failed, "fix.txt")).write_text(body)
 
         failset = failing_tests(_run_text(ctx.results[f"run validation {self.step}"]))
-        entries.append({"attempt": failed, "round": rnd, "failset": sorted(failset)})
+        entries.append(
+            {"attempt": failed, "round": rnd, "failset": sorted(failset), "fix_ran": fix_ran}
+        )
         Path(paths["ledger"]).write_text(json.dumps(entries, indent=2) + "\n")
 
         in_round = [e for e in entries if e["round"] == rnd]
+        fixes_failed = sum(1 for e in in_round if e.get("fix_ran"))
         lines = [f"Validation attempt {attempt} of {self.max_retries}."]
         if rnd > 1:
             lines.append(
@@ -1098,8 +1113,8 @@ class _RetryLedger(BaseStage):
             )
         lines += ["", "Fail sets of the earlier failed runs in this round:"]
         lines += [f"- attempt {e['attempt']}: {_format_failset(e['failset'])}" for e in in_round]
-        if attempt >= 3:
-            lines += ["", LEDGER_TWO_FIXES_FAILED]
+        if attempt >= 3 and fixes_failed:
+            lines += ["", ledger_fixes_failed(fixes_failed)]
         output = "\n".join(lines)
 
         oscillation = detect_oscillation(entries)

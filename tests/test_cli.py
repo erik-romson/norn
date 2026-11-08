@@ -263,6 +263,46 @@ def test_history_run_shows_detailed_step_log(capsys, tmp_path):
     assert "sonnet" in captured.out
 
 
+def test_history_run_prints_brackets_in_errors_and_names(capsys, tmp_path):
+    """A stage's error is shown as written, not read as console markup."""
+    config = str(tmp_path / "pipeline.py")
+    append_run(
+        config,
+        RunRecord(
+            run_id=1,
+            timestamp="2026-03-25T09:00:00+00:00",
+            success=False,
+            total_cost_usd=0.0,
+            total_tokens=0,
+            duration_ms=1000,
+            stages=[StageHistoryEntry(name="run [x]", success=False, cost_usd=0.0)],
+            retries=0,
+            failed_stage="run [x]",
+            stage_log=[
+                StageLogEntry(
+                    name="run [x]",
+                    status="failed",
+                    success=False,
+                    attempt=1,
+                    duration_ms=1000,
+                    cost_usd=0.0,
+                    running_total_cost_usd=0.0,
+                    running_total_tokens=0,
+                    error="answer [r] once",
+                )
+            ],
+        ),
+    )
+
+    with patch("sys.argv", ["norn", "history", config, "--run", "1"]):
+        main()
+
+    out = capsys.readouterr().out
+    assert "Failed at: run [x]" in out
+    assert "answer [r] once" in out
+    assert "answer  once" not in out
+
+
 def test_history_run_shows_finding(capsys, tmp_path):
     """history --run prints findings when journal metrics exist."""
     import json

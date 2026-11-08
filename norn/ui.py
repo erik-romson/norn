@@ -427,7 +427,7 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
     if record.session_id:
         console.print(f"  Session:   {record.session_id}")
     if record.failed_stage:
-        console.print(f"  Failed at: {record.failed_stage}")
+        console.print(f"  Failed at: {escape(record.failed_stage)}")
 
     if not record.stage_log:
         console.print("\n  [dim]No detailed stage log stored for this run.[/dim]\n")
@@ -506,10 +506,12 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
         tools_str = f"{entry.tool_uses} ({entry.tool_errors}x)" if entry.tool_errors else (str(entry.tool_uses) if entry.tool_uses else "-")
         peak_ctx = _peak_ctx_by_name.get(entry.name) or _peak_ctx_by_name.get(f"stage:{entry.name}")
         peak_ctx_str = f"{peak_ctx:,}" if peak_ctx is not None else "-"
+        # escape(): stage names, statuses and errors are external text, not console
+        # markup; unescaped, "answer [r] once" printed as "answer  once".
         row = [
-            entry.name,
+            escape(entry.name),
             str(entry.attempt),
-            status_labels.get(entry.status, entry.status),
+            status_labels.get(entry.status, escape(entry.status)),
             cost,
             running,
             tokens,
@@ -521,7 +523,7 @@ def print_history_run_details(records: list[RunRecord], run_id: int, *, state_ke
         ]
         if _has_peak_ctx:
             row.append(peak_ctx_str)
-        row.extend([entry.model or "-", info or "-"])
+        row.extend([escape(entry.model or "-"), escape(info or "-")])
         table.add_row(*row)
 
     wide.print()
