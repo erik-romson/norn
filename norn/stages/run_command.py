@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from norn.events import CommandOutput, EventKey
 from norn.models import PipelineContext, StageResult
+from norn.sdkman import sdkman_env
 from norn.secrets import resolve_env
 from norn.stages.base import BaseStage
 
@@ -143,8 +144,11 @@ class RunCommand(BaseStage):
         attempt: int = 1,
         **kwargs: Any,
     ) -> StageResult:
-        # Build subprocess env: process env + pipeline env + stage env (with secret resolution)
-        subprocess_env = {**os.environ, **ctx.env, "NORN_ATTEMPT": str(attempt)}
+        # Build subprocess env: process env + the working directory's .sdkmanrc
+        # + pipeline env + stage env (with secret resolution)
+        subprocess_env = dict(os.environ)
+        subprocess_env.update(sdkman_env(ctx.working_dir or os.getcwd(), subprocess_env))
+        subprocess_env.update({**ctx.env, "NORN_ATTEMPT": str(attempt)})
         if self.env:
             subprocess_env.update(resolve_env(self.env, ctx))
 
