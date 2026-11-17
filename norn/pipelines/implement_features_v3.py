@@ -1552,6 +1552,17 @@ def _outside_tree_marker_path(key: str, validation_cmd: str) -> str:
     return os.path.join(snapshot_root, f"{key}.failed.{digest}.outside")
 
 
+def _shell_group(cmd: str) -> str:
+    """Wrap a plan's command in a `{ ...; }` group that is safe to embed.
+
+    The closing brace goes on its own line. A command whose last line is a
+    heredoc terminator (`PY`) or ends in a `# comment` would otherwise swallow
+    a ` ; }` on the same line, and the shell stops at parse time with
+    `syntax error: unexpected end of file` before anything runs.
+    """
+    return f"{{ {cmd}\n}}"
+
+
 def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
     """Build the in-loop validation shell and the gate's validation shell.
 
@@ -1601,7 +1612,7 @@ def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
     )
     in_loop = (
         f"{unchanged_since_failure} && rm -f {q(proof)} {q(failed)} {q(outside)} && "
-        f"if {{ {validation_cmd} ; }}; then "
+        f"if {_shell_group(validation_cmd)}; then "
         f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(proof)}; "
         f"else rc=$?; "
         f"python3 {q(SNAPSHOT_HELPER)} snapshot --root {q(GIT_TOPLEVEL)} {q(failed)}; "
@@ -1615,7 +1626,7 @@ def _proven_validation(key: str, validation_cmd: str) -> tuple[str, str]:
         f" > {q(delta)}; fi && "
         f"if [ -f {q(proof)} ] && [ ! -s {q(delta)} ]; then "
         f'echo "=== validation: passed in the loop on this exact tree, not rerun ==="; '
-        f'else echo "=== validation ===" && {{ {validation_cmd} ; }}; fi'
+        f'else echo "=== validation ===" && {_shell_group(validation_cmd)}; fi'
     )
     return in_loop, gate
 
@@ -2202,8 +2213,8 @@ for step_file in step_files:
     # survives loop attempts).
     if bats_cmd:
         validation_cmd: str = (
-            f'echo "=== test_cmd ===" && {test_cmd} && '
-            f'echo "=== bats_cmd ===" && {bats_cmd}'
+            f'echo "=== test_cmd ===" && {_shell_group(test_cmd)} && '
+            f'echo "=== bats_cmd ===" && {_shell_group(bats_cmd)}'
         )
         validation_timeout: float = max(test_timeout, bats_timeout)
     else:
@@ -2569,7 +2580,7 @@ for step_file in step_files:
         f"revalidate {name}",
         RunCommand(
             cmd=(
-                f"cd {shlex.quote(PROJECT_DIR)} && {{ {validation_cmd} ; }} || {{ "
+                f"cd {shlex.quote(PROJECT_DIR)} && {_shell_group(validation_cmd)} || {{ "
                 'echo "ERROR: post-commit revalidation failed;'
                 ' the hook-rewritten code is already committed." 1>&2; '
                 'echo "Fix and amend the last commit, then rerun;'

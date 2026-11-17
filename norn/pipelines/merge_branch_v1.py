@@ -263,7 +263,9 @@ def run_local_tests_cmd(paths: MergePaths, project_dir: str, test_cmd: str, n: i
         f"rm -f {red_path} {proof_path}\n"
         f"KEY=$({{ git rev-parse HEAD; git diff HEAD; printf '%s' {key_input}; }} "
         "| git hash-object --stdin) || exit 1\n"
-        f"{{ {{ {test_cmd} ; }} ; echo $? > {rc_path} ; }} 2>&1 | tee {log_path}\n"
+        # The group closes on its own line: a test_cmd that ends in a heredoc
+        # terminator or a `# comment` would swallow a ` ; }` on the same line.
+        f"{{ {{ {test_cmd}\n}} ; echo $? > {rc_path} ; }} 2>&1 | tee {log_path}\n"
         f'if [ "$(cat {rc_path})" = 0 ]; then printf \'%s\\n\' "$KEY" > {proof_path}; '
         f"else touch {red_path}; fi\n"
         "exit 0\n"
@@ -365,7 +367,7 @@ def local_tests_green_cmd(paths: MergePaths, project_dir: str, test_cmd: str, n:
         '  echo "passed in the loop on this exact tree, not rerun"\n'
         "  exit 0\n"
         "fi\n"
-        f"if ! {{ {test_cmd} ; }}; then\n"
+        f"if ! {{ {test_cmd}\n}}; then\n"
         f"{gate_red_halt}"
         "fi\n"
         "exit 0\n"

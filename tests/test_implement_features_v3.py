@@ -1147,6 +1147,47 @@ def test_validation_gate_reruns_only_when_the_loop_left_no_proof_for_this_tree(
     assert run_count() == 5
 
 
+@pytest.mark.parametrize(
+    ("cmd", "expected_rc"),
+    [
+        ("cat <<'PY'\nok\nPY", 0),
+        ("true # trailing comment", 0),
+        ("false # trailing comment", 1),
+    ],
+    ids=["ends-in-heredoc", "ends-in-comment", "fails-and-ends-in-comment"],
+)
+@pytest.mark.parametrize("module_name", ["implement_features_v3", "implement_features_v2"])
+def test_validation_shell_parses_when_the_command_ends_in_a_heredoc_or_comment(
+    tmp_path, monkeypatch, cmd: str, expected_rc: int, module_name: str
+) -> None:
+    """A ` ; }` on the command's last line would be swallowed and fail at parse time.
+
+    The fix is ported to the frozen implement_features_v2 as well, and its own
+    test file is frozen, so the original is covered here.
+    """
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    shutil.copytree(GOOD_DIR, repo_path / "feat")
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(sys, "argv", [sys.argv[0], str(repo_path / "feat")])
+    mod = importlib.reload(importlib.import_module(f"norn.pipelines.{module_name}"))
+
+    def rc(script: str) -> int:
+        result = subprocess.run(script, shell=True, cwd=repo_path, capture_output=True, text=True)
+        assert "syntax error" not in result.stderr, result.stderr
+        return result.returncode
+
+    in_loop, _ = mod._proven_validation("step-h", cmd)
+    _, gate_without_proof = mod._proven_validation("step-h-gate", cmd)
+    group = mod._shell_group(cmd)
+    with_bats = f'echo "=== test_cmd ===" && {group} && echo "=== bats_cmd ===" && {group}'
+
+    assert rc(in_loop) == expected_rc
+    assert rc(gate_without_proof) == expected_rc
+    assert rc(f"{group} || exit 7") == (7 if expected_rc else 0)
+    assert rc(mod._shell_group(with_bats)) == expected_rc
+
+
 def test_validation_is_not_rerun_in_the_same_loop_pass_on_the_tree_it_failed_on(
     tmp_path, monkeypatch
 ) -> None:

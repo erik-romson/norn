@@ -18,7 +18,7 @@ import pytest
 
 from norn.dsl import Loop, Parallel, Pipeline, Stage
 from norn.pipelines import _merge_gh, _merge_state
-from tests.merge_fakes import ctx_for, install_fake_gh
+from tests.merge_fakes import ctx_for, install_fake_gh, make_repo_with_remote
 
 
 def _import(module_name: str, argv_tail: list[str] = (), cwd=None):
@@ -347,3 +347,43 @@ def test_summary_learning_pointer_absent_without_proposal_file(tmp_path):
         paths, rerun_cmd="r", max_rounds=2, project_dir=str(tmp_path), learning_pointers=True
     )
     assert "Learning proposal:" not in body
+
+
+# --- test_cmd ending in a heredoc or comment ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("test_cmd", "green"),
+    [
+        ("cat <<'PY'\nok\nPY", True),
+        ("true # trailing comment", True),
+        ("false # trailing comment", False),
+    ],
+    ids=["ends-in-heredoc", "ends-in-comment", "fails-and-ends-in-comment"],
+)
+@pytest.mark.parametrize("module_name", ["norn.pipelines.merge_branch_v2", "norn.pipelines.merge_branch_v1"])
+def test_local_test_shells_parse_when_test_cmd_ends_in_a_heredoc_or_comment(
+    tmp_path, module_name: str, test_cmd: str, green: bool
+) -> None:
+    """A ` ; }` on test_cmd's last line would be swallowed and fail at parse time.
+
+    The fix is ported to the frozen merge_branch_v1 as well, and its own test
+    file is frozen, so the original is covered here.
+    """
+    mod = _import(module_name, cwd=tmp_path)
+    repo = make_repo_with_remote(tmp_path / "checkout")
+    paths = _merge_state.MergePaths(str(tmp_path / "norn-work"))
+    Path(paths.root).mkdir(parents=True, exist_ok=True)
+
+    def sh(script: str) -> subprocess.CompletedProcess:
+        result = subprocess.run(["sh", "-c", script], cwd=repo.path, capture_output=True, text=True)
+        assert "syntax error" not in result.stderr, result.stderr
+        return result
+
+    assert sh(mod.run_local_tests_cmd(paths, repo.path, test_cmd, 1)).returncode == 0
+    assert Path(paths.proof(1)).is_file() is green
+    assert Path(paths.red(1)).is_file() is not green
+
+    Path(paths.proof(1)).unlink(missing_ok=True)
+    assert sh(mod.local_tests_green_cmd(paths, repo.path, test_cmd, 1)).returncode == 0
+    assert Path(paths.halt).is_file() is not green
