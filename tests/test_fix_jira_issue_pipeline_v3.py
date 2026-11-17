@@ -792,9 +792,21 @@ def test_graph_builds(tmp_path, make):
 
 def test_metadata(tmp_path):
     mod = _import_default(tmp_path)
-    assert list(mod.metadata["args"].keys()) == ["args"]
-    assert "auto" in mod.metadata["args"]["args"]
+    from norn.catalog import is_switch_arg
+
+    assert list(mod.metadata["args"].keys()) == ["args", "auto"]
+    assert is_switch_arg(mod.metadata["args"]["auto"])
     assert mod.metadata["env_vars"] == ["ANTHROPIC_API_KEY", "JIRA_AUTH", "JIRA_BASE"]
+
+
+@pytest.mark.parametrize(
+    ("tail", "auto"),
+    [([], False), (["auto"], True), (["--arg", "auto=on"], True), (["--arg", "auto=off"], False)],
+    ids=["default", "positional", "checkbox_on", "checkbox_off"],
+)
+def test_auto_switch_sets_the_mode(tmp_path, tail, auto):
+    """The norn ui checkbox sends --arg auto=on; it must mean what the positional means."""
+    assert _import_fix_jira(["CBS-2249", *tail], cwd=tmp_path).AUTO is auto
 
 
 def test_catalog_lists_v3_beside_its_original():
@@ -803,7 +815,7 @@ def test_catalog_lists_v3_beside_its_original():
     assert "fix_jira_issue_v2" in infos
     info = infos["fix_jira_issue_v3"]
     assert info.short.startswith("Fix a Jira issue")
-    assert list(info.args) == ["args"]
+    assert list(info.args) == ["args", "auto"]
     for marker in (
         "CBS-1234 auto --non-interactive",
         "--resume",

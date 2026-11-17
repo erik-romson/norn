@@ -22,7 +22,8 @@ in tmp/jira/<KEY>/:
   4. <KEY>-ship.md             COMMITS (rewrite or keep), TITLE, then
                                STATUS: DECIDED; nothing is pushed before it
 
-`auto` decides every gate it safely can and stops, with a prompt and an
+`auto` (or `--arg auto=on`, the `auto` checkbox under `norn ui`) decides
+every gate it safely can and stops, with a prompt and an
 alert, where it cannot.  `auto --non-interactive` turns every such stop into
 an abort with a FAILED alert.
 
@@ -115,7 +116,8 @@ if _STOP:
         "fix_jira_issue_v3 always pauses at the reviewed plan; `stop` is a v2 positional. "
         "Use `auto` to run hands-off or --arg plan_gate=off to skip the plan pause."
     )
-AUTO = run_mode(sys.argv[1:]) == "auto"
+# `--arg auto=on` means the same as the positional: it is what the norn ui checkbox sends.
+AUTO = run_mode(sys.argv[1:]) == "auto" or on_off_knob(_args, "auto", False)
 
 ART = artifact_paths(PROJECT_DIR, ISSUE_KEY)
 PLAN, QUESTIONS, REVIEW, RESPONSE = derive_paths(ART.preplan)
@@ -189,7 +191,19 @@ CHILD_STATE_KEYS = ["implement_features_v3", "check_and_fix_ci_v2"]
 
 metadata = {
     "env_vars": ["ANTHROPIC_API_KEY", "JIRA_AUTH", "JIRA_BASE"],
-    "args": {"args": "Jira issue key (e.g. CBS-2249), optionally followed by `auto`"},
+    "args": {
+        "args": "Jira issue key (e.g. CBS-2249)",
+        "auto": {
+            "type": "switch",
+            "help": (
+                "Hands-off run: the pipeline never pauses to ask you and approves every "
+                "gate itself. It answers the plan questions with their recommendations, "
+                "approves the plan, fixes every code-review finding except nits, accepts "
+                "the proposed commits and PR title, and opens the draft PR. It still "
+                "stops, with an alert, where it cannot decide safely."
+            ),
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------
