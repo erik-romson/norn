@@ -1391,6 +1391,96 @@ async def test_assert_owned_diff_writes_noop_marker(tmp_path, monkeypatch) -> No
     assert not _stage(mod, f"record no-op {stem}").when(ctx)
 
 
+@pytest.mark.asyncio
+async def test_assert_owned_diff_shows_the_implement_reply(tmp_path, monkeypatch) -> None:
+    """A step that changed nothing shows why, in the text the operator reads.
+
+    An agent that stops on purpose (here: the sandbox refused the build tool)
+    changes nothing, and before this the prompt only blamed leftover or
+    hand-committed work.
+    """
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext, StageResult
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+    reply = "I stopped before making any change. The sandbox blocks Gradle."
+    ctx.results[f"implement {stem}"] = StageResult(name="", success=True, output=reply)
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+    r = await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)
+
+    assert not r.success
+    stdout = r.output["stdout"]
+    assert "changed nothing" in stdout
+    assert reply in stdout
+    assert "[a]bort" in stdout
+    assert stdout.index("changed nothing") < stdout.index(reply)
+    assert reply in (r.error or ""), "the prompt shows result.error, so the reply must be in it"
+
+
+@pytest.mark.asyncio
+async def test_assert_owned_diff_keeps_the_tail_of_a_long_reply(tmp_path, monkeypatch) -> None:
+    """Only the end of the reply is shown: that is where the agent sums up."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext, StageResult
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+    reply = "HEAD-OF-REPLY " + "x" * (mod.IMPLEMENT_REPLY_TAIL_CHARS * 2) + " END-OF-REPLY"
+    ctx.results[f"implement {stem}"] = StageResult(name="", success=True, output=reply)
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+    r = await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)
+
+    assert not r.success
+    assert "END-OF-REPLY" in r.output["stdout"]
+    assert "HEAD-OF-REPLY" not in r.output["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_assert_owned_diff_without_a_reply_drops_a_stale_one(tmp_path, monkeypatch) -> None:
+    """With no implement result, no reply is shown, also not one left by an earlier run."""
+    _init_temp_repo(tmp_path / "repo")
+    repo_path = tmp_path / "repo"
+    feat_dir = repo_path / "feat"
+    shutil.copytree(GOOD_DIR, feat_dir)
+
+    monkeypatch.chdir(repo_path)
+    mod = _import_v2_in_repo(feat_dir, monkeypatch)
+
+    from norn.models import PipelineContext
+
+    stem = "step-01-v2-fixture-alpha"
+    ctx = PipelineContext()
+    stale = Path(mod.snapshot_root) / f"{stem}.implement-reply"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("STALE REPLY FROM AN EARLIER RUN\n")
+
+    assert (await _stage(mod, f"record baseline {stem}").impl.run(ctx)).success
+    r = await _stage(mod, f"assert owned diff {stem}").impl.run(ctx)
+
+    assert not r.success
+    assert "changed nothing" in r.output["stdout"]
+    assert "STALE REPLY" not in r.output["stdout"]
+    assert "ended with" not in r.output["stdout"]
+    assert not stale.exists()
+
+
 # ---------------------------------------------------------------------------
 # Declared no-op: `allow_noop: true` passes the gate without prompting
 # ---------------------------------------------------------------------------

@@ -874,6 +874,42 @@ class _AssertLaunchTree(BaseStage):
 
 
 # ---------------------------------------------------------------------------
+# Owned-diff gate: shows the implement agent's reply when the step changed nothing
+# ---------------------------------------------------------------------------
+
+# Characters of the implement agent's reply kept for the 'changed nothing'
+# message: enough for a closing summary, short enough for the prompt.
+IMPLEMENT_REPLY_TAIL_CHARS = 2000
+
+
+class _AssertOwnedDiff(RunCommand):
+    """The ``assert owned diff`` gate, with the agent's reply at hand.
+
+    An agent that stops on purpose (a STOP, a tool the environment refuses)
+    changes nothing, and so does one whose work is already in the tree.  The
+    gate cannot tell them apart; the agent's own reply can.  Before the shell
+    runs, the tail of the implement stage's output is written to *reply_path*
+    (removed when there is none), and the no-op branch prints it, so the
+    operator deciding between abort, continue and retry reads why the step
+    did nothing.
+    """
+
+    def __init__(self, *, implement_stage: str, reply_path: str, cmd: str) -> None:
+        super().__init__(cmd=cmd)
+        self.implement_stage = implement_stage
+        self.reply_path = reply_path
+
+    async def run(self, ctx: PipelineContext, **kwargs: Any) -> StageResult:
+        result = ctx.results.get(self.implement_stage)
+        reply = result.output.strip() if result and isinstance(result.output, str) else ""
+        if reply:
+            Path(self.reply_path).write_text(reply[-IMPLEMENT_REPLY_TAIL_CHARS:] + "\n")
+        else:
+            Path(self.reply_path).unlink(missing_ok=True)
+        return await super().run(ctx, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Retry ledger: per-step evidence of failed validation runs, oscillation stop
 # ---------------------------------------------------------------------------
 
@@ -2238,6 +2274,7 @@ for step_file in step_files:
     step_hookfix_marker = os.path.join(snapshot_root, f"{name}.hookfix.marker")
     step_facts   = os.path.join(snapshot_root, f"{name}.facts")
     step_noop    = os.path.join(snapshot_root, f"{name}.noop")
+    step_reply   = os.path.join(snapshot_root, f"{name}.implement-reply")
     step_recheck     = os.path.join(snapshot_root, f"{name}.recheck.json")
     step_recheck_chg = os.path.join(snapshot_root, f"{name}.recheck.changed")
 
@@ -2337,7 +2374,21 @@ for step_file in step_files:
     # run started with `--non-interactive` (a child run under fix_jira_issue
     # has no operator to press [c]ontinue; NonInteractiveResponder answers
     # abort).  The guard stays intact for every step that does not opt in.
+    #
+    # The failing branch prints the implement agent's reply first: an agent
+    # that stopped on purpose also changes nothing, and its reply is the only
+    # place that says why.  Without it the message pointed only at leftover
+    # or hand-committed work, and [c]ontinue looked like the way out.
     # ------------------------------------------------------------------
+    _show_reply = (
+        f'if [ -s {shlex.quote(step_reply)} ]; then '
+        f'echo "The implement agent ended with (last '
+        f'{IMPLEMENT_REPLY_TAIL_CHARS} characters):"; '
+        f'echo "----"; cat {shlex.quote(step_reply)}; echo "----"; '
+        f'echo "If the agent stopped on purpose, [a]bort, fix the cause and '
+        f'start a new run: [c]ontinue skips this step\'s work, and [r]etry and '
+        f'--resume do not run the agent again."; fi; '
+    )
     if allow_noop:
         _noop_branch = (
             f'{{ touch {shlex.quote(step_noop)}; '
@@ -2348,6 +2399,7 @@ for step_file in step_files:
         _noop_branch = (
             f'{{ touch {shlex.quote(step_noop)}; '
             f'echo "ERROR: implement {name} changed nothing"; '
+            f'{_show_reply}'
             f'echo "If this step\'s work is already in the working tree from an '
             f'earlier run, commit or reset it before resuming."; '
             f'echo "If it was committed by hand, give that commit the subject '
@@ -2360,18 +2412,22 @@ for step_file in step_files:
 
     pipeline.stage(
         f"assert owned diff {name}",
-        RunCommand(cmd=(
-            f"cd {shlex.quote(GIT_TOPLEVEL)} && "
-            f"rm -f {shlex.quote(step_noop)} && "
-            f"python3 {shlex.quote(SNAPSHOT_HELPER)} snapshot "
-            f"--root {shlex.quote(GIT_TOPLEVEL)} {shlex.quote(step_mid)} && "
-            f"python3 {shlex.quote(SNAPSHOT_HELPER)} diff "
-            f"{shlex.quote(step_pre)} {shlex.quote(step_mid)} "
-            f"--root {shlex.quote(GIT_TOPLEVEL)}{NORN_STATE_IGNORE_FLAGS} "
-            f"> {shlex.quote(step_mid_chg)} && "
-            f"{{ [ -s {shlex.quote(step_mid_chg)} ] || "
-            f"{_noop_branch}; }}"
-        )),
+        _AssertOwnedDiff(
+            implement_stage=f"implement {name}",
+            reply_path=step_reply,
+            cmd=(
+                f"cd {shlex.quote(GIT_TOPLEVEL)} && "
+                f"rm -f {shlex.quote(step_noop)} && "
+                f"python3 {shlex.quote(SNAPSHOT_HELPER)} snapshot "
+                f"--root {shlex.quote(GIT_TOPLEVEL)} {shlex.quote(step_mid)} && "
+                f"python3 {shlex.quote(SNAPSHOT_HELPER)} diff "
+                f"{shlex.quote(step_pre)} {shlex.quote(step_mid)} "
+                f"--root {shlex.quote(GIT_TOPLEVEL)}{NORN_STATE_IGNORE_FLAGS} "
+                f"> {shlex.quote(step_mid_chg)} && "
+                f"{{ [ -s {shlex.quote(step_mid_chg)} ] || "
+                f"{_noop_branch}; }}"
+            ),
+        ),
         on_failure=ask_user,
     )
 
