@@ -147,10 +147,25 @@ def _input_id(name: str) -> str:
     return "arg-" + re.sub(r"\W", "_", name)
 
 
+class _SwitchCheckbox(Checkbox, inherit_bindings=False):
+    """A switch arg's checkbox: Space toggles it and Enter runs, as everywhere on the form.
+
+    Textual's Checkbox toggles on Enter too.  Ticking the box and then pressing
+    Enter to run unticked it again without starting anything, so the next
+    submit launched with the switch off.
+    """
+
+    BINDINGS = [
+        Binding("space", "toggle_button", "Toggle", show=False),
+        Binding("enter", "screen.submit", "Run", show=False),
+    ]
+
+
 class ArgsPromptScreen(Screen):
     """Form collecting values for a pipeline's declared ``args``.
 
-    One :class:`~textual.widgets.Input` per arg.  Path-like args (per
+    One :class:`~textual.widgets.Input` per arg, and a checkbox per switch arg
+    (Space toggles it; Enter submits, as in an input).  Path-like args (per
     :func:`is_path_arg`) can be filled via the ``fzf`` picker (``ctrl+o`` while
     the input is focused).  Submit with ``ctrl+s`` or Enter; cancel with
     ``Escape`` (dismisses with ``None`` so the caller returns to the launcher).
@@ -222,7 +237,7 @@ class ArgsPromptScreen(Screen):
                 desc = arg_help(spec)
                 if name in self._switch_args:
                     yield Label(f"{name}: {desc}")
-                    yield Checkbox(
+                    yield _SwitchCheckbox(
                         name, value=self._initial.get(name) == "on", id=_input_id(name)
                     )
                     continue

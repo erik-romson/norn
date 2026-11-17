@@ -70,6 +70,11 @@ Launcher ──select──▶ [Args prompt, if the pipeline declares args] ─�
 - **Args prompt** (`ArgsPromptScreen`) — shown only when the pipeline declares
   `args` in its `metadata`. One input per arg. Path-like args (description
   mentions path/file/folder/dir) can be filled with **`ctrl+o`** → fzf.
+  An arg declared as a switch (`{"type": "switch", "help": ...}`) is a
+  checkbox instead: ticked, it reaches the pipeline as `--arg <name>=on`.
+  **Space** toggles it; **Enter** submits, as in an input, rather than
+  Textual's default of toggling on Enter, which unticked a box the user had
+  just ticked and launched the run with the switch off.
   Submit with **`ctrl+s`** or **Enter**; **Esc** cancels back to the launcher.
   The screen also collects the run's **budget** and **token_budget** ceilings —
   optional, blank keeps the pipeline's own limit — so a run known to be a big

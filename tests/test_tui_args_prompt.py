@@ -286,6 +286,18 @@ async def test_unticked_switch_is_left_out_of_the_launch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enter_on_a_ticked_switch_runs_with_it_on() -> None:
+    """Enter on the focused checkbox submits, as the hint says; it must not untick it."""
+    app = ArgsPromptApp("p", _SWITCH_META)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#arg-args", Input).value = "123"
+        await pilot.press("tab", "space", "enter")
+        await pilot.pause()
+    assert app.params == {"args": "123", "auto": "on"}
+
+
+@pytest.mark.asyncio
 async def test_resume_ticks_a_switch_the_run_was_started_with() -> None:
     screen = ArgsPromptScreen("p", _SWITCH_META, initial={"args": "123", "auto": "on"}, resume=True)
 
